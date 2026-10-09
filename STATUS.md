@@ -2048,3 +2048,500 @@ honest Windows-vs-Android comparison) and
 only `folio-core`/`folio-render`/`folio-engine` with the NDK against the
 Android prebuilts. It answers "is the portable stack Android-clean?" for
 one CI run, and deliberately does not attempt a shell that does not exist.
+
+---
+
+## Round 21 — touch and pen, end to end
+
+The previous rounds built a mobile *layout* on top of a mouse-only *input
+model*. Everything below 720 px looked right and behaved like a desktop:
+one pointer, no pressure, no gestures, hit targets sized for a cursor.
+This round closes that gap.
+
+A note on the starting point, because it was misleading:
+`folio-ui/viewport/FolioPageView.{h,cpp}` contains working Qt pinch and
+touch handling. It is dead Qt-era code, referenced by no CMakeLists and
+compiled by nothing. It was not a foundation to build on.
+
+### The event contract
+
+`PointerEvent` gained `pointerType` (`Mouse`/`Touch`/`Pen`), `pointerId`,
+`pressure` (0..1), and `tiltX`/`tiltY`, plus `isTouch()`/`isPen()`.
+Everything else keys off these five fields.
+
+`folio-ui/components/Gestures.{h,cpp}` is new and holds all of the state a
+gesture needs — `GestureTracker` with `onPointer`/`pinch`/`panDelta`/
+`flingVelocity`/`wasTap`/`tapCount`/`pollLongPress`, plus the tunables
+(`kSlop=10`, `kLongPress=0.5 s`, `kDoubleTap=0.3 s`, `kFlingMin=120`,
+`kVelocityAlpha=0.35`). It owns no document state and no widget, so it is
+testable on its own and reusable by any future surface.
+
+### The rules, and why each one is what it is
+
+| Input | Behaviour |
+|---|---|
+| Mouse | Unchanged, bit for bit. Touch is additive, not a rewrite. |
+| Pen | Falls through to the mouse paths. Only pressure is harvested. |
+| Two fingers | Always pinch + pan, **whatever tool is armed**. |
+| One finger, reading | Pans; a flick hands off to the existing inertia. |
+| One finger, tool armed | Draws. |
+| Double tap | FitWidth ⇄ 2 × FitWidth, anchored at the tap. |
+| Long press | Selects the word and opens the markup popup. |
+
+Two fingers overriding the active tool is the important one: it is the
+escape hatch that means arming the pen tool never traps the reader in a
+mode where they cannot navigate.
+
+Pen pressure scales the committed stroke width by
+`clamp(0.45 + meanPressure, 0.45, 1.75)`. Measured on a rendered page:
+p=0.12 → 2 px, p=1.00 → 7 px.
+
+### Three bugs that only reading the code would find
+
+1. **A half-drawn stroke survived the escape hatch.** Finger down with the
+   pen armed starts a stroke; a second finger then switches to pinch — but
+   the draft was still in the store and committed as a stray mark when the
+   first finger lifted. Now a second finger cancels the draft.
+2. **Double tap stole deliberate dots.** With a tool armed, two quick taps
+   are two marks, not a zoom request. Double-tap zoom is now gated on
+   `editTool_ == None`.
+3. **Double tap ratcheted instead of toggling.** It was ×2 each time until
+   it crossed a threshold and snapped back (60 → 120 → 240 → fit). Now it
+   is strictly two states, so the second double tap always undoes the first.
+
+### Word selection had to learn about scripts
+
+`selectWordAt` expanded over "anything that is not whitespace". Japanese
+has no whitespace, so a long press on the CJK fixture would have selected
+**the entire page** — silently.
+
+Expansion is now over a run of one script class (`Sep`/`Word`/`Han`/
+`Kana`/`Kata`/`Hangul`). For Japanese this is a genuinely good
+approximation: a kanji stem, its hiragana okurigana and a katakana
+loanword each form their own run, which is where a reader expects the
+selection to stop. Verified: long-pressing 午前八時三十分 selects exactly
+that and stops at から. Real segmentation needs a dictionary (MeCab/ICU);
+this is the honest approximation until one is linked. Latin improved too —
+"Vaswani*" now selects `Vaswani` without the footnote asterisk.
+
+### 44 px touch targets
+
+Hit targets are inflated at hit-test time, not at layout time, so **not one
+pixel of the design moves**. `Widget::hitLocalPadded` grows a control's hit
+rect towards `EventRouter::touchTarget` (44 px) only on the axis that is
+short, and only for touch — pen is excluded on purpose, because inflating a
+precision instrument's targets makes it harder to place a stroke, not
+easier. Overlapping inflated targets are settled by paint order, so the
+control drawn on top wins the contested pixels.
+
+Measured on the bottom-bar page chevron (28 px tall, centred at y=861):
+
+| y | mouse | pen | touch |
+|---|---|---|---|
+| 850 | chevron | chevron | chevron |
+| 846 | PageStage | PageStage | **chevron** |
+| 842 | PageStage | PageStage | **chevron** |
+| 838 | PageStage | PageStage | PageStage |
+
+### Transport
+
+The browser shell now emits Pointer Events when available: `p`=down,
+`q`=move, `s`=up/cancel, each `ch,x,y,button,mods,ptype,pointerId,pressure`,
+with `touchAction:none`, `setPointerCapture`, and `getCoalescedEvents()` so
+a 120 Hz digitiser's merged points are not thrown away. The legacy
+`mouse*` handlers are guarded with `if (window.PointerEvent) return;` so
+they never double-fire.
+
+The up record is `s`, **not** `r`. `r` is already the resize record, and
+distinguishing the two by field count alone means a short write turns a
+finger lift into a window resize to 546×846.
+
+### Diagnostics
+
+`FOLIO_DEBUG_HIT` logs every pointer-down as
+`type / id / position / slop → widget`. It is permanent and cached-`getenv`,
+like `FOLIO_DEBUG_POP`. It earned its place immediately: an earlier
+frame-differencing probe "showed" that pen input was broken, and the hit log
+proved the opposite — the frames were changing because `PageStage` was
+reacting behind the bottom bar, not because the chevron had fired. The
+crude test was wrong, not the code.
+
+`tools/stream-drive.py` is the scripted-input harness (`click`, `key`,
+`resize`, `tdown`/`tmove`/`tup`, `cap`, `burst`), now kept in the repo
+instead of being retyped after every sandbox reset.
+
+### Corpus repair
+
+`documents/Japanese_Government_Notice.pdf` was found damaged: a save test
+from Round 19 had left an appended incremental revision on disk, and the
+`git checkout` that was supposed to revert it never took effect — the
+workspace excludes `.git/config` from snapshots, so git had stopped
+recognising the directory as a repository.
+
+Stripping the appended revision from every fixture worked for the flat
+files but **destroyed this one**: it is linearized, so its first
+`startxref` is near the *front* of the file, and truncating there cut
+92,807 bytes down to 472. It had no recipe — it was an opaque binary.
+
+It is now generated by `tools/make-cjk-pdf.py`: one A4 page of Japanese in
+an embedded, fontTools-subsetted CID-keyed font (Type0 / Identity-H /
+CIDToGIDMap / ToUnicode), 40 KB, 151 glyphs. The fixture is reproducible
+from source for the first time. One trap worth recording: the subsetter was
+initially fed `text` filtered by `c.strip()`, which silently drops U+3000
+IDEOGRAPHIC SPACE — whitespace to Python, a real width-carrying glyph to
+the font — and it rendered as tofu mid-sentence.
+
+### Still open
+
+* **X11 XInput2 is not written.** On X11 the server synthesises core
+  pointer events for the first touch point, so single-finger tap and drag
+  already work through the existing mouse path; what is missing natively is
+  multi-touch (pinch) and pen pressure. `libXi.so.6` is present and
+  `libxi-dev` is fetchable, so the work is unblocked — it is deliberately
+  not done blind, because there is no touch or pen device in this
+  environment to verify it against, and the stream shell is the testable
+  path today.
+* The browser JS (coalesced events, pointer capture) is **verified through
+  the C++ parser, not through a real browser** — there is none here.
+* Android and iOS remain without a backend at all, so "tablet and mobile"
+  is currently served by the stream shell and the phone layout, not by
+  native shells.
+
+---
+
+# Round 22 — X11 touch/pen, and Android made real
+
+Three things were asked for: write the X11 XInput2 code now even though it
+cannot be device-tested, push Android forward to a true mobile platform
+application, and give a view on WebAssembly. The WASM answer is in
+`WASM-ASSESSMENT.md`. The other two are below.
+
+## 22.1 X11 XInput2 — what is and is not tested
+
+The full XI2 path is written, compiled, linked and running. The honest
+summary of its test status is narrower than "it works", and the
+distinction matters:
+
+| Path | Status |
+|---|---|
+| XI2 extension negotiation, device enumeration | **Verified running** — `XInput2 2.2 active` under Xvfb |
+| Mouse down / move / up / wheel through XI2 | **Verified** — drove the real app, asserted on widget names |
+| Device classification (mouse vs touch vs pen) | **Partly** — mouse classified correctly; no touch or pen device existed to classify |
+| Packed-valuator decoding (pressure, tilt) | **Unit-tested** — `tests/platform/test_xi_valuator.cpp`, 15 checks |
+| Touch down/move/up, multi-touch, pinch on X11 | **NEVER EXECUTED** |
+| Pen pressure and tilt on X11 | **NEVER EXECUTED** |
+
+### What was actually done to test it
+
+The risk in this change was not the touch code — it was that `initXI2()`
+**replaces the core pointer event masks**. If XI2 selection succeeds but
+delivery differs in any way, every existing Linux mouse interaction breaks.
+That is a regression that would be invisible in a headless CI link check.
+
+So the real desktop binary was run on Xvfb (which speaks XInput2 2.2) and
+driven with synthetic input through xdotool: opened the welcome screen,
+clicked through the file dialog, opened `Attention_Is_All_You_Need.pdf`,
+drag-selected text across a line, and scrolled with the wheel. Every step
+was asserted with `FOLIO_DEBUG_HIT` on the widget name — not on pixels,
+for the reason recorded in round 21. All of it arrived as `type=0` (mouse)
+with correct coordinates and exactly one event per action, and a
+screenshot confirmed the page rendered and the selection markup popup
+appeared.
+
+A `FOLIO_DEBUG_INPUT=1` diagnostic was added specifically so this claim
+could be checked rather than assumed: it prints the negotiated XI2 version
+and each device's classification and axis numbers. Without it, a silent
+fallback to core events would look exactly like success.
+
+### The part that cannot be tested here
+
+Xvfb has no touchscreen and no tablet. `XISelectEvents` asks for
+`XI_TouchBegin/Update/End` and the pressure/tilt valuators, and nothing in
+this sandbox can emit them. `/dev/uinput` exists but is root-only, and in
+any case Xvfb has no evdev input backend to feed — it only accepts XTEST,
+which cannot synthesise touch.
+
+**The touch and pen branches of `translateXI()` have therefore never
+executed.** They are written, they compile, they are reachable, and the
+one piece of them that is genuinely easy to get wrong — the packed
+valuator walk — is covered by unit tests.
+
+#### Why that one piece got its own test
+
+XI2 does not send a value per axis. It sends a mask of which axes are
+present plus a tightly packed array of only those values. The value for
+axis *N* is not `values[N]`; it is `values[popcount(mask below N)]`.
+Indexing by axis number compiles, runs, and returns a plausible number —
+a stylus would report its tilt as pressure and strokes would come out the
+wrong width. That is precisely the class of bug that survives until
+someone plugs in hardware, so it was extracted into
+`folio-platform/linux/XiValuator.h` as a pure function with no X11
+dependency and tested directly: dense masks, sparse masks, absent axes
+(which must leave the destination untouched, not zero it mid-stroke),
+axes past the first mask byte, and null/negative inputs.
+
+### Other changes
+
+* `tools/bootstrap-deps.sh` fetches `libxi-dev` **and `libxfixes-dev`** —
+  `XInput2.h` includes `Xfixes.h` for `PointerBarrier` and will not compile
+  without it. `libXi.so` ships the same dangling symlink as the GL
+  libraries and is repointed the same way.
+* CMake degrades cleanly: no libXi means `FOLIO_HAVE_XI2=0`, a status
+  message, and single-touch via core-pointer emulation rather than a
+  broken build.
+* `NativeShell.cpp` maps the new `plat::Event` fields onto `PointerEvent`
+  and handles `PointerCancel`.
+
+## 22.2 Android — from "configures to nothing" to a loadable library
+
+Previous rounds recorded that configuring for Android "silently selects the
+headless `none` backend… a false success". That is fixed. The NDK (r27c)
+and real arm64 prebuilts were fetched, and **the whole stack now
+cross-compiles, links, and produces `libfolio-android.so` (22 MB,
+aarch64) exporting both `android_main` and `ANativeActivity_onCreate`.**
+
+Cross-compiling immediately found four real defects that the host build
+had been hiding:
+
+1. **`tools/bootstrap-deps.sh` ignored the target when caching.** Skia and
+   PDFium unpacked to the same directory regardless of `FOLIO_TARGET`, and
+   the presence checks were path-based. A warm host cache made
+   `FOLIO_TARGET=android` a silent no-op — it printed "skia: present" and
+   fetched nothing. A cold cache would have been worse: a host build
+   linking Android archives. Cross targets now get suffixed directories,
+   and `cmake/FolioDependencies.cmake` resolves the same suffix.
+2. **Signed/unsigned narrowing in `PdfiumWorker.cpp`.** `PageId{i}` with
+   `int i` is a narrowing conversion in a braced initialiser; GCC warns,
+   Clang refuses. Three sites, now explicit casts.
+3. **`std::from_chars` for floats does not exist in libc++.** The NDK's
+   standard library declares the floating-point overloads and never
+   defines them, so the call resolved to the deleted `bool` overload. The
+   SVG path parser in `Icons.cpp` now falls back to `strtof` on libc++.
+4. **`project(... LANGUAGES CXX)` silently dropped the NDK's
+   `android_native_app_glue.c`.** No error, no warning — the `.so` simply
+   linked without `ANativeActivity_onCreate`, which Android resolves by
+   `dlsym`. The app would have failed to start with no useful diagnostic.
+   C is now enabled for that one file.
+
+Defect 4 is worth dwelling on: it is the exact failure mode this round was
+supposed to eliminate. The library built, linked, reported success, and
+was unloadable. Only `llvm-nm -D` on the result caught it. **Checking that
+a build produced the right symbols is not paranoia on a new platform; it
+is the only evidence that exists.**
+
+### What was written
+
+* **`folio-platform/android/AndroidWindow.cpp`** — `ANativeWindow` +
+  EGL/GLES3 (stencil 8, no depth, no MSAA, matching every other backend),
+  the looper wired to `poll`/`waitEvents`/`wake`, and the lifecycle. Three
+  Android-specific realities are handled explicitly rather than papered
+  over:
+  - *There is no window to create.* `createWindow` waits for
+    `APP_CMD_INIT_WINDOW` and adopts what it is given. Losing the surface
+    on background or rotate is normal operation, and the **EGL context is
+    kept across it** — recreating it would throw away every texture Skia
+    has uploaded.
+  - *One `MotionEvent` carries every pointer.* A pinch is a single
+    `ACTION_MOVE` holding both fingers plus the historical samples
+    batched since the last frame. Each event fans out to one Folio event
+    per pointer, **historical samples first** — discarding them is what
+    makes a fast stroke look polygonal, the same reason the browser shell
+    asks for coalesced events.
+  - *Focus loss voids every contact.* A finger mid-pinch when the app
+    backgrounds will never report an UP, so `APP_CMD_LOST_FOCUS` emits
+    `PointerCancel`.
+  - Stylus is read from `AMOTION_EVENT_TOOL_TYPE_STYLUS/ERASER`, pressure
+    from `getPressure`, and Android's single tilt-plus-orientation pair is
+    decomposed onto the tiltX/tiltY axes the rest of Folio uses.
+  - `AKEYCODE_BACK` maps to `Escape`. Swallowing Back is a one-star
+    review.
+* **`folio-ui/shell/main_android.cpp`** — `android_main`, plus unpacking
+  fonts out of the APK. APK assets are zip entries, and Skia's font
+  manager wants paths, so the fonts are extracted once into the app's
+  private directory. The path arithmetic here is off-by-one-level easy to
+  get wrong: Gradle packages the *contents* of `assets.srcDirs` at the
+  asset root, so the repository's `assets/fonts/x.ttf` is addressed as
+  `fonts/x.ttf` inside the APK, and what the shell is handed must be the
+  *parent* of the unpacked `fonts/`.
+* **`android/`** — Gradle project: `build.gradle.kts` driving our existing
+  CMake through `externalNativeBuild`, and a `NativeActivity` manifest
+  with no Java at all (`android:hasCode="false"`). `configChanges` claims
+  orientation and density so a rotation does not destroy the activity and
+  discard the page cache.
+* `NativeShellOptions::assetDir` — desktop still derives it from the
+  executable path; Android passes the unpacked directory.
+
+### Android status, stated plainly
+
+| | |
+|---|---|
+| Cross-compiles for arm64-v8a | **Yes**, whole stack, zero warnings |
+| Links to a loadable `.so` with both entry points | **Yes**, verified with `llvm-nm -D` |
+| Platform backend selected | **`android`**, no longer `none` |
+| Ever run on a device or emulator | **No.** No SDK, no emulator, no device here. |
+| Gradle layer ever executed | **No.** No Android SDK and no Gradle in this sandbox. |
+| Clipboard | No-op. Needs JNI to `ClipboardManager`. |
+| File open/save | **No native picker.** Modern Android has no file-path dialog at all — scoped storage replaced it with SAF, which returns a `content://` URI and a file descriptor, and that does not fit `IFileDialog`'s path-shaped interface. `available()` returns false so the in-app `OpenDialog` is used instead, which is a real experience on a sandboxed app directory. Opening documents from Files or Gmail needs the SAF bridge. |
+| PoDoFo | Not cross-compiled, so **no save on Android yet** — same blocker as WASM. |
+
+So: the C++ is real and verified as far as a machine without an Android
+device can verify it. The Java/Gradle/APK layer is written and
+**unexecuted**. Nobody should read "Android builds" as "Android runs".
+
+## 22.3 Verification notes
+
+* **The Linux build and all 12 tests stay green** after the shared changes
+  (`PdfiumWorker.cpp`, `Icons.cpp`, `cmake/FolioDependencies.cmake`,
+  `CMakeLists.txt`). The new test is `platform.xi.valuator`.
+* **Search highlighting was re-verified visually**, because clearing a
+  `-Wshadow` warning in `PageStage.cpp` meant renaming a loop variable
+  inside the highlight draw path — a rename that initially left the body
+  referring to the *outer* `r`, which is precisely the bug the warning
+  exists to prevent. Searching "Revenue" in Annual_Report_2026 reports
+  "1 of 23" and draws the current hit in orange, as before.
+* **`tools/build-android.sh`** builds either ABI from scratch, fetching the
+  NDK if absent, and then **asserts on the exported symbols**. Its first
+  version reported a false failure: under `set -o pipefail`, `grep -q`
+  exits on its first match, `nm` takes SIGPIPE, and the pipeline reports
+  failure *because* the symbol was found. The check now captures the
+  symbol list once. Worth recording as a general trap — `pipefail` plus
+  `grep -q` inverts the result of any such test.
+* **Clang surfaces nine cosmetic warnings that GCC does not** (unused
+  private fields, an unused lambda capture, constants shadowed in an
+  anonymous namespace). They are listed in the build log and left for a
+  hygiene pass; none affects behaviour. The four that did matter are fixed
+  and described in §22.2.
+
+## 22.4 WebAssembly
+
+Answered in full in **`WASM-ASSESSMENT.md`**. The headline: §13 of the
+architecture plan is out of date in Folio's favour. Skia and PDFium both
+ship prebuilt Emscripten artefacts at the versions already pinned here
+(`Skia-m144-...-wasm-Release-wasm.zip`, 23.5 MB; `pdfium-wasm.tgz`,
+2.5 MB), and committing to Skia deleted the Qt-on-WASM GPLv3 problem
+entirely. The blocker has moved to **PoDoFo**, which has no Emscripten
+build, so a web Folio reads and annotates but cannot save until that is
+cross-compiled. Recommended order: Android, then Windows (808 lines
+already written and never compiled — the best value per hour left), then
+WASM.
+
+One trap recorded there and repeated here because it will otherwise be
+rediscovered: `folio-platform/CMakeLists.txt` still reads
+`elseif(UNIX AND NOT APPLE AND NOT ANDROID AND NOT EMSCRIPTEN)`, so an
+Emscripten configure silently selects the headless `none` backend — the
+same false success Android was in until this round.
+
+---
+
+# Round 23 — the first Windows CI run, and a real APK
+
+The Windows build was pushed and failed. Every one of those failures is
+fixed, and while getting there the Android story moved from "a `.so` that
+links" to an actual installable APK.
+
+## 23.1 Windows / MSVC — four causes, not four bugs
+
+The CI log showed ~15 errors. They reduce to four root causes.
+
+**1. `std::max` colliding with `windows.h` (the `C2589`/`C2059` cluster).**
+PDFium's public headers include `<windows.h>`, which defines `min` and `max`
+as function-like macros, so `std::max(0, n)` preprocesses into
+`std::(((0) > (n)) ? (0) : (n))` — "illegal token on right side of `::`".
+The error points at our code and never mentions the macro, which is why it
+looks like a syntax error in a line that is obviously fine.
+
+Fix is `add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)` at
+top level, placed immediately after `project()` so it reaches **every**
+target, not just the ones that include `<windows.h>` themselves.
+
+*Verified, not assumed.* Reproduced with GCC: a TU containing `#define max`
+before `<algorithm>` produces the same class of failure. That matters
+because a fix I cannot reproduce is a fix I am guessing at.
+
+**2. `-Wno-conversion` reaching `cl.exe` (`D8021: invalid numeric
+argument`).** Three sites passed GCC/Clang flags unguarded:
+`folio-render-skia`, `folio-engine-podofo`, and the header block in
+`folio-platform`. `folio_relax_warnings()` was always MSVC-aware; these
+three just bypassed it. Now routed through the helper or `if(MSVC)`
+guarded. MSVC *rejects* unknown `/W` flags rather than ignoring unknown
+`-W` ones, so this is not cosmetic — it stops the build dead.
+
+**3. `Draw.h` using `std::string` while including only `<string_view>`
+(`C2039: 'string': is not a member of 'std'`).** A missing include, made
+invisible by libstdc++ pulling `<string>` in transitively. This class of bug
+is *undetectable from Linux, ever* — so a lint was written instead of a
+prayer.
+
+**4. `C2397` narrowing at the `PageId{...}` sites.** Already fixed in round
+22 as a *Clang/NDK* fix (the NDK's clang is stricter than GCC here); their
+Windows run was from before it. The `C4267` size_t→int warnings on the same
+lines were the round-22 fix being incomplete, and are now fixed properly.
+
+Plus four `C4005` macro-redefinition warnings: `Win32Window.cpp` defined
+`WIN32_LEAN_AND_MEAN`/`NOMINMAX`/`UNICODE`/`_UNICODE` that CMake also sets
+on the command line. Guarded with `#ifndef` so the file still compiles
+outside our build system. `_CRT_SECURE_NO_WARNINGS` added project-wide for
+the `getenv`/`sscanf` C4996 noise.
+
+## 23.2 The header check, and what it found
+
+`tools/check-header-includes.py` is a deliberately conservative text lint:
+for a known list of std symbols it reports any use whose owning header is
+not included. It only judges the header that *owns* the symbol and expands a
+handful of standardised re-exports (`<string>` → `std::string_view`), because
+inferring transitive includes is the very thing that caused the bug.
+
+It found **39 missing includes across 24 headers**, including three more
+`std::string` cases — `FolioApp.h`, `ReaderScreen.h`, `WelcomeScreen.h` —
+that would each have failed the Windows build exactly like `Draw.h` did, on
+the next file anyone touched. All fixed, plus `tools/fix-header-includes.py`
+to re-run the repair idiomatically. The check now runs as the **first step of
+the `core-only` CI job**, ahead of the compiler, and costs about a second.
+
+Changed headers (24): folio-core `render/TileGrid.h`, `render/TileKey.h`,
+`util/Arena.h` · folio-engine `PdfiumPause.h`, `PdfiumRasterizer.h`,
+`SnapshotFileAccess.h` · folio-render `SkiaPaintTarget.h`,
+`SkiaTileCompositor.h` · folio-ui `Annotations.h`, `Button.h`,
+`Containers.h`, `Controls.h`, `Edits.h`, `PageStage.h`, `WidthStrip.h`,
+`Draw.h`, `Theme.h`, `Widget.h`, `FolioApp.h`, `ReaderScreen.h`,
+`WelcomeScreen.h`, `HttpServer.h`, `StreamShell.h` · plus
+`folio-engine/pdfium/PdfiumWorker.cpp` and `folio-platform/win32/
+Win32Window.cpp`.
+
+## 23.3 "Without an APK, how would it be tested?" — you were right
+
+Challenging the claim was correct, and the honest answer would have been
+"it wouldn't". So the toolchain was fetched and an APK was actually built.
+**There is now a real `app-debug.apk`, 36 MB**, containing
+`lib/{arm64-v8a,x86_64}/{libfolio-android.so,libpdfium.so,libc++_shared.so}`
+and `assets/fonts/DMSans-Variable.ttf`, with
+`package: ai.folio.reader`, `launchable-activity: android.app.NativeActivity`,
+`native-code: 'arm64-v8a' 'x86_64'`, `sdkVersion: 26`.
+
+Building it found two more real defects, both of the "looks fine, isn't"
+kind:
+
+* **`folio-android` silently vanished for any ABI without prebuilts.**
+  x86_64 has no Skia in the cache, so CMake skipped the target and Gradle
+  reported `Unexpected native build target folio-android` — technically true,
+  diagnostically useless. Now a `FATAL_ERROR` naming the ABI and the exact
+  bootstrap command.
+* **`ndk.dir` in `local.properties` is rejected by AGP 8** (`CXX1102`) unless
+  the NDK sits under the SDK root. The NDK must be installed via
+  `sdkmanager`, not pointed at.
+
+`tools/build-apk.sh` captures the whole working sequence (JDK 17 → SDK →
+per-ABI prebuilts → Gradle), and `android/.gitignore` exists because
+Gradle's `.cxx` scratch tree is **212 MB under a directory name that is not
+snapshot-excluded** — unlike `build/`, it gets committed. The script now
+removes it after packaging (`KEEP_CXX=1` to opt out). Workspace is back to
+**6.2 MB**.
+
+**What this does NOT prove:** it cannot be *run*. `/dev/kvm` does not exist,
+so there is no hardware-accelerated emulator, and a software-emulated
+GLES3+PDFium app would be too slow to tell a hang from a bug. The APK is
+verified by inspection. **The first launch on real hardware is still the
+first launch**, and touch, pen, and the font-unpacking path remain
+unexercised on device.
+
+Manifest: dropped the `package` attribute (AGP 8 ignores it and warns).

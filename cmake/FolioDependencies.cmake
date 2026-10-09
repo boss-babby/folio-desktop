@@ -26,7 +26,23 @@ set(FOLIO_HAVE_PODOFO OFF)
 # ---------------------------------------------------------------------------
 # PDFium
 # ---------------------------------------------------------------------------
-set(_pdfium_root "${FOLIO_DEPS_DIR}/pdfium")
+# Cross builds keep their prebuilts in target-specific directories, exactly
+# as tools/bootstrap-deps.sh writes them. The host build keeps the
+# unsuffixed paths it has always used.
+set(_folio_dep_suffix "")
+if(ANDROID)
+    if(CMAKE_ANDROID_ARCH_ABI STREQUAL "arm64-v8a")
+        set(_folio_dep_suffix "-android-arm64")
+    elseif(CMAKE_ANDROID_ARCH_ABI STREQUAL "x86_64")
+        set(_folio_dep_suffix "-android-x64")
+    else()
+        message(FATAL_ERROR
+            "no Folio prebuilts for Android ABI ${CMAKE_ANDROID_ARCH_ABI} "
+            "(skia-pack ships arm64 and x64 only)")
+    endif()
+endif()
+
+set(_pdfium_root "${FOLIO_DEPS_DIR}/pdfium${_folio_dep_suffix}")
 if(EXISTS "${_pdfium_root}/include/fpdfview.h")
     # The bblanchon archives ship a shared library on every platform; static
     # builds exist only via their local build script. For iOS we will need
@@ -79,7 +95,7 @@ endif()
 # rather than INTERFACE_LINK_LIBRARIES on separate targets, because CMake will
 # happily reorder the latter.
 # ---------------------------------------------------------------------------
-set(_skia_root "${FOLIO_DEPS_DIR}/skia")
+set(_skia_root "${FOLIO_DEPS_DIR}/skia${_folio_dep_suffix}")
 
 # Static library spelling differs by toolchain: libfoo.a on Unix, foo.lib
 # under MSVC. Everything below is written once against these two, so adding
@@ -114,6 +130,12 @@ if(EXISTS "${_skia_root}/include/core/SkCanvas.h")
         if(WIN32)
             set(_skia_sys opengl32 user32 gdi32 ole32 oleaut32 advapi32
                           usp10 fontsub shlwapi windowscodecs)
+        elseif(ANDROID)
+            # Skia's Android pack calls __android_log_vprint from SkDebugf
+            # and uses the platform GLES/EGL loaders. These are platform
+            # libraries, not optional extras: without them the archive has
+            # undefined symbols and nothing links.
+            set(_skia_sys log android EGL GLESv3)
         endif()
 
         # Link order matters and CMake reorders INTERFACE_LINK_LIBRARIES on

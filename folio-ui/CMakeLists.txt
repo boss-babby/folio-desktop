@@ -51,6 +51,7 @@ add_library(folio-ui-core STATIC
     components/WindowChrome.cpp
     components/Controls.cpp
     components/Containers.cpp
+    components/Gestures.cpp
     components/PageStage.cpp
     components/Overlays.cpp
     components/OpenDialog.cpp
@@ -144,4 +145,42 @@ if(TARGET folio-render-skia)
     folio_enable_warnings(folio-desktop)
     folio_relax_warnings(folio-desktop)
     message(STATUS "  native shell: folio-desktop (${FOLIO_PLATFORM_BACKEND})")
+endif()
+
+# ---------------------------------------------------------------------------
+# folio-android : the NativeActivity shared library
+#
+# Android loads a .so, not an executable, and the manifest names it in
+# android.app.lib_name. Everything inside is the same NativeShell the
+# desktop binary runs.
+# ---------------------------------------------------------------------------
+if(ANDROID AND NOT TARGET folio-render-skia)
+    # Without this, the target simply does not exist and Gradle fails with
+    # "Unexpected native build target folio-android", which says nothing
+    # about the actual cause: prebuilts were never fetched for this ABI.
+    message(FATAL_ERROR
+        "folio-android needs Skia for ${CMAKE_ANDROID_ARCH_ABI}, which is "
+        "not in ${FOLIO_DEPS_DIR}. Fetch it first:\n"
+        "  FOLIO_TARGET=android FOLIO_ABI=<arm64|x64> "
+        "bash tools/bootstrap-deps.sh")
+endif()
+
+if(ANDROID AND TARGET folio-render-skia)
+    add_library(folio-android SHARED
+        shell/main_android.cpp
+        shell/NativeShell.cpp
+        # See the note in folio-platform/CMakeLists.txt: the glue has to be
+        # compiled into the .so, not linked from an archive.
+        "${CMAKE_ANDROID_NDK}/sources/android/native_app_glue/android_native_app_glue.c")
+    target_link_libraries(folio-android PRIVATE
+        folio-ui-app folio-render-skia folio-platform
+        android log EGL GLESv3)
+    target_include_directories(folio-android PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/shell")
+    folio_enable_warnings(folio-android)
+    folio_relax_warnings(folio-android)
+    # Belt and braces: even compiled in, --gc-sections can take an export
+    # that nothing references from inside the library.
+    target_link_options(folio-android PRIVATE
+        "LINKER:--undefined=ANativeActivity_onCreate")
 endif()

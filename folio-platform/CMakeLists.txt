@@ -27,6 +27,25 @@ elseif(APPLE AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/cocoa/CocoaWindow.mm")
     set(_folio_platform_libs ${COCOA_LIB} ${QUARTZCORE_LIB} ${OPENGL_LIB})
     set(_folio_platform_backend "cocoa")
 
+elseif(ANDROID AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/android/AndroidWindow.cpp")
+    # native_app_glue ships as source with the NDK and is expected to be
+    # compiled into the app, not linked from a prebuilt. It is what turns
+    # NativeActivity's callback soup into a thread with a looper.
+    # The glue .c is deliberately NOT compiled here. It defines
+    # ANativeActivity_onCreate, which nothing in this library references -
+    # the runtime finds it by dlsym. Inside a static archive the linker
+    # therefore discards it, the .so exports no entry point, and Android
+    # fails to load the app with no useful diagnostic. It is compiled into
+    # the shared library instead (see folio-ui/CMakeLists.txt), where it is
+    # always present. Only the header is needed to build against.
+    set(_glue "${CMAKE_ANDROID_NDK}/sources/android/native_app_glue")
+    if(NOT EXISTS "${_glue}/android_native_app_glue.c")
+        message(FATAL_ERROR "native_app_glue not found under ${_glue}")
+    endif()
+    set(_folio_platform_sources android/AndroidWindow.cpp)
+    set(_folio_platform_libs android log EGL GLESv3)
+    set(_folio_platform_backend "android")
+
 elseif(UNIX AND NOT APPLE AND NOT ANDROID AND NOT EMSCRIPTEN)
     # X11 and EGL are resolved by hand rather than through find_package so a
     # sandbox with headers unpacked outside /usr can point at them with
@@ -41,6 +60,16 @@ elseif(UNIX AND NOT APPLE AND NOT ANDROID AND NOT EMSCRIPTEN)
     # GrGLMakeGLXInterface.cpp whether or not we use GLX, so glXGetProcAddress
     # and glXGetCurrentContext have to resolve at link time.
     find_library(FOLIO_GL_LIB NAMES GL
+        HINTS "${FOLIO_GLDEV_ROOT}/usr/lib/x86_64-linux-gnu"
+              "${FOLIO_GLDEV_ROOT}/usr/lib" ENV FOLIO_GLDEV_ROOT)
+
+    # XInput2: multi-touch and pen pressure. Optional on purpose - without
+    # it the backend still builds and single-touch still works through the
+    # server's core-pointer emulation, so a machine with no libXi headers
+    # loses pinch and pressure rather than the whole X11 backend.
+    find_path(FOLIO_XI2_INCLUDE_DIR X11/extensions/XInput2.h
+        HINTS "${FOLIO_GLDEV_ROOT}/usr/include" ENV FOLIO_GLDEV_ROOT)
+    find_library(FOLIO_XI2_LIB NAMES Xi
         HINTS "${FOLIO_GLDEV_ROOT}/usr/lib/x86_64-linux-gnu"
               "${FOLIO_GLDEV_ROOT}/usr/lib" ENV FOLIO_GLDEV_ROOT)
 
@@ -61,6 +90,14 @@ elseif(UNIX AND NOT APPLE AND NOT ANDROID AND NOT EMSCRIPTEN)
             list(APPEND _folio_platform_libs ${FOLIO_GL_LIB})
         endif()
         list(APPEND _folio_platform_libs -Wl,--as-needed)
+        if(FOLIO_XI2_INCLUDE_DIR AND FOLIO_XI2_LIB)
+            list(APPEND _folio_platform_libs ${FOLIO_XI2_LIB})
+            set(_folio_platform_xi2 ON)
+        else()
+            message(STATUS
+                "folio-platform: libXi not found - X11 builds without "
+                "multi-touch or pen pressure")
+        endif()
         set(_folio_platform_backend "x11")
     endif()
 endif()
@@ -69,9 +106,19 @@ add_library(folio-platform STATIC ${_folio_platform_sources})
 target_include_directories(folio-platform PUBLIC include)
 target_link_libraries(folio-platform PUBLIC ${_folio_platform_libs})
 
+if(_folio_platform_backend STREQUAL "android")
+    target_include_directories(folio-platform PUBLIC
+        "${CMAKE_ANDROID_NDK}/sources/android/native_app_glue")
+endif()
+
 if(_folio_platform_backend STREQUAL "x11")
     target_include_directories(folio-platform PRIVATE
         ${X11_INCLUDE_DIR} ${FOLIO_EGL_INCLUDE_DIR})
+    if(_folio_platform_xi2)
+        target_include_directories(folio-platform PRIVATE
+            ${FOLIO_XI2_INCLUDE_DIR})
+        target_compile_definitions(folio-platform PRIVATE FOLIO_HAVE_XI2=1)
+    endif()
 endif()
 
 # Xlib's macros and the EGL headers both trip -Wold-style-cast and friends.

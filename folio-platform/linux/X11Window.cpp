@@ -24,6 +24,11 @@
 #include <X11/Xresource.h>
 #include <X11/Xutil.h>
 #include <X11/cursorfont.h>
+#if FOLIO_HAVE_XI2
+#include <X11/extensions/XInput2.h>
+
+#include "XiValuator.h"
+#endif
 
 #include <EGL/egl.h>
 
@@ -55,9 +60,11 @@ constexpr int kFocusOut = FocusOut;
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <unordered_map>
 #include <string>
 
 namespace folio::platform {
@@ -576,6 +583,34 @@ private:
     // Double-click detection, which X11 does not do for you.
     Time lastClickTime_ = 0;
     int lastClickX_ = 0, lastClickY_ = 0;
+
+#if FOLIO_HAVE_XI2
+    // --- XInput2 ----------------------------------------------------------
+    // What a physical device can tell us, resolved once per device id and
+    // cached. Valuator *numbers* are per-device and have no fixed meaning,
+    // so the axis a stylus reports pressure on has to be looked up by its
+    // label atom before any event from it can be read.
+    struct XiAxis {
+        int number = -1;
+        double min = 0.0, max = 0.0;
+        [[nodiscard]] bool valid() const noexcept { return number >= 0 && max > min; }
+        [[nodiscard]] double norm(double v) const noexcept {
+            return (v - min) / (max - min);
+        }
+    };
+    struct XiDevice {
+        PointerSource source = PointerSource::Mouse;
+        XiAxis pressure, tiltX, tiltY;
+    };
+
+    void initXI2();
+    bool translateXI(XGenericEventCookie& cookie);
+    const XiDevice& deviceFor(int sourceId);
+
+    int xiOpcode_ = -1;
+    bool xiActive_ = false;
+    std::unordered_map<int, XiDevice> xiDevices_;
+#endif
 };
 
 bool X11Window::create(const WindowDesc& desc, std::string* error) {
@@ -632,6 +667,13 @@ bool X11Window::create(const WindowDesc& desc, std::string* error) {
         if (error) *error = "XCreateWindow failed";
         return false;
     }
+
+#if FOLIO_HAVE_XI2
+    // Must run before the window is mapped: it replaces the core pointer
+    // event mask chosen above, and doing that after the first events have
+    // been delivered would drop them.
+    initXI2();
+#endif
 
     if (!desc.systemDecorations) {
         MotifHints hints{};
@@ -974,6 +1016,220 @@ void X11Window::translate(const XEvent& ev) {
     }
 }
 
+#if FOLIO_HAVE_XI2
+// ---------------------------------------------------------------------------
+// XInput2: multi-touch and pen pressure
+//
+// Core X11 gives one pointer, one position and no pressure. Everything a
+// tablet or a touchscreen knows beyond that arrives only through XI2, as
+// GenericEvents carrying a per-device valuator set.
+//
+// Two things make this more than a translation layer:
+//
+//  * Valuator numbers are per-device. "Axis 2" is pressure on one stylus
+//    and tilt on another, so each device's axes are resolved by their
+//    label atoms once and cached.
+//  * Selecting touch events changes core delivery. Once a client selects
+//    XI_TouchBegin on a window, the server stops sending it the emulated
+//    core pointer events for that touch. That is exactly what we want -
+//    but it means the core ButtonPress/MotionNotify masks must come off
+//    at the same time, or a mouse would be delivered twice.
+// ---------------------------------------------------------------------------
+
+void X11Window::initXI2() {
+    int event = 0, error = 0;
+    if (!XQueryExtension(dpy_, "XInputExtension", &xiOpcode_, &event, &error))
+        return;
+
+    // 2.2 is the first version with multi-touch. Asking for it on an older
+    // server returns the server's version instead of failing, so the reply
+    // has to be checked rather than trusted.
+    int major = 2, minor = 2;
+    if (XIQueryVersion(dpy_, &major, &minor) != Success) return;
+    if (major < 2 || (major == 2 && minor < 2)) return;
+
+    unsigned char mask[XIMaskLen(XI_LASTEVENT)] = {0};
+    XISetMask(mask, XI_ButtonPress);
+    XISetMask(mask, XI_ButtonRelease);
+    XISetMask(mask, XI_Motion);
+    XISetMask(mask, XI_TouchBegin);
+    XISetMask(mask, XI_TouchUpdate);
+    XISetMask(mask, XI_TouchEnd);
+
+    XIEventMask em;
+    em.deviceid = XIAllMasterDevices;
+    em.mask_len = sizeof(mask);
+    em.mask = mask;
+    if (XISelectEvents(dpy_, win_, &em, 1) != Success) return;
+
+    xiActive_ = true;
+    if (std::getenv("FOLIO_DEBUG_INPUT"))
+        std::fprintf(stderr,
+                     "[input] XInput2 %d.%d active: pointer, touch and pen "
+                     "events arrive as XI2; core pointer masks released\n",
+                     major, minor);
+
+    // Hand pointer input over to XI2 wholesale. Leaving the core masks on
+    // would deliver every mouse click twice: once as ButtonPress and once
+    // as XI_ButtonPress.
+    XSelectInput(dpy_, win_,
+                 ExposureMask | StructureNotifyMask | KeyPressMask |
+                     KeyReleaseMask | LeaveWindowMask | FocusChangeMask |
+                     PropertyChangeMask);
+}
+
+const X11Window::XiDevice& X11Window::deviceFor(int sourceId) {
+    if (auto it = xiDevices_.find(sourceId); it != xiDevices_.end())
+        return it->second;
+
+    XiDevice dev;
+    int count = 0;
+    if (XIDeviceInfo* info = XIQueryDevice(dpy_, sourceId, &count)) {
+        for (int i = 0; i < count; ++i) {
+            for (int c = 0; c < info[i].num_classes; ++c) {
+                const XIAnyClassInfo* any = info[i].classes[c];
+                if (any->type == XITouchClass) {
+                    const auto* t =
+                        reinterpret_cast<const XITouchClassInfo*>(any);
+                    // Indirect touch is a trackpad: the OS already turns it
+                    // into pointer motion and scroll, and treating it as a
+                    // touchscreen would fight the desktop.
+                    if (t->mode == XIDirectTouch)
+                        dev.source = PointerSource::Touch;
+                    continue;
+                }
+                if (any->type != XIValuatorClass) continue;
+                const auto* v =
+                    reinterpret_cast<const XIValuatorClassInfo*>(any);
+                if (v->label == None) continue;
+                char* label = XGetAtomName(dpy_, v->label);
+                if (!label) continue;
+                XiAxis axis{v->number, v->min, v->max};
+                if (std::strcmp(label, "Abs Pressure") == 0) {
+                    dev.pressure = axis;
+                    // Only a stylus reports pressure. A touchscreen that
+                    // also does was already classified above and keeps
+                    // Touch, which is the behaviour we want.
+                    if (dev.source == PointerSource::Mouse)
+                        dev.source = PointerSource::Pen;
+                } else if (std::strcmp(label, "Abs Tilt X") == 0) {
+                    dev.tiltX = axis;
+                } else if (std::strcmp(label, "Abs Tilt Y") == 0) {
+                    dev.tiltY = axis;
+                }
+                XFree(label);
+            }
+        }
+        XIFreeDeviceInfo(info);
+    }
+    if (std::getenv("FOLIO_DEBUG_INPUT")) {
+        static const char* kSrc[] = {"mouse", "touch", "pen"};
+        std::fprintf(stderr,
+                     "[input] device %d: %s (pressure axis %d, tilt %d/%d)\n",
+                     sourceId, kSrc[static_cast<int>(dev.source)],
+                     dev.pressure.number, dev.tiltX.number, dev.tiltY.number);
+    }
+    return xiDevices_.emplace(sourceId, dev).first->second;
+}
+
+bool X11Window::translateXI(XGenericEventCookie& cookie) {
+    const auto* de = static_cast<const XIDeviceEvent*>(cookie.data);
+    const XiDevice& dev = deviceFor(de->sourceid);
+
+    Event e;
+    e.x = de->event_x;
+    e.y = de->event_y;
+    e.mods = modsFromState(de->mods.effective);
+    e.source = dev.source;
+
+    const auto readAxis = [&](const XiAxis& axis, float& out, bool degrees) {
+        if (!axis.valid()) return;
+        double raw = 0.0;
+        if (!folio::platform::x11detail::valuator(
+                de->valuators.mask, de->valuators.mask_len,
+                de->valuators.values, axis.number, &raw))
+            return;
+        out = degrees ? static_cast<float>(raw)
+                      : static_cast<float>(std::clamp(axis.norm(raw), 0.0, 1.0));
+    };
+
+    switch (cookie.evtype) {
+        case XI_TouchBegin:
+        case XI_TouchUpdate:
+        case XI_TouchEnd:
+            e.source = PointerSource::Touch;
+            // `detail` is the touch sequence id: stable for the life of one
+            // contact, which is exactly the identity a gesture tracker needs
+            // to tell two fingers apart.
+            e.pointerId = static_cast<std::uint32_t>(de->detail);
+            e.button = Button::Left;
+            e.pressure = cookie.evtype == XI_TouchEnd ? 0.f : 1.f;
+            e.type = cookie.evtype == XI_TouchBegin  ? Event::Type::PointerDown
+                     : cookie.evtype == XI_TouchEnd  ? Event::Type::PointerUp
+                                                     : Event::Type::PointerMove;
+            if (cookie.evtype == XI_TouchBegin) {
+                const bool near = std::abs(e.x - lastClickX_) < 4 &&
+                                  std::abs(e.y - lastClickY_) < 4;
+                e.clickCount = (near && de->time - lastClickTime_ < 400) ? 2 : 1;
+                lastClickTime_ = de->time;
+                lastClickX_ = static_cast<int>(e.x);
+                lastClickY_ = static_cast<int>(e.y);
+            }
+            queue_.push_back(std::move(e));
+            return true;
+
+        case XI_Motion:
+            readAxis(dev.pressure, e.pressure, false);
+            readAxis(dev.tiltX, e.tiltX, true);
+            readAxis(dev.tiltY, e.tiltY, true);
+            e.type = Event::Type::PointerMove;
+            queue_.push_back(std::move(e));
+            return true;
+
+        case XI_ButtonPress:
+        case XI_ButtonRelease: {
+            // Wheel notches are still buttons 4-7 here, exactly as in core.
+            if (de->detail >= 4 && de->detail <= 7) {
+                if (cookie.evtype == XI_ButtonRelease) return true;
+                e.type = Event::Type::Wheel;
+                e.wheelY = de->detail == 4 ? 1.0 : (de->detail == 5 ? -1.0 : 0.0);
+                e.wheelX = de->detail == 6 ? -1.0 : (de->detail == 7 ? 1.0 : 0.0);
+                queue_.push_back(std::move(e));
+                return true;
+            }
+            readAxis(dev.pressure, e.pressure, false);
+            readAxis(dev.tiltX, e.tiltX, true);
+            readAxis(dev.tiltY, e.tiltY, true);
+            // A pen that reports no pressure on contact is a pen whose
+            // driver does not expose the axis; treat the barrel switch as
+            // full pressure so stroke width stays usable.
+            if (dev.source == PointerSource::Pen && e.pressure <= 0.f &&
+                cookie.evtype == XI_ButtonPress)
+                e.pressure = 1.f;
+            e.type = cookie.evtype == XI_ButtonPress ? Event::Type::PointerDown
+                                                     : Event::Type::PointerUp;
+            e.button = de->detail == 1   ? Button::Left
+                       : de->detail == 2 ? Button::Middle
+                       : de->detail == 3 ? Button::Right
+                                         : Button::Other;
+            if (cookie.evtype == XI_ButtonPress) {
+                const bool near = std::abs(e.x - lastClickX_) < 4 &&
+                                  std::abs(e.y - lastClickY_) < 4;
+                e.clickCount = (near && de->time - lastClickTime_ < 400) ? 2 : 1;
+                lastClickTime_ = de->time;
+                lastClickX_ = static_cast<int>(e.x);
+                lastClickY_ = static_cast<int>(e.y);
+            }
+            queue_.push_back(std::move(e));
+            return true;
+        }
+
+        default:
+            return false;
+    }
+}
+#endif  // FOLIO_HAVE_XI2
+
 void X11Window::drainX() {
     if (!dpy_) return;
     XEvent ev;
@@ -983,6 +1239,19 @@ void X11Window::drainX() {
         // candidate windows) before anything else looks at it.
         if (XFilterEvent(&ev, win_)) continue;
         if (theClipboard().handle(ev)) continue;
+#if FOLIO_HAVE_XI2
+        // XI2 arrives as a cookie whose payload the server owns; it is only
+        // valid between XGetEventData and XFreeEventData, so it has to be
+        // consumed here rather than handed on.
+        if (xiActive_ && ev.type == GenericEvent &&
+            ev.xcookie.extension == xiOpcode_) {
+            if (XGetEventData(dpy_, &ev.xcookie)) {
+                translateXI(ev.xcookie);
+                XFreeEventData(dpy_, &ev.xcookie);
+            }
+            continue;
+        }
+#endif
         translate(ev);
     }
 }

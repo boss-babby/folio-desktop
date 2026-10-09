@@ -5,6 +5,7 @@
 #include <fpdf_text.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <cmath>
 #include <utility>
 
@@ -162,10 +163,11 @@ void PdfiumWorker::threadMain() {
             if (ok) {
                 // Read on this thread, where the FPDF_DOCUMENT lives.
                 toc = rast.outline();
-                const int n = rast.pageCount();
+                const auto n = static_cast<int>(rast.pageCount());
                 meta.reserve(static_cast<std::size_t>(std::max(0, n)));
                 for (int i = 0; i < n; ++i) {
-                    const auto info = rast.pageInfo(folio::core::PageId{i});
+                    const auto info = rast.pageInfo(
+                        folio::core::PageId{static_cast<std::uint32_t>(i)});
                     meta.push_back(
                         PageMeta{info.widthPt, info.heightPt, info.rotation});
                 }
@@ -193,7 +195,8 @@ void PdfiumWorker::threadMain() {
 
         if (job.kind == Kind::Render) {
             res.scale = job.scale;
-            auto tile = rast.renderFullPage(folio::core::PageId{job.page},
+            auto tile = rast.renderFullPage(
+                folio::core::PageId{static_cast<std::uint32_t>(job.page)},
                                             job.scale, job.rotation,
                                             folio::core::ColorScheme::Light);
             if (tile) {
@@ -203,7 +206,8 @@ void PdfiumWorker::threadMain() {
             }
         } else {
             auto text = std::make_shared<PageText>();
-            if (FPDF_PAGE page = rast.borrowPage(folio::core::PageId{job.page})) {
+            if (FPDF_PAGE page = rast.borrowPage(
+                    folio::core::PageId{static_cast<std::uint32_t>(job.page)})) {
                 if (FPDF_TEXTPAGE tp = FPDFText_LoadPage(page)) {
                     const int n = FPDFText_CountChars(tp);
                     const auto m = pageMeta(job.page);

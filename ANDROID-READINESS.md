@@ -1,5 +1,18 @@
 # Is Folio ready to build for Android on GitHub?
 
+> **SUPERSEDED IN PART — round 22.** This document was written when nothing
+> Android existed. Since then the NDK toolchain, the platform backend, the
+> entry point and the Gradle project have all been written, and **the whole
+> native stack now cross-compiles and links for arm64-v8a**, producing
+> `libfolio-android.so` with both required entry points. Build it with
+> `tools/build-android.sh`.
+>
+> What remains true: **nothing has ever run on a device or emulator**, the
+> Gradle/APK layer has never been executed (no Android SDK here), and the
+> file-access, clipboard and save stories below are still unsolved. Read
+> the headline "No" as "not shippable", not as "not started" — and see
+> §22.2 of `STATUS.md` for exactly what is and is not verified.
+
 **No.** Not close, and not for the reason you might expect.
 
 The short version: **the dependencies are ready, the application is not.**

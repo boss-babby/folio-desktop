@@ -8,6 +8,7 @@
 #include "folio/ui/Draw.h"
 #include "folio/ui/Widget.h"
 
+#include <cstdint>
 #include <functional>
 #include <string>
 #include <vector>

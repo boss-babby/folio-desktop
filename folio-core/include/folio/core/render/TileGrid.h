@@ -12,6 +12,7 @@
 #pragma once
 
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 #include "folio/core/render/TileKey.h"

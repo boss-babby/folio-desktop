@@ -18,6 +18,8 @@
 
 #pragma once
 
+#include <cstdint>
+#include <utility>
 #include <fpdf_progressive.h>
 
 #include <chrono>

@@ -1005,6 +1005,21 @@ bool PageStage::handleAuthoring(const PointerEvent& e) {
         case PointerPhase::Up: {
             if (!authoring_) return false;
             authoring_ = false;
+            // A pen stroke commits at a width scaled by how hard it was
+            // pressed. Mean pressure over the stroke, not the value at
+            // lift-off, which is always near zero as the nib comes away.
+            if (penPressN_ > 0 && store_) {
+                if (Annotation* d = store_->draft()) {
+                    if (d->kind == AnnotKind::Ink ||
+                        d->kind == AnnotKind::Signature) {
+                        const float mean =
+                            penPressSum_ / static_cast<float>(penPressN_);
+                        d->width *= std::clamp(0.45f + mean, 0.45f, 1.75f);
+                    }
+                }
+                penPressSum_ = 0.f;
+                penPressN_ = 0;
+            }
             if (editTool_ != EditTool::Eraser) {
                 const std::uint64_t id = store_->commitDraft();
                 if (id && onAnnotationAdded) {
@@ -1041,6 +1056,60 @@ void appendUtf8(std::string& out, char32_t cp) {
     }
 }
 }  // namespace
+
+void PageStage::selectWordAt(int page, int glyph) {
+    const auto* gs = source_ ? source_->glyphs(page) : nullptr;
+    if (!gs || gs->empty()) return;
+    const int last = static_cast<int>(gs->size()) - 1;
+    if (glyph < 0 || glyph > last) return;
+
+    // Expand over a run of ONE script class, not over "everything that is
+    // not a space". Japanese has no spaces, so a whitespace-only rule
+    // selects the whole page; worse, it is silent about it. Classing the
+    // characters instead costs nothing and gets CJK roughly right:
+    // a kanji stem, its hiragana okurigana and a katakana loanword each
+    // form their own run, which is where a reader expects the selection
+    // to stop. Real segmentation needs a dictionary (MeCab/ICU); this is
+    // the honest approximation until one is linked.
+    enum Cls { Sep = 0, Word, Han, Kana, Kata, Hangul };
+    const auto classOf = [](char32_t c) -> Cls {
+        if (c == U' ' || c == U'\t' || c == U'\n' || c == U'\r' || c == 0xA0 ||
+            c == 0x3000)
+            return Sep;
+        if ((c >= 0x3001 && c <= 0x303F) ||            // 、。「」etc
+            (c >= 0xFF01 && c <= 0xFF0F) || (c >= 0xFF1A && c <= 0xFF20) ||
+            (c >= 0xFF3B && c <= 0xFF40) || (c >= 0xFF5B && c <= 0xFF65))
+            return Sep;                                // fullwidth punctuation
+        if ((c >= 0x4E00 && c <= 0x9FFF) || (c >= 0x3400 && c <= 0x4DBF) ||
+            (c >= 0xF900 && c <= 0xFAFF))
+            return Han;
+        if (c >= 0x3040 && c <= 0x309F) return Kana;
+        if ((c >= 0x30A0 && c <= 0x30FF) || (c >= 0x31F0 && c <= 0x31FF) ||
+            (c >= 0xFF66 && c <= 0xFF9D))
+            return Kata;
+        if ((c >= 0xAC00 && c <= 0xD7AF) || (c >= 0x1100 && c <= 0x11FF))
+            return Hangul;
+        if (c < 0x80 && !((c >= U'0' && c <= U'9') ||
+                          (c >= U'A' && c <= U'Z') ||
+                          (c >= U'a' && c <= U'z') || c == U'\'' || c == U'_'))
+            return Sep;                                // ASCII punctuation
+        return Word;   // Latin, fullwidth alnum, Cyrillic, Greek, ...
+    };
+
+    const Cls hit = classOf((*gs)[static_cast<std::size_t>(glyph)].code);
+    if (hit == Sep) {
+        selA_ = selB_ = TextPos{page, glyph};
+        return;
+    }
+    const auto same = [&](int i) {
+        return classOf((*gs)[static_cast<std::size_t>(i)].code) == hit;
+    };
+    int a = glyph, b = glyph;
+    while (a > 0 && same(a - 1)) --a;
+    while (b < last && same(b + 1)) ++b;
+    selA_ = TextPos{page, a};
+    selB_ = TextPos{page, b};
+}
 
 int PageStage::glyphAt(int page, Point n) {
     if (!source_) return -1;
@@ -1161,7 +1230,126 @@ void PageStage::selectAll() {
     selB_ = TextPos{last, gs ? static_cast<int>(gs->size()) - 1 : 0};
 }
 
+
+// ---------------------------------------------------------------------------
+// Touch
+// ---------------------------------------------------------------------------
+
+bool PageStage::handleTouch(const PointerEvent& e) {
+    // A mouse keeps every behaviour it already had, bit for bit. Touch is
+    // additive here, not a rewrite of a working input path.
+    if (e.pointerType == PointerType::Mouse) return false;
+
+    // A pen is a precision instrument and falls through to the ordinary
+    // paths so it can draw and select exactly like a mouse. All we take
+    // from it is nib pressure.
+    if (e.pointerType == PointerType::Pen) {
+        if (e.phase == PointerPhase::Down) { penPressSum_ = 0.f; penPressN_ = 0; }
+        if (e.phase == PointerPhase::Down || e.phase == PointerPhase::Move) {
+            penPressSum_ += e.pressure;
+            ++penPressN_;
+        }
+        return false;
+    }
+
+    touch_.onPointer(e);
+    const std::size_t n = touch_.count();
+
+    switch (e.phase) {
+        case PointerPhase::Down:
+            // Landing a finger stops a glide dead, the way grabbing a
+            // spinning wheel does. Nothing is more annoying than a page
+            // that keeps sliding under the finger trying to stop it.
+            smoothing_ = false;
+            velocity_ = 0.f;
+            pinchZoom_ = zoomTarget_;
+            // One finger with a tool active is a drawing stroke: let the
+            // authoring path have it.
+            if (n == 1 && editTool_ != EditTool::None) return false;
+            // A second finger landing mid-stroke means the user wanted to
+            // zoom, not to draw. Throw the half-drawn stroke away instead
+            // of committing a stray mark when that finger lifts.
+            if (n >= 2 && authoring_) {
+                store_->cancelDraft();
+                authoring_ = false;
+            }
+            touchPanning_ = (n >= 1);
+            return true;
+
+        case PointerPhase::Move: {
+            if (n >= 2) {
+                // Two fingers: scale about the midpoint and carry the page
+                // along with it, so the content under the fingers stays
+                // under the fingers.
+                const PinchState p = touch_.pinch();
+                setZoomFocus(p.centroid.x, p.centroid.y);
+                pinchZoom_ = std::clamp(pinchZoom_ * p.scale, kMinZoom, kMaxZoom);
+                zoomMode_ = ZoomMode::Free;
+                zoomTarget_ = pinchZoom_;
+                // Snap, not animate: the zoom must track the fingers
+                // frame for frame or the gesture feels like it is lagging.
+                zoomAnim_.reset(pinchZoom_);
+                applyZoomAnchor();
+                scrollX_ -= p.centroidDelta.x;
+                scrollY_ -= p.centroidDelta.y;
+                clampScroll();
+                updateCurrentFromScroll();
+                return true;
+            }
+            if (!touchPanning_) return false;
+            const Point d = touch_.panDelta();
+            scrollX_ -= d.x;
+            scrollY_ -= d.y;
+            clampScroll();
+            updateCurrentFromScroll();
+            return true;
+        }
+
+        case PointerPhase::Up:
+        case PointerPhase::Cancel: {
+            const bool wasPanning = touchPanning_;
+            if (touch_.count() == 0) touchPanning_ = false;
+
+            // Double tap toggles between fitting the page and a readable
+            // 2x at the point tapped - the gesture every mobile reader has.
+            // ...but not while a tool is armed: there, two quick taps are
+            // two deliberate dots, and zooming instead would destroy work.
+            if (touch_.wasTap() && touch_.tapCount() >= 2 &&
+                editTool_ == EditTool::None) {
+                const Point tp = touch_.tapPos();
+                const float fit = fitScale(true);
+                // Strictly two states, so a second double tap always undoes
+                // the first. Ratcheting (x2 each time) leaves the reader
+                // somewhere they did not ask to be.
+                if (zoomTarget_ > fit * 1.2f) {
+                    setZoomMode(ZoomMode::FitWidth, e.timestamp);
+                } else {
+                    setZoomFocus(tp.x, tp.y);
+                    setZoom(fit * 2.f, e.timestamp);
+                }
+                return true;
+            }
+
+            const Point v = touch_.flingVelocity();
+            if (std::fabs(v.y) > 1.f) {
+                // Hand off to the existing inertial scroller rather than
+                // inventing a second one: one decay curve, one cutoff.
+                velocity_ = -v.y;
+                smoothing_ = false;
+            }
+            return wasPanning;
+        }
+
+        default:
+            return false;
+    }
+}
+
 bool PageStage::onPointer(const PointerEvent& e) {
+    // Touch first: it decides whether this is a gesture or a
+    // single-pointer interaction the mouse paths below understand.
+    if (handleTouch(e)) return true;
+
     // Scrollbars first: a press on one must never fall through to the page
     // and start a selection or a pan.
     if (handleScrollbar(e)) return true;
@@ -1313,12 +1501,40 @@ bool PageStage::animating(double now) const {
     // lands while nothing else is moving still has to be painted.
     if (source_ && source_->pending()) return true;
     if (zoomAnim_.active(now) || rotationAnim_.active(now) || smoothing_) return true;
+    // A finger resting on the page must keep frames coming, or the
+    // long-press timer has nothing to fire from.
+    if (touch_.count() > 0) return true;
     if (std::fabs(velocity_) > kFlingCutoff) return true;
     return std::any_of(entrance_.begin(), entrance_.end(),
                        [now](const Timeline& tl) { return tl.active(now); });
 }
 
 void PageStage::onPaint(IPaintTarget& t, const PaintCtx& ctx) {
+    // Long press: a finger has no hover, so there is no way to say "select
+    // this text" by pointing at it. Holding still is the gesture every
+    // mobile reader uses, and it has to be polled because it is defined by
+    // the *absence* of events.
+    if (touch_.pollLongPress(ctx.now) && !touch_.pointers().empty()) {
+        const Point p = touch_.pointers().front().pos;
+        int pg = 0;
+        Point n{0.f, 0.f};
+        if (hitPage(p, &pg, &n)) {
+            const int g = glyphAt(pg, n);
+            if (g >= 0) {
+                // Select the word under the finger and hand over to the
+                // ordinary drag-selection path, so the handles and the
+                // markup popup behave exactly as they do with a mouse.
+                selectWordAt(pg, g);
+                selecting_ = true;
+                touchPanning_ = false;
+                // Same hand-off a mouse drag makes on release, so the
+                // markup popup appears over the word just selected.
+                if (onSelectionCommitted)
+                    onSelectionCommitted(toWindow(p));
+            }
+        }
+    }
+
     // Install anything the engine finished since the last frame, before we
     // decide what to draw.
     if (source_) {
@@ -1523,7 +1739,7 @@ void PageStage::onPaint(IPaintTarget& t, const PaintCtx& ctx) {
             }
             Color sel = ctx.pal.accent;
             sel.a = 72;
-            for (const Rect& r : rects) t.fillRect(r, sel);
+            for (const Rect& sr : rects) t.fillRect(sr, sel);
 
             for (std::size_t h = 0; h < searchHits_.size(); ++h) {
                 const auto& hit = searchHits_[h];
@@ -1533,10 +1749,10 @@ void PageStage::onPaint(IPaintTarget& t, const PaintCtx& ctx) {
                 const bool cur = static_cast<int>(h) == searchCurrent_;
                 Color c = cur ? Color{0xFF, 0x9F, 0x1A, 0xC8}
                               : Color{0xFF, 0xD6, 0x6B, 0x8C};
-                for (const Rect& r : hr) {
-                    t.fillRect(r, c);
+                for (const Rect& hrr : hr) {
+                    t.fillRect(hrr, c);
                     if (cur)
-                        t.strokeRoundedRect(r, Corners{1.5f, 1.5f, 1.5f, 1.5f},
+                        t.strokeRoundedRect(hrr, Corners{1.5f, 1.5f, 1.5f, 1.5f},
                                             Color{0xB4, 0x6A, 0x00, 0xFF}, 1.5f);
                 }
             }

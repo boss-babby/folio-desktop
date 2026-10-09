@@ -1,0 +1,109 @@
+# .github/workflows/android-apk.yml
+#
+# Builds an installable Folio debug APK (arm64-v8a + x86_64) on a GitHub
+# runner and uploads it as an artifact. The runner has network access to
+# dl.google.com, services.gradle.org and the Skia/PDFium releases, which
+# the build needs and which the development sandbox does not have.
+#
+# The heavy lifting lives in tools/build-apk.sh. This workflow only sets
+# up Java, caches the downloads, runs the script, and checks the result.
+#
+# Debug only: a debug APK is signed with the auto-generated debug key and
+# installs directly. A Release APK is unsigned and will not install until
+# a signing keystore is wired in (see the note at the bottom of this file).
+name: Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  apk:
+    name: Debug APK (arm64-v8a + x86_64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # build-apk.sh accepts any JDK 17+ already on JAVA_HOME and only
+      # downloads its own JDK 17 when none is present. Pinning it here
+      # removes that download and makes the Java version explicit.
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # Everything the script downloads lives under ~/.cache/folio-deps:
+      # the Android SDK (platform 34, build-tools 34, NDK r27c), Gradle 8.9,
+      # and the per-ABI Skia and PDFium prebuilts. The SDK and NDK alone are
+      # well over a gigabyte, so caching them is the difference between a
+      # 5-minute rebuild and a 30-minute one. The key changes whenever the
+      # pins in these scripts change, so a stale cache cannot survive an
+      # upgrade.
+      - name: Cache SDK, NDK, Gradle and prebuilts
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/folio-deps
+          key: folio-apk-${{ hashFiles('tools/build-apk.sh', 'tools/build-android.sh', 'tools/bootstrap-deps.sh') }}-v1
+
+      - name: Build debug APK
+        run: bash tools/build-apk.sh Debug
+
+      # An APK that packages without error can still be missing the pieces
+      # that make it run: a native library for one ABI, PDFium, or the
+      # fonts the text system loads from assets. Check for them by name.
+      - name: Verify APK contents
+        run: |
+          APK=$(find android/app/build/outputs/apk -name '*.apk' | head -1)
+          if [ -z "$APK" ]; then
+            echo "no APK found under android/app/build/outputs/apk" >&2
+            exit 1
+          fi
+          unzip -l "$APK" > apk-contents.txt
+          for entry in \
+              lib/arm64-v8a/libfolio-android.so \
+              lib/x86_64/libfolio-android.so \
+              lib/arm64-v8a/libpdfium.so \
+              lib/x86_64/libpdfium.so \
+              assets/fonts/DMSans-Variable.ttf; do
+            if ! grep -qF "$entry" apk-contents.txt; then
+              echo "missing from $APK: $entry" >&2
+              cat apk-contents.txt
+              exit 1
+            fi
+          done
+          echo "APK ok: $APK ($(du -h "$APK" | cut -f1))"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: folio-android-debug-apk
+          path: android/app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+# Notes
+#
+# * Installing: download the artifact from the run, unzip it, copy the .apk
+#   to a phone, allow "install unknown apps" for your file manager, and open
+#   it. Or with a USB-connected device and adb:
+#       adb install -r app-debug.apk
+#
+# * The first launch on a real device has never been done. The sandbox that
+#   built the code has no emulator, so this APK has been checked by
+#   inspection only. If it crashes on launch, `adb logcat -s folio` is the
+#   first place to look.
+#
+# * Release builds: a signed release APK needs a keystore stored as a
+#   repository secret, plus signingConfigs in android/app/build.gradle.kts.
+#   That is a separate change and is not included here.
+#
+# * If the bootstrap step fails with a GitHub API rate-limit message, the
+#   script's unauthenticated lookups for Skia and PDFium hit the limit.
+#   Re-running the job usually succeeds.

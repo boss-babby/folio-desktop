@@ -1,9 +1,29 @@
 cmake_minimum_required(VERSION 3.28)
 
+# C is enabled for exactly one file: the NDK's android_native_app_glue.c.
+# With LANGUAGES CXX alone, CMake does not error on a .c source - it
+# silently drops it, the .so links without ANativeActivity_onCreate, and
+# Android refuses to start the app with no clue as to why.
 project(Folio
     VERSION 0.1.0
     DESCRIPTION "Folio - PDF reader and editor"
-    LANGUAGES CXX)
+    LANGUAGES CXX C)
+
+if(WIN32)
+    # These must be set for EVERY target, not just the ones that include
+    # <windows.h> directly. PDFium's public headers pull it in, and
+    # <windows.h> defines min() and max() as macros, so a perfectly normal
+    # std::max(0, n) elsewhere in the translation unit expands to
+    # std::(((0) > (n)) ? (0) : (n)) and fails with "illegal token on the
+    # right side of ::" - an error that points at our code and says
+    # nothing about its real cause.
+    #
+    # Set here, immediately after project(), because add_compile_definitions
+    # only applies to targets created afterwards.
+    add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
+    # getenv, sscanf and friends are used deliberately and portably.
+    add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
+endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -78,8 +98,18 @@ if(FOLIO_HAVE_PODOFO)
     target_link_libraries(folio-engine-podofo PUBLIC folio-core PRIVATE podofo::podofo)
     # PoDoFo 0.9.8's headers predate C++17: std::iterator, throw() specs and
     # unqualified NULL comparisons throughout. Not ours to fix.
-    target_compile_options(folio-engine-podofo PRIVATE
-        -Wno-deprecated-declarations -Wno-conversion -Wno-shadow -Wno-old-style-cast)
+    #
+    # MSVC rejects unknown /W-style flags outright (D8021) rather than
+    # ignoring them the way GCC tolerates an unrecognised -Wno-*, so these
+    # must never reach cl.exe.
+    if(MSVC)
+        target_compile_options(folio-engine-podofo PRIVATE
+            /wd4996 /wd4244 /wd4267 /wd4458)
+    else()
+        target_compile_options(folio-engine-podofo PRIVATE
+            -Wno-deprecated-declarations -Wno-conversion -Wno-shadow
+            -Wno-old-style-cast)
+    endif()
     folio_enable_warnings(folio-engine-podofo)
     add_library(Folio::EnginePodofo ALIAS folio-engine-podofo)
 endif()
@@ -143,8 +173,10 @@ if(FOLIO_HAVE_SKIA)
     target_compile_definitions(folio-render-skia PUBLIC
         FOLIO_ASSET_DIR="${FOLIO_ASSET_DIR}")
     folio_enable_warnings(folio-render-skia)
-    # Skia's own headers are not -Wconversion clean and we do not control them.
-    target_compile_options(folio-render-skia PRIVATE -Wno-conversion -Wno-shadow)
+    # Skia's own headers are not -Wconversion clean and we do not control
+    # them. folio_relax_warnings picks the right spelling per compiler;
+    # passing -Wno-conversion directly fails the MSVC build with D8021.
+    folio_relax_warnings(folio-render-skia)
     add_library(Folio::RenderSkia ALIAS folio-render-skia)
 endif()
 

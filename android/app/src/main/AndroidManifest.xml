@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Folio for Android.
+
+  This is a NativeActivity app: there is no Java Activity subclass, no
+  layout XML and no View hierarchy. The whole UI is the same C++ that runs
+  on the desktop, drawing through Skia onto the activity's surface. The
+  only Java involved is the framework's own NativeActivity.
+-->
+<!-- The applicationId/namespace lives in build.gradle.kts. AGP 8 ignores a
+     `package` attribute here and warns about it, so it is deliberately
+     absent. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!--
+      API 26 is the floor. It is where NativeActivity's input handling,
+      AAssetManager and the EGL/GLES3 surface behaviour we rely on are all
+      dependable, and it predates scoped storage becoming mandatory, which
+      keeps the file story honest while SAF is still unwritten.
+    -->
+    <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="34" />
+
+    <uses-feature android:glEsVersion="0x00030000" android:required="true" />
+    <!--
+      Declared, not required: a phone with no stylus must still install.
+      The pen paths degrade to touch, which is exactly what the input
+      layer does when tool type comes back as FINGER.
+    -->
+    <uses-feature android:name="android.hardware.touchscreen.multitouch.jazzhand"
+                  android:required="false" />
+    <uses-feature android:name="android.hardware.touchscreen.multitouch"
+                  android:required="true" />
+
+    <application
+        android:label="Folio"
+        android:hasCode="false"
+        android:allowBackup="true"
+        android:supportsRtl="true">
+
+        <!--
+          configChanges lists everything Folio handles itself and must NOT
+          be restarted for: an activity recreated on rotation would throw
+          away the rendered page cache and the user's scroll position. The
+          native side gets APP_CMD_CONFIG_CHANGED instead.
+        -->
+        <activity
+            android:name="android.app.NativeActivity"
+            android:exported="true"
+            android:label="Folio"
+            android:launchMode="singleTop"
+            android:screenOrientation="fullUser"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|density|smallestScreenSize|uiMode"
+            android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
+
+            <!-- Names the library NativeActivity will dlopen: libfolio-android.so -->
+            <meta-data android:name="android.app.lib_name"
+                       android:value="folio-android" />
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!--
+              Open a PDF from another app (Files, Gmail, Drive). The URI
+              arrives as content:// and currently cannot be resolved to a
+              path, so this is wired but not yet honoured - see the SAF
+              item in ANDROID-READINESS.md.
+            -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:mimeType="application/pdf" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

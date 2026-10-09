@@ -34,6 +34,21 @@ enum class PointerPhase : std::uint8_t {
 
 enum class MouseButton : std::uint8_t { None = 0, Left = 1, Right = 2, Middle = 4 };
 
+/// What is driving the pointer.
+///
+/// This matters far more than it looks. A finger and a mouse want opposite
+/// behaviour from the same drag on a page: the mouse selects text, the
+/// finger pans - because a finger has no hover state to show you what it
+/// would select, and panning is what every other reader does. A pen wants
+/// a third behaviour again: it draws, whatever mode the toolbar is in,
+/// because that is why you picked up a pen.
+enum class PointerType : std::uint8_t { Mouse, Touch, Pen };
+
+/// Identifies one finger across a multi-touch sequence. A mouse is always
+/// id 0; touches get whatever id the platform assigns, stable from down to
+/// up. Needed to tell "two fingers moved" from "one finger teleported".
+using PointerId = std::uint32_t;
+
 struct PointerEvent {
     PointerPhase phase = PointerPhase::Move;
     /// Position in the receiving widget's local coordinates. The router
@@ -50,6 +65,22 @@ struct PointerEvent {
     std::uint32_t modifiers = 0;
     double timestamp = 0.0;
     int clickCount = 1;
+
+    PointerType pointerType = PointerType::Mouse;
+    PointerId pointerId = 0;
+    /// 0..1. Pens report real pressure; mouse and touch report 1 when down
+    /// and 0 when up, so a width curve can read this unconditionally.
+    float pressure = 1.f;
+    /// Pen tilt in degrees from vertical, -90..90. Zero for everything else.
+    float tiltX = 0.f;
+    float tiltY = 0.f;
+
+    [[nodiscard]] bool isTouch() const noexcept {
+        return pointerType == PointerType::Touch;
+    }
+    [[nodiscard]] bool isPen() const noexcept {
+        return pointerType == PointerType::Pen;
+    }
 };
 
 enum Modifier : std::uint32_t {

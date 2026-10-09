@@ -30,6 +30,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace folio::ui {
@@ -219,7 +220,11 @@ public:
     void paintTree(IPaintTarget& t, const PaintCtx& ctx);
     /// Deepest pointer-accepting descendant containing `parentPoint`.
     /// Returns nullptr if the point misses this subtree.
-    [[nodiscard]] Widget* hitTest(Point parentPoint);
+    /// `minTarget` is the smallest tappable edge length to honour: any
+    /// control painted smaller than that is hit-tested as if it were that
+    /// big, without changing a single pixel of how it is drawn. Pass 0 for
+    /// an exact test (mouse and pen).
+    [[nodiscard]] Widget* hitTest(Point parentPoint, float minTarget = 0.f);
     [[nodiscard]] bool treeAnimating(double now) const;
 
     /// Depth-first visit, self first.
@@ -229,6 +234,12 @@ protected:
     /// Hit shape, in local coordinates. Override for non-rectangular or
     /// enlarged touch targets. Default is the full local bounds.
     [[nodiscard]] virtual bool hitLocal(Point local) const;
+
+    /// `hitLocal` with the frame inflated to at least `minTarget` on each
+    /// axis. Only ever grows, never shrinks, so a control that is already
+    /// comfortably large keeps its exact shape - including any custom
+    /// `hitLocal` override, which is consulted first.
+    [[nodiscard]] bool hitLocalPadded(Point local, float minTarget) const;
 
 private:
     /// Re-sort children by layer if anything changed since the last pass.
@@ -255,6 +266,12 @@ private:
 /// every first-draft UI gets wrong.
 class EventRouter {
 public:
+    /// Smallest tappable edge length, in logical px, applied to touch
+    /// input only. 44 is the figure Apple, Google (48 dp) and Microsoft
+    /// all converge on; it is a field rather than a constant so a test
+    /// can turn the behaviour off and assert the exact geometry.
+    float touchTarget = 44.f;
+
     /// Returns true if any widget consumed the event.
     bool dispatchPointer(Widget& root, const PointerEvent& windowEvent);
     bool dispatchKey(Widget& root, const KeyEvent& e);

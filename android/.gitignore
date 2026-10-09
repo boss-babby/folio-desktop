@@ -1,0 +1,9 @@
+# Gradle and AGP scratch. Note .cxx in particular: it holds a full CMake
+# tree plus object files per ABI (about 400 MB here) and, unlike "build",
+# its name is not on the workspace snapshot exclusion list, so leaving it
+# around is what blows the size budget.
+.gradle/
+.cxx/
+build/
+local.properties
+.kotlin/

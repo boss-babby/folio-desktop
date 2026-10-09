@@ -1,6 +1,8 @@
 #include "folio/ui/Widget.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 
 namespace folio::ui {
 
@@ -62,6 +64,19 @@ bool Widget::hitLocal(Point local) const {
     return local.x >= 0.f && local.y >= 0.f && local.x < frame.w && local.y < frame.h;
 }
 
+bool Widget::hitLocalPadded(Point local, float minTarget) const {
+    if (hitLocal(local)) return true;
+    if (minTarget <= 0.f) return false;
+    // Grow only towards the minimum, and only on the axis that is short.
+    // A 28 px icon button becomes 44 px of catchable area; a full-width
+    // list row, already past the minimum, is untouched.
+    const float ex = std::max(0.f, (minTarget - frame.w) * 0.5f);
+    const float ey = std::max(0.f, (minTarget - frame.h) * 0.5f);
+    if (ex == 0.f && ey == 0.f) return false;
+    return local.x >= -ex && local.y >= -ey &&
+           local.x < frame.w + ex && local.y < frame.h + ey;
+}
+
 void Widget::layoutTree() {
     onLayout();
     ensureChildOrder();
@@ -101,21 +116,25 @@ void Widget::paintTree(IPaintTarget& t, const PaintCtx& ctx) {
     t.restore();
 }
 
-Widget* Widget::hitTest(Point parentPoint) {
+Widget* Widget::hitTest(Point parentPoint, float minTarget) {
     if (!visible || !enabled) return nullptr;
     const Point local{parentPoint.x - frame.x, parentPoint.y - frame.y};
 
     // A clipping container hides anything outside itself, so stop early -
-    // otherwise a scrolled-out list row would still catch clicks.
+    // otherwise a scrolled-out list row would still catch clicks. Note the
+    // exact test: a clip must not leak, or a tap just outside a scroll view
+    // would land on a row the user cannot even see.
     if (clipsContent && !hitLocal(local)) return nullptr;
 
     // Later children paint on top, so they are tested first. Same order
     // the painter used, or the topmost widget would not be the one clicked.
+    // This also settles overlapping inflated targets: whichever control is
+    // drawn on top wins the contested pixels, which is what the eye expects.
     ensureChildOrder();
     for (auto it = children_.rbegin(); it != children_.rend(); ++it) {
-        if (Widget* hit = (*it)->hitTest(local)) return hit;
+        if (Widget* hit = (*it)->hitTest(local, minTarget)) return hit;
     }
-    if (acceptsPointer && hitLocal(local)) return this;
+    if (acceptsPointer && hitLocalPadded(local, minTarget)) return this;
     return nullptr;
 }
 
@@ -160,9 +179,22 @@ void EventRouter::setFocus(Widget* w) {
     if (focus_) focus_->onFocusChanged(true);
 }
 
+static bool debugHits() {
+    static const bool on = std::getenv("FOLIO_DEBUG_HIT") != nullptr;
+    return on;
+}
+
 bool EventRouter::dispatchPointer(Widget& root, const PointerEvent& windowEvent) {
     PointerEvent e = windowEvent;
     e.pos = e.windowPos;
+
+    // A fingertip covers roughly 9 mm of glass and, unlike a cursor, hides
+    // the very thing it is aiming at. Every platform guideline lands near
+    // the same number, so controls drawn smaller than this are hit-tested
+    // as if they were this big. The pen is excluded on purpose: it is a
+    // precision instrument and inflating its targets would make it harder
+    // to place a stroke, not easier.
+    const float minTarget = e.isTouch() ? touchTarget : 0.f;
 
     // The pointer leaving the window must clear hover everywhere, or a button
     // stays lit after the user alt-tabs away.
@@ -191,7 +223,7 @@ bool EventRouter::dispatchPointer(Widget& root, const PointerEvent& windowEvent)
             capture_ = nullptr;
             // Re-evaluate hover: the pointer may have been released somewhere
             // else entirely.
-            Widget* under = root.hitTest(e.windowPos);
+            Widget* under = root.hitTest(e.windowPos, minTarget);
             if (under != hover_) {
                 if (hover_) {
                     PointerEvent lv = e;
@@ -211,7 +243,19 @@ bool EventRouter::dispatchPointer(Widget& root, const PointerEvent& windowEvent)
         return consumed;
     }
 
-    Widget* under = root.hitTest(e.windowPos);
+    Widget* under = root.hitTest(e.windowPos, minTarget);
+
+    if (debugHits()) {
+        static const char* kPh[] = {"Move", "Down", "Up", "Enter",
+                                    "Leave", "Wheel", "Cancel"};
+        std::fprintf(stderr, "[hit] %-6s type=%d id=%u (%.0f,%.0f) slop=%.0f -> %s\n",
+                     kPh[static_cast<int>(e.phase) % 7],
+                     static_cast<int>(e.pointerType), e.pointerId,
+                     e.windowPos.x, e.windowPos.y, minTarget,
+                     under ? (under->debugName.empty() ? "<unnamed>"
+                                                       : under->debugName.c_str())
+                           : "(none)");
+    }
 
     // --- hover transitions --------------------------------------------------
     if (under != hover_) {

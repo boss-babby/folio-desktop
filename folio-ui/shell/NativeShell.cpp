@@ -211,8 +211,9 @@ int runNativeShell(const NativeShellOptions& opts) {
     }
     sk_sp<SkSurface> raster;
 
-    render::skia::SkiaTextSystem::instance().initialise(resolveAssetDir() +
-                                                        "/fonts");
+    const std::string assetDir =
+        opts.assetDir.empty() ? resolveAssetDir() : opts.assetDir;
+    render::skia::SkiaTextSystem::instance().initialise(assetDir + "/fonts");
 
     NativePicker picker;
     FilePicker::setCurrent(&picker);
@@ -266,6 +267,7 @@ int runNativeShell(const NativeShellOptions& opts) {
                 case plat::Event::Type::PointerDown:
                 case plat::Event::Type::PointerUp:
                 case plat::Event::Type::PointerMove:
+                case plat::Event::Type::PointerCancel:
                 case plat::Event::Type::PointerLeave: {
                     PointerEvent pe;
                     pe.phase = e.type == plat::Event::Type::PointerDown
@@ -274,6 +276,8 @@ int runNativeShell(const NativeShellOptions& opts) {
                                    ? PointerPhase::Up
                                : e.type == plat::Event::Type::PointerMove
                                    ? PointerPhase::Move
+                               : e.type == plat::Event::Type::PointerCancel
+                                   ? PointerPhase::Cancel
                                    : PointerPhase::Leave;
                     pe.pos = {static_cast<float>(e.x) / dpr,
                               static_cast<float>(e.y) / dpr};
@@ -281,6 +285,21 @@ int runNativeShell(const NativeShellOptions& opts) {
                     pe.button = toUiButton(e.button);
                     pe.modifiers = e.mods;
                     pe.clickCount = e.clickCount;
+                    pe.pointerType =
+                        e.source == plat::PointerSource::Touch ? PointerType::Touch
+                        : e.source == plat::PointerSource::Pen ? PointerType::Pen
+                                                               : PointerType::Mouse;
+                    pe.pointerId = e.pointerId;
+                    pe.pressure = e.pressure;
+                    pe.tiltX = e.tiltX;
+                    pe.tiltY = e.tiltY;
+                    // A mouse has no pressure axis. Report full pressure on
+                    // contact and none on release, so a width curve can read
+                    // `pressure` without first asking what device sent it.
+                    if (pe.pointerType == PointerType::Mouse) {
+                        if (pe.phase == PointerPhase::Down) pe.pressure = 1.f;
+                        else if (pe.phase == PointerPhase::Up) pe.pressure = 0.f;
+                    }
                     pe.timestamp = seconds();
                     app.pointer(pe);
                     dirty = true;

@@ -21,6 +21,8 @@
 #include "folio/ui/Animation.h"
 #include "folio/ui/Tokens.h"
 
+#include <cstdint>
+
 namespace folio::ui {
 
 enum class ColorScheme : std::uint8_t { Light, Dark };

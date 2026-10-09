@@ -17,6 +17,11 @@ struct NativeShellOptions {
     bool forceSoftware = false;
     /// Open this document at startup, if non-empty.
     std::string openPath;
+    /// Where fonts live. Empty means "work it out from the executable",
+    /// which is right on every desktop. Android has no executable to be
+    /// beside and no readable assets directory, so its entry point unpacks
+    /// the fonts and passes the destination here.
+    std::string assetDir;
 };
 
 /// Runs until the window closes. Returns a process exit code.

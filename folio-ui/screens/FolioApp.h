@@ -17,7 +17,9 @@
 #include "screens/WelcomeScreen.h"
 #include "components/OpenDialog.h"
 
+#include <functional>
 #include <memory>
+#include <string>
 
 namespace folio::ui {
 

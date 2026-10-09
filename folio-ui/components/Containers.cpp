@@ -191,7 +191,7 @@ void SidePanel::setCollapsed(bool c, double now) {
     if (c == collapsed_) return;
     collapsed_ = c;
     const float expanded = expanded_;
-    const float d = c ? tokens::dur::panelCollapse : tokens::dur::panelReveal;
+    const int d = c ? tokens::dur::panelCollapse : tokens::dur::panelReveal;
     width_.animateTo(c ? tokens::size::panelRailCollapsed : expanded, d, now);
     collapseT_.animateTo(c ? 1.f : 0.f, d, now);
     // A sheet travels instead of narrowing. OutCubic on the way up gives it

@@ -19,6 +19,11 @@ mkdir -p "$DEPS"
 #   pdfium-binaries             -> pdfium-android-{arm64,x64,arm,x86}.tgz
 FOLIO_TARGET="${FOLIO_TARGET:-linux}"
 FOLIO_ABI="${FOLIO_ABI:-x64}"
+# The host build keeps the unsuffixed paths it has always used: every
+# existing checkout, dev-setup.sh and the CI cache key point at them, and
+# renaming would force a 179 MB re-download for no benefit.
+SKIA_SUFFIX=""
+PDFIUM_SUFFIX=""
 case "$FOLIO_TARGET" in
     linux)
         SKIA_MATCH="linux-Release-x64"
@@ -34,6 +39,13 @@ case "$FOLIO_TARGET" in
         esac
         SKIA_MATCH="android-Release-${_sk_abi}"
         PDFIUM_ASSET="pdfium-android-${_pd_abi}.tgz"
+        # Cross builds get their own cache directories. Sharing one with the
+        # host build is not merely untidy: the presence checks below are
+        # path-based, so a warm host cache makes an Android fetch silently
+        # no-op, and a cold one makes a host build link Android archives.
+        # Both failures look like success until the linker disagrees.
+        SKIA_SUFFIX="-android-${_sk_abi}"
+        PDFIUM_SUFFIX="-android-${_pd_abi}"
         ;;
     *)
         echo "unsupported FOLIO_TARGET=$FOLIO_TARGET (linux or android)" >&2
@@ -57,7 +69,10 @@ api() {
 }
 
 # --- Skia --------------------------------------------------------------
-if have "$DEPS/skia/include/core/SkCanvas.h"; then
+SKIA_DIR="$DEPS/skia$SKIA_SUFFIX"
+PDFIUM_DIR="$DEPS/pdfium$PDFIUM_SUFFIX"
+
+if have "$SKIA_DIR/include/core/SkCanvas.h"; then
     echo "skia: present"
 else
     echo "skia: fetching m144 $SKIA_MATCH ..."
@@ -66,20 +81,20 @@ else
         | head -1)
     [ -n "$url" ] || { echo "skia: no matching asset"; exit 1; }
     curl -sSfL -o "$DEPS/skia.zip" "$url"
-    rm -rf "$DEPS/skia"
+    rm -rf "$SKIA_DIR"
     # The archive has no top-level directory: it unpacks include/, out/,
     # modules/, src/ and third_party/ straight into the cwd.
     tmp="$DEPS/.skia-unpack"; rm -rf "$tmp"; mkdir -p "$tmp"
     (cd "$tmp" && unzip -q "$DEPS/skia.zip")
     rm "$DEPS/skia.zip"
-    mkdir -p "$DEPS/skia"
-    mv "$tmp"/* "$DEPS/skia/"
+    mkdir -p "$SKIA_DIR"
+    mv "$tmp"/* "$SKIA_DIR/"
     rmdir "$tmp"
     echo "skia: ok"
 fi
 
 # --- PDFium ------------------------------------------------------------
-if have "$DEPS/pdfium/include/fpdfview.h"; then
+if have "$PDFIUM_DIR/include/fpdfview.h"; then
     echo "pdfium: present"
 else
     echo "pdfium: fetching latest $PDFIUM_ASSET ..."
@@ -87,8 +102,8 @@ else
         | grep -o "https://[^\"]*${PDFIUM_ASSET}" | head -1)
     [ -n "$url" ] || { echo "pdfium: no matching asset"; exit 1; }
     curl -sSfL -o "$DEPS/pdfium.tgz" "$url"
-    rm -rf "$DEPS/pdfium"; mkdir -p "$DEPS/pdfium"
-    tar -xzf "$DEPS/pdfium.tgz" -C "$DEPS/pdfium"
+    rm -rf "$PDFIUM_DIR"; mkdir -p "$PDFIUM_DIR"
+    tar -xzf "$DEPS/pdfium.tgz" -C "$PDFIUM_DIR"
     rm "$DEPS/pdfium.tgz"
     echo "pdfium: ok"
 fi
@@ -147,14 +162,27 @@ GLDEV="$DEPS/gldev"
 if [ ! -f "$GLDEV/root/usr/include/EGL/egl.h" ]; then
     echo "==> fetching X11 + EGL headers"
     mkdir -p "$GLDEV" && cd "$GLDEV"
+    # libxi-dev is XInput2: multi-touch and pen pressure on X11. Without it
+    # the backend still builds and still gets single-touch through the
+    # server's core-pointer emulation, just no pinch and no pressure.
+    # libxfixes-dev comes with it, not for itself: XInput2.h includes
+    # Xfixes.h for PointerBarrier and will not compile without it.
     apt-get download libgl-dev libegl-dev libglvnd-dev mesa-common-dev \
-                     libx11-dev libxext-dev >/dev/null 2>&1 || true
+                     libx11-dev libxext-dev libxi-dev libxfixes-dev \
+                     >/dev/null 2>&1 || true
     for d in *.deb; do [ -f "$d" ] && dpkg-deb -x "$d" root; done
     LIBDIR="$GLDEV/root/usr/lib/x86_64-linux-gnu"
     [ -e /usr/lib/x86_64-linux-gnu/libEGL.so.1 ] && \
         ln -sf /usr/lib/x86_64-linux-gnu/libEGL.so.1 "$LIBDIR/libEGL.so"
     [ -e /usr/lib/x86_64-linux-gnu/libGL.so.1 ] && \
         ln -sf /usr/lib/x86_64-linux-gnu/libGL.so.1 "$LIBDIR/libGL.so"
+    # libXi ships the same dangling .so symlink as the GL ones.
+    [ -e /usr/lib/x86_64-linux-gnu/libXi.so.6 ] && \
+        ln -sf /usr/lib/x86_64-linux-gnu/libXi.so.6 "$LIBDIR/libXi.so"
     cd - >/dev/null
 fi
 echo "    configure with -DFOLIO_GLDEV_ROOT=$GLDEV/root"
+if [ "$FOLIO_TARGET" != "linux" ]; then
+    echo "    skia   : $SKIA_DIR"
+    echo "    pdfium : $PDFIUM_DIR"
+fi

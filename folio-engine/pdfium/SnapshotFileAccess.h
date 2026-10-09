@@ -11,6 +11,8 @@
 
 #include "folio/core/engine/DocumentSnapshot.h"
 
+#include <cstddef>
+#include <utility>
 #include <fpdfview.h>
 
 #include <span>

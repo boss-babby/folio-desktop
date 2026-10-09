@@ -27,6 +27,8 @@
 #include "include/core/SkImage.h"
 #include "include/core/SkRect.h"
 
+#include <cstdint>
+
 namespace folio::render::skia {
 
 namespace core = folio::core;

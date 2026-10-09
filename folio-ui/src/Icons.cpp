@@ -2,6 +2,7 @@
 
 #include <cctype>
 #include <charconv>
+#include <cstdlib>
 #include <cmath>
 #include <utility>
 #include <cstdio>
@@ -58,12 +59,28 @@ struct Cursor {
         // from_chars does not accept a leading '+', which SVG allows.
         std::size_t begin = i;
         if (s[i] == '+') ++begin;
+        const char* first = s.data() + begin;
+
+#if defined(__cpp_lib_to_chars) && !defined(_LIBCPP_VERSION)
+        // Preferred: locale-independent, non-allocating, and it reports
+        // exactly where it stopped.
         float v = 0.f;
-        const auto* first = s.data() + begin;
-        const auto* last = s.data() + s.size();
+        const char* last = s.data() + s.size();
         auto [ptr, ec] = std::from_chars(first, last, v);
         if (ec != std::errc{}) return false;
         i = static_cast<std::size_t>(ptr - s.data());
+#else
+        // libc++ (the NDK's standard library) declares the floating-point
+        // from_chars overloads but does not define them, so the call
+        // resolves to the deleted bool overload and fails to compile.
+        // strtof is the portable fallback. It is locale-sensitive in
+        // principle; in practice this parses our own compiled-in icon
+        // paths, and nothing in the process ever calls setlocale.
+        char* end = nullptr;
+        const float v = std::strtof(first, &end);
+        if (end == first) return false;
+        i = static_cast<std::size_t>(end - s.data());
+#endif
         out = v;
         return true;
     }

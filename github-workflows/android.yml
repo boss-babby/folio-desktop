@@ -1,0 +1,59 @@
+# .github/workflows/android.yml
+#
+# Cross-compiles the Android native library. Deliberately does NOT build an
+# APK: that needs the Android SDK and Gradle, and the native library is
+# both the part that breaks and the part that can be checked quickly.
+#
+# This workspace cannot create a .github directory - copy this file to
+# .github/workflows/android.yml in a normal checkout.
+name: android
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: arm64-v8a
+            dep_abi: arm64
+          - abi: x86_64
+            dep_abi: x64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      # The runner image already ships an NDK; using it avoids a 633 MB
+      # download on every run. tools/build-android.sh falls back to
+      # fetching r27c when ANDROID_NDK_HOME is unset.
+      - name: Locate NDK
+        run: echo "ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+
+      - name: Cache prebuilts
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/folio-deps
+          key: folio-deps-android-${{ matrix.dep_abi }}-m144-v1
+
+      - name: Build
+        run: bash tools/build-android.sh ${{ matrix.abi }}
+
+      # build-android.sh already asserts both entry points are exported.
+      # An Android library that links but exports no ANativeActivity_onCreate
+      # installs fine and refuses to start, so this is the check that
+      # matters most and it must not be skipped.
+      - name: Upload library
+        uses: actions/upload-artifact@v4
+        with:
+          name: libfolio-android-${{ matrix.abi }}
+          path: build/android-${{ matrix.dep_abi }}/folio-ui/libfolio-android.so
+          if-no-files-found: error

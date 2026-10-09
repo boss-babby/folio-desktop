@@ -12,6 +12,8 @@
 #include "folio/render/IPaintTarget.h"
 #include "folio/ui/Tokens.h"
 
+#include <cstdint>
+#include <string>
 #include <string_view>
 
 namespace folio::ui {

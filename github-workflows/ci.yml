@@ -28,6 +28,14 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      # Runs before the compiler, because it catches a class of breakage
+      # no Linux compiler can: a header that uses std::string while
+      # including only <string_view> builds fine against libstdc++, which
+      # drags <string> in transitively, and fails on MSVC's stricter
+      # standard library. That is exactly how the first Windows build
+      # broke. Costs about a second.
+      - name: Check headers are self-contained
+        run: python3 tools/check-header-includes.py .
       - name: Install toolchain
         run: sudo apt-get update && sudo apt-get install -y ninja-build cmake g++-14
       - name: Configure

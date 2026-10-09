@@ -19,10 +19,23 @@
 //    DpiAwarenessContext would raise the minimum SDK for everyone building
 //    this, and a GetProcAddress costs one call at startup.
 
+// Guarded because the build system also sets these on the command line
+// (NOMINMAX and WIN32_LEAN_AND_MEAN project-wide, UNICODE for this
+// target). Redefining them unconditionally is warning C4005, which with
+// warnings-as-errors would fail the build. They are kept here so the file
+// still compiles if someone builds it outside our CMake.
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
+#ifndef UNICODE
 #define UNICODE
+#endif
+#ifndef _UNICODE
 #define _UNICODE
+#endif
 
 #include <windows.h>
 #include <windowsx.h>

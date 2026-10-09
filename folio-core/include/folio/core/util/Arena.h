@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <memory>
 #include <new>
+#include <utility>
 #include <vector>
 
 namespace folio::core {

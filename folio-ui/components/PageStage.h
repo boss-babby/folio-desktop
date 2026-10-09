@@ -20,13 +20,15 @@
 #include "folio/ui/Animation.h"
 #include "folio/ui/Draw.h"
 #include "folio/ui/Theme.h"
+#include "components/Gestures.h"
 #include "folio/ui/Widget.h"
 #include "components/Annotations.h"
 
+#include <cstdint>
 #include <functional>
-#include <utility>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace folio::ui {
@@ -345,6 +347,25 @@ public:
     /// for the pill's zoom buttons, which have no pointer to speak of.
     void setZoomFocus(float localX, float localY);
     void clearZoomFocus();
+
+    // --- touch -------------------------------------------------------------
+    /// Consume touch before the mouse paths see it. Returns true when the
+    /// gesture owns the event.
+    ///
+    /// The rule, which matches every serious annotation app: two fingers
+    /// always pinch and pan, whatever tool is selected - it is the escape
+    /// hatch out of a drawing mode. One finger pans while reading and
+    /// draws while a tool is active. A pen always draws, because that is
+    /// why you picked it up.
+    bool handleTouch(const PointerEvent& e);
+    GestureTracker touch_;
+    bool touchPanning_ = false;
+    float pinchZoom_ = 1.f;
+    /// Mean nib pressure over the stroke in flight, so a pen can commit a
+    /// heavier line than a light pass. Per-point pressure profiles would
+    /// need the Annotation schema to carry a width per point.
+    float penPressSum_ = 0.f;
+    int   penPressN_ = 0;
     bool anchorValid_ = false;
     /// Where an in-flight wheel glide is heading, so consecutive notches
     /// extend one animation instead of each restarting from a standstill.
@@ -364,6 +385,11 @@ public:
     /// direct hit, then the closest glyph on the nearest text line, which is
     /// what makes dragging past the end of a line behave.
     [[nodiscard]] int glyphAt(int page, Point n);
+    /// Expand a glyph index to the whitespace-delimited word around it,
+    /// writing the half-open range into selA_/selB_. A long press has no
+    /// drag behind it, so selecting one character would be useless - every
+    /// mobile reader selects a word.
+    void selectWordAt(int page, int glyph);
     /// Merge a glyph range into per-line rectangles in content coordinates.
     void selectionRects(int page, int from, int to,
                         std::vector<Rect>& out);

@@ -13,6 +13,11 @@
 
 #include "include/core/SkCanvas.h"
 
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <string_view>
+
 namespace folio::render::skia {
 
 class SkiaPaintTarget final : public IPaintTarget {

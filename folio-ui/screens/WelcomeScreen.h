@@ -12,6 +12,7 @@
 #include "screens/AppState.h"
 
 #include <functional>
+#include <string>
 #include <vector>
 
 namespace folio::ui {

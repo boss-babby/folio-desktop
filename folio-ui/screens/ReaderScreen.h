@@ -5,6 +5,9 @@
 
 #pragma once
 
+#include <cstdint>
+#include <string>
+#include <utility>
 #include <array>
 #include "components/Button.h"
 #include "components/Containers.h"

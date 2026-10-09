@@ -38,6 +38,10 @@
 #include <string_view>
 #include <vector>
 
+#if defined(__ANDROID__)
+struct android_app;  // <android_native_app_glue.h>, global scope
+#endif
+
 namespace folio::platform {
 
 // ---------------------------------------------------------------------------
@@ -74,6 +78,12 @@ enum class Key : std::uint16_t {
     Plus, Minus, F11,
 };
 
+/// What physically produced a pointer event. The UI layer needs this to
+/// decide between behaviours that cannot all be right at once: a finger
+/// wants inflated hit targets and gesture interpretation, a pen wants
+/// neither and carries pressure, a mouse wants exactly what it always had.
+enum class PointerSource : std::uint8_t { Mouse, Touch, Pen };
+
 struct Event {
     enum class Type : std::uint8_t {
         None,
@@ -85,6 +95,7 @@ struct Event {
         PointerUp,
         PointerMove,
         PointerLeave,
+        PointerCancel,  ///< touch sequence abandoned (grab stolen, device lost)
         Wheel,          ///< `wheelX`/`wheelY` in lines; positive y is "away"
         KeyDown,
         KeyUp,
@@ -100,6 +111,14 @@ struct Event {
     double wheelX = 0.0, wheelY = 0.0;
     Button button = Button::Left;
     int clickCount = 1;              ///< 2 on a double click
+
+    // Pointer device. `pointerId` distinguishes simultaneous contacts: it is
+    // the touch sequence number for a finger and 0 for the system pointer,
+    // so a single-pointer backend needs to set none of this.
+    PointerSource source = PointerSource::Mouse;
+    std::uint32_t pointerId = 0;
+    float pressure = 0.f;            ///< 0..1, pen only; 0 when unsupported
+    float tiltX = 0.f, tiltY = 0.f;  ///< degrees from vertical, pen only
 
     // Keyboard
     Key key = Key::Unknown;
@@ -292,5 +311,17 @@ IFileDialog& fileDialog();
 
 /// Which backend was compiled in: "x11", "win32", "cocoa", or "none".
 [[nodiscard]] const char* backendName() noexcept;
+
+#if defined(__ANDROID__)
+/// Hand the activity to the platform layer. Must be called by
+/// `android_main` before `createWindow`, because on Android the process
+/// does not own its window - the activity does, and everything here is
+/// reached through it.
+///
+/// `::android_app` is forward-declared at global scope above: declaring it
+/// here would create a distinct folio::platform::android_app that silently
+/// fails to match the real one.
+void setAndroidApp(::android_app* app) noexcept;
+#endif
 
 }  // namespace folio::platform

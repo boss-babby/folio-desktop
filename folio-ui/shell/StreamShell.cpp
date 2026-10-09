@@ -97,6 +97,7 @@ async function flush() {
 // mousemove floods the input queue and adds latency without adding fidelity.
 let pendingMove = null;
 img.addEventListener('mousemove', e => {
+  if (window.PointerEvent) return;   // pointermove already covered it
   const [x,y] = pt(e);
   pendingMove = `m,${x.toFixed(1)},${y.toFixed(1)},${e.buttons},${mods(e)}`;
 });
@@ -106,13 +107,48 @@ function pumpMove() {
 }
 requestAnimationFrame(pumpMove);
 
+// Pointer Events give us touch, pen and mouse through one API, with
+// pointerType and pressure attached. Registered in preference to the mouse
+// handlers below; browsers that support them never fire both for the same
+// gesture once we preventDefault and capture.
+const PT = { mouse:0, touch:1, pen:2 };
+function ptype(e) { return PT[e.pointerType] !== undefined ? PT[e.pointerType] : 0; }
+if (window.PointerEvent) {
+  img.style.touchAction = 'none';   // we handle panning and pinching
+  const send3 = (ch, e) => {
+    const [x,y] = pt(e);
+    push(`${ch},${x.toFixed(1)},${y.toFixed(1)},${e.button < 0 ? 0 : e.button},`
+       + `${mods(e)},${ptype(e)},${e.pointerId},${(e.pressure||0).toFixed(3)}`);
+  };
+  img.addEventListener('pointerdown', e => {
+    img.focus();
+    img.setPointerCapture(e.pointerId);
+    send3('p', e);
+    e.preventDefault();
+  });
+  // Coalesced moves: a 120Hz digitiser emits far more points than we can
+  // render, and getCoalescedEvents gives us the ones the browser merged -
+  // which is what keeps a fast pen stroke smooth instead of polygonal.
+  img.addEventListener('pointermove', e => {
+    if (!e.buttons) { send3('q', e); return; }
+    const list = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
+    for (const c of list) send3('q', c);
+    e.preventDefault();
+  }, { passive:false });
+  const up = e => { send3('s', e); e.preventDefault(); };
+  img.addEventListener('pointerup', up);
+  img.addEventListener('pointercancel', up);
+}
+
 img.addEventListener('mousedown', e => {
+  if (window.PointerEvent) { e.preventDefault(); return; }
   img.focus();
   const [x,y] = pt(e);
   push(`d,${x.toFixed(1)},${y.toFixed(1)},${e.button},${mods(e)}`);
   e.preventDefault();
 });
 window.addEventListener('mouseup', e => {
+  if (window.PointerEvent) return;
   const [x,y] = pt(e);
   push(`u,${x.toFixed(1)},${y.toFixed(1)},${e.button},${mods(e)}`);
 });
@@ -332,6 +368,51 @@ void StreamShell::drainInput(double now) {
             pe.wheelX = std::strtof(f[3].c_str(), nullptr);
             pe.wheelY = std::strtof(f[4].c_str(), nullptr);
             pe.modifiers = static_cast<std::uint32_t>(std::atoi(f[5].c_str()));
+            app_.pointer(pe);
+        } else if ((f[0] == "p" || f[0] == "q" || f[0] == "s") &&
+                   f.size() >= 8) {
+            // Pointer Events transport: p=down q=move s=up/cancel.
+            // Deliberately NOT 'r': that is the resize record, and telling
+            // the two apart by field count alone means a short write turns
+            // a finger lift into a window resize to 546x846.
+            //   p,x,y,button,mods,type,id,pressure
+            // Carries what the mouse records cannot - which device is
+            // driving, which finger it is, and how hard it is pressed.
+            pe.phase = f[0] == "p"   ? ui::PointerPhase::Down
+                       : f[0] == "q" ? ui::PointerPhase::Move
+                                     : ui::PointerPhase::Up;
+            pe.windowPos = {std::strtof(f[1].c_str(), nullptr) / dpr_,
+                            std::strtof(f[2].c_str(), nullptr) / dpr_};
+            const int btn = std::atoi(f[3].c_str());
+            pe.button = btn == 2   ? ui::MouseButton::Right
+                        : btn == 1 ? ui::MouseButton::Middle
+                                   : ui::MouseButton::Left;
+            pe.modifiers = static_cast<std::uint32_t>(std::atoi(f[4].c_str()));
+            const int ty = std::atoi(f[5].c_str());
+            pe.pointerType = ty == 1   ? ui::PointerType::Touch
+                             : ty == 2 ? ui::PointerType::Pen
+                                       : ui::PointerType::Mouse;
+            pe.pointerId =
+                static_cast<ui::PointerId>(std::strtoul(f[6].c_str(), nullptr, 10));
+            pe.pressure = std::strtof(f[7].c_str(), nullptr);
+            // A mouse reports pressure 0 even while held; normalise so a
+            // width curve can read `pressure` without asking what device
+            // it came from.
+            if (pe.pointerType != ui::PointerType::Pen)
+                pe.pressure = (pe.phase == ui::PointerPhase::Up) ? 0.f : 1.f;
+
+            if (pe.phase == ui::PointerPhase::Down) {
+                const bool near =
+                    std::abs(pe.windowPos.x - lastClickPos_.x) < 4.f &&
+                    std::abs(pe.windowPos.y - lastClickPos_.y) < 4.f;
+                pe.clickCount = (near && now - lastClickTime_ < 0.4) ? 2 : 1;
+                lastClickTime_ = now;
+                lastClickPos_ = pe.windowPos;
+                pe.buttonsDown = 1;
+            } else if (pe.phase == ui::PointerPhase::Move) {
+                pe.buttonsDown = pe.pressure > 0.f ? 1 : 0;
+            }
+            lastPointer_ = pe.windowPos;
             app_.pointer(pe);
         } else if (f[0] == "x") {
             pe.phase = ui::PointerPhase::Cancel;

@@ -23,6 +23,7 @@
 
 #pragma once
 
+#include <utility>
 #include <fpdfview.h>
 
 #include <cstdint>

@@ -16,6 +16,12 @@ target_link_libraries(folio-test-core PRIVATE folio-core)
 folio_enable_warnings(folio-test-core)
 add_test(NAME core.snapshot COMMAND folio-test-core)
 
+# XI2 valuator decoding is a pure header with no X11 dependency, so it is
+# tested everywhere, not only where libXi happens to be installed.
+add_executable(folio-test-xi-valuator platform/test_xi_valuator.cpp)
+folio_enable_warnings(folio-test-xi-valuator)
+add_test(NAME platform.xi.valuator COMMAND folio-test-xi-valuator)
+
 add_executable(folio-test-tilegrid render/test_tile_grid.cpp)
 target_link_libraries(folio-test-tilegrid PRIVATE folio-core)
 folio_enable_warnings(folio-test-tilegrid)

@@ -1,0 +1,196 @@
+{
+  "$schema": "https://folio.app/schemas/design-tokens-1.json",
+  "meta": {
+    "name": "Folio",
+    "source": "Folio · PDF reader and editor (working prototype).html",
+    "note": "Single source of truth. tools/token-gen emits Tokens.qml, folio_tokens.h and tokens.css from this file. CI fails on any hard-coded colour or duration in folio-ui/."
+  },
+
+  "color": {
+    "light": {
+      "bg":   "#EDEAE3",
+      "card": "#FFFFFF",
+      "text": "#2A2F45",
+      "muted":"#5E6382",
+      "border":"#DAD9EA",
+      "divider":"#ECEBF3",
+      "accent":"#4338CA",
+      "accentSoft":"#ECEBFA",
+      "accentText":"#3730A3",
+      "surfaceSunken":"#F3F2FA",
+      "hover":"#EEEDF7",
+      "danger":"#B42318",
+      "shadow":"rgba(40,36,90,0.16)",
+      "ring":"rgba(40,36,90,0.06)",
+      "pageShadow":"rgba(40,36,90,0.20)"
+    },
+    "dark": {
+      "bg":   "#0F1016",
+      "card": "#1B1D28",
+      "text": "#E7E9F2",
+      "muted":"#A3A9C2",
+      "border":"#3A3D52",
+      "divider":"#2C2F40",
+      "accent":"#5B5BE0",
+      "accentSoft":"#2A2C58",
+      "accentText":"#C3C5FF",
+      "surfaceSunken":"#252838",
+      "hover":"#272B3D",
+      "danger":"#FF8C85",
+      "shadow":"rgba(0,0,0,0.55)",
+      "ring":"rgba(255,255,255,0.07)",
+      "pageShadow":"rgba(0,0,0,0.65)"
+    },
+    "fixed": {
+      "dirtyDot":"#D97706",
+      "closeHover":"#D9342B",
+      "tooltipBg":"#14151C",
+      "tooltipText":"#FFFFFF",
+      "pinFill":"#F5B544",
+      "pinText":"#1A1405",
+      "stampRed":"#B42318",
+      "findMatch":"#F5B544",
+      "findCurrent":"#FF7A45"
+    },
+    "highlighter": {
+      "yellow":"rgba(250,204,21,0.55)",
+      "mint":  "rgba(94,211,160,0.50)",
+      "rose":  "rgba(255,138,138,0.50)",
+      "sky":   "rgba(107,182,255,0.50)"
+    },
+    "inkPalette": ["#2A2F46", "#4338CA", "#D9534F", "#3F7D58"],
+    "docAccent":  ["#4338CA", "#0F766E", "#B45309"]
+  },
+
+  "pageTheme": {
+    "light": { "paper": "#FEFEFE", "ink": "#2A2F46" },
+    "sepia": { "paper": "#F1E4C8", "ink": "#4A3A22" },
+    "dark":  { "paper": "#22252E", "ink": "#E1E3EA" }
+  },
+
+  "typography": {
+    "family": "DM Sans",
+    "licence": "SIL OFL 1.1 — bundled on every platform for metric parity",
+    "fallback": "system-ui, sans-serif",
+    "weights": [400, 500, 600, 700],
+    "scale": {
+      "body":       { "size": 13, "weight": 400 },
+      "bodyStrong": { "size": 13, "weight": 600 },
+      "small":      { "size": 12, "weight": 400 },
+      "sectionHeader": { "size": 11, "weight": 700, "letterSpacing": "0.07em", "transform": "uppercase" },
+      "label":      { "size": 14, "weight": 400 },
+      "cardTitle":  { "size": 17, "weight": 600 },
+      "heroTitle":  { "size": 22, "weight": 700 },
+      "greeting":   { "size": 26, "weight": 700, "letterSpacing": "-0.01em" }
+    }
+  },
+
+  "radius": {
+    "xs": 6, "sm": 8, "menuItem": 9, "control": 10,
+    "modeBtn": 11, "segment": 12, "popover": 14,
+    "card": 16, "cardLarge": 18, "pill": 21
+  },
+
+  "size": {
+    "titleBar": 44,
+    "commandBar": 48,
+    "control": 34,
+    "controlCompact": 28,
+    "field": 32,
+    "pill": 42,
+    "panelLeft": 268,
+    "panelRight": 272,
+    "panelRailCollapsed": 48,
+    "panelLeftCollapsedHeight": 204,
+    "panelRightCollapsedHeight": 90,
+    "tab": { "width": 178, "height": 34 },
+    "windowControl": { "width": 46, "height": 44 },
+    "thumbnail": { "width": 108, "height": 162 },
+    "gridThumbMin": 110,
+    "gridThumbMax": 220,
+    "gridThumbDefault": 150,
+    "pageBaseWidth": 560,
+    "pageAspect": "7:10",
+    "twoUpScale": 0.78,
+    "rotatedScale": 0.72,
+    "appCanvas": { "width": 1440, "height": 900 }
+  },
+
+  "spacing": { "gutter": 24, "panelGap": 16, "pad": 14, "gap": 12, "tight": 6, "hair": 2 },
+
+  "motion": {
+    "easing": {
+      "standard": { "css": "cubic-bezier(0.42, 0, 0.58, 1)", "bezier": [0.42, 0.0, 0.58, 1.0] }
+    },
+    "duration": {
+      "pressScale": 150,
+      "toolSwap": 160,
+      "tooltip": 180,
+      "hoverFast": 200,
+      "hover": 250,
+      "toast": 250,
+      "paneSwitch": 300,
+      "modeChevron": 300,
+      "toggleKnob": 300,
+      "tabClose": 300,
+      "thumbDelete": 300,
+      "panelCollapse": 340,
+      "panelReveal": 340,
+      "tabOpen": 350,
+      "toolLabelGrow": 350,
+      "pageRotate": 500,
+      "pageWidth": 400,
+      "annotPlace": 400,
+      "popoverReveal": 460,
+      "screenSwap": 500,
+      "pageEnter": 500,
+      "focusMode": 500,
+      "progressBar": 500,
+      "themeIconSpin": 600,
+      "themeTransition": 760,
+      "heroBarFill": 900
+    },
+    "delay": {
+      "tooltipHover": 380,
+      "railFadeIn": 160,
+      "recentCardBase": 80,
+      "recentCardStep": 50,
+      "pageEnterStep": 40
+    },
+    "autoDismiss": { "toast": 1700 },
+    "reducedMotion": { "durationScale": 0.0, "note": "Honour the OS reduced-motion setting on all six platforms." }
+  },
+
+  "elevation": {
+    "card":    "0 6px 28px {shadow}, 0 0 0 1px {ring}",
+    "cardFlat":"0 2px 12px {shadow}, 0 0 0 1px {ring}",
+    "cardHover":"0 10px 30px {shadow}, 0 0 0 1px {accent}",
+    "tabActive":"0 1px 6px {shadow}",
+    "page":    "0 10px 40px {pageShadow}",
+    "pageSmall":"0 4px 16px {pageShadow}",
+    "popover": "drop-shadow(0 10px 20px {shadow})",
+    "maximizeRestore": "0 20px 60px {shadow}"
+  },
+
+  "icon": {
+    "size": 17,
+    "sizeSmall": 15,
+    "sizeTiny": 13,
+    "strokeWidth": 1.9,
+    "linecap": "round",
+    "linejoin": "round",
+    "viewBox": 24,
+    "note": "~60 stroked icons. Bake into one SDF atlas at startup so the whole UI draws from a single material (see plan §14.2)."
+  },
+
+  "performance": {
+    "frameBudgetMs": { "at60": 16.67, "at120": 8.33 },
+    "tilePx": 512,
+    "proxyLongEdgePx": 256,
+    "zoomQuantisation": 0.125,
+    "zoomSettleMs": 120,
+    "prefetchLookaheadSec": 0.35,
+    "rasterCacheBytes": { "desktop": 268435456, "mobile": 100663296, "wasm": 67108864 },
+    "textureCacheBytes": { "desktop": 402653184, "mobile": 134217728, "wasm": 100663296 }
+  }
+}

@@ -1,0 +1,79 @@
+name: Android probe
+
+# NOT a shipping build. There is no Android app yet - no activity, no
+# window backend, no APK. See ANDROID-READINESS.md.
+#
+# What this job answers is the one question worth answering first: does the
+# portable two-thirds of Folio actually cross-compile for arm64 with the
+# NDK, against the Android Skia and PDFium prebuilts? That is a real
+# green/red signal and it costs ten minutes. Everything above those layers
+# (platform backend, shell, APK packaging) is work that has not been done,
+# so the job deliberately does not attempt it.
+#
+# Expected result on first run: either green, or a short list of portability
+# fixes in folio-core / folio-render / folio-engine. Either is useful.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "folio-core/**"
+      - "folio-render/**"
+      - "folio-engine/**"
+      - "tools/bootstrap-deps.sh"
+      - ".github/workflows/android-probe.yml"
+
+jobs:
+  probe:
+    name: arm64 cross-compile (portable layers only)
+    runs-on: ubuntu-latest
+    env:
+      FOLIO_DEPS_DIR: ${{ github.workspace }}/.folio-deps-android
+      ANDROID_ABI: arm64-v8a
+      ANDROID_API: "26"          # 8.0; matches the NDK's own floor for 64-bit
+    steps:
+      - uses: actions/checkout@v4
+
+      # ubuntu-latest ships an NDK already; this pins which one rather than
+      # inheriting whatever the image happens to have this month.
+      - name: Pin the NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+          local-cache: true
+
+      - name: Cache Android prebuilts
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.FOLIO_DEPS_DIR }}
+          key: folio-deps-android-arm64-${{ hashFiles('tools/bootstrap-deps.sh') }}
+
+      - name: Fetch Android Skia + PDFium
+        run: FOLIO_TARGET=android FOLIO_ABI=arm64 bash tools/bootstrap-deps.sh
+
+      - name: Configure for arm64
+        run: |
+          cmake -B build-android -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="${{ steps.ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI="${ANDROID_ABI}" \
+            -DANDROID_PLATFORM="android-${ANDROID_API}" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DFOLIO_DEPS_DIR="${FOLIO_DEPS_DIR}" \
+            -DFOLIO_BUILD_UI=OFF \
+            -DFOLIO_BUILD_TESTS=OFF \
+            -DFOLIO_WITH_PODOFO=OFF
+
+      # Named targets, not `all`: the point is to learn how far the portable
+      # stack gets, not to discover that a shell nobody has written is
+      # missing.
+      - name: Build the portable layers
+        run: cmake --build build-android --parallel --target folio-core folio-render folio-engine
+
+      - name: Report what came out
+        if: always()
+        run: |
+          echo "### Android arm64 probe" >> "$GITHUB_STEP_SUMMARY"
+          find build-android -name '*.a' -printf '%-56p %10s bytes\n' \
+            >> "$GITHUB_STEP_SUMMARY" || true
+          file build-android/**/*.a 2>/dev/null | head -20 || true

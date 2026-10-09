@@ -1,0 +1,37 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "folio",
+  "version": "0.1.0",
+  "description": "Folio - PDF reader and editor",
+  "comment": [
+    "PDFium is NOT acquired here. It is a GN/Chromium build with its own",
+    "toolchain and a multi-GB checkout; attempting it inside CMake is a trap.",
+    "It arrives as pinned prebuilt artefacts in third_party/pdfium (WP A2),",
+    "replaced by an owned GN pipeline at Phase 3 (plan §15.2).",
+    "",
+    "PoDoFo 1.0+ is required, not 0.10.x: the MPL-2.0 option that makes static",
+    "linking into a proprietary iOS app clean only exists from 1.0 (plan §2.1)."
+  ],
+  "dependencies": [
+    { "name": "podofo", "version>=": "1.0.0" },
+    "freetype",
+    "zlib",
+    "libpng",
+    "libjpeg-turbo",
+    "libxml2",
+    { "name": "openssl", "platform": "!wasm32" },
+    { "name": "fontconfig", "platform": "linux" },
+    "harfbuzz",
+    { "name": "gtest", "platform": "!wasm32" }
+  ],
+  "features": {
+    "signing": {
+      "description": "PAdES digital signatures (requires OpenSSL)",
+      "dependencies": [ "openssl" ]
+    }
+  },
+  "overrides": [
+    { "name": "podofo", "version": "1.0.0" }
+  ],
+  "builtin-baseline": "0000000000000000000000000000000000000000"
+}

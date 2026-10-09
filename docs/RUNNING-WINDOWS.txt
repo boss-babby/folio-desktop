@@ -1,0 +1,25 @@
+Folio - Windows build
+=====================
+
+Contents
+    Folio.exe      the application
+    pdfium.dll     the PDF engine; must stay beside Folio.exe
+    assets\        fonts and icons; must stay beside Folio.exe
+    documents\     sample PDFs
+
+Running
+    Double-click Folio.exe. Keep the four items together - the exe looks
+    for assets\fonts next to itself, and Windows looks for pdfium.dll in
+    the same folder.
+
+If SmartScreen blocks it
+    The binary is unsigned, so "Windows protected your PC" is expected.
+    More info -> Run anyway. Code signing needs a certificate, which is a
+    purchase decision, not a build setting.
+
+Known limitations in this build
+    - The Win32 window backend is new. If the window misbehaves, run with
+      --software to bypass the GPU path.
+    - PoDoFo is off in the CI build (-DFOLIO_WITH_PODOFO=OFF), so saving
+      annotations back into a PDF is unavailable. Reading, rendering,
+      searching, selecting and annotating in-session all work.

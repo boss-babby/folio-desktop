@@ -1,0 +1,222 @@
+name: CI
+
+# Standing gates from IMPLEMENTATION-PLAN.md. The rule that matters more than
+# any individual check: if a gate goes flaky, it gets fixed that week. A
+# tolerated flaky gate is a gate that has been switched off, and everyone
+# stops reading the red.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # --------------------------------------------------------------------------
+  # The fast lane. No PDFium, no Skia, no network beyond actions/checkout.
+  # folio-core and its whole test suite must build and pass with zero
+  # third-party dependencies - that property is what let the geometry, cache
+  # and scheduler layers be finished and verified before any binary was
+  # vendored, and it is worth defending with a job of its own.
+  # --------------------------------------------------------------------------
+  core-only:
+    name: core (no dependencies)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: sudo apt-get update && sudo apt-get install -y ninja-build cmake g++-14
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_CXX_COMPILER=g++-14
+          -DFOLIO_BUILD_UI=OFF
+          -DFOLIO_DEPS_DIR=/nonexistent
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  # --------------------------------------------------------------------------
+  # The real lane: PDFium + Skia, every test including the end-to-end pipeline.
+  # --------------------------------------------------------------------------
+  full:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-gcc,    os: ubuntu-24.04, cc: gcc-14,  cxx: g++-14 }
+          - { name: linux-clang,  os: ubuntu-24.04, cc: clang-18, cxx: clang++-18 }
+          - { name: macos-arm64,  os: macos-14,     cc: clang,   cxx: clang++ }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ninja-build cmake
+
+      - name: Install toolchain (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja cmake
+
+      # The pins live in tools/fetch-deps.sh, so the cache key is the hash of
+      # that file. Change a pin, get a new cache - no stale-dependency class
+      # of failure, which is the one that wastes a whole afternoon.
+      - name: Cache dependencies
+        id: deps-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/folio-deps
+          key: folio-deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/fetch-deps.sh') }}
+
+      - name: Fetch dependencies
+        if: steps.deps-cache.outputs.cache-hit != 'true'
+        run: ./tools/fetch-deps.sh
+
+      - name: Configure
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DFOLIO_BUILD_UI=OFF
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      # The golden images are the cross-platform gate: the same document must
+      # render to the same pixels on Linux, macOS and Windows. Uploading the
+      # actual output on failure is the difference between "golden mismatch"
+      # and being able to see that macOS substituted a different font.
+      - name: Upload render artefacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: render-${{ matrix.name }}
+          path: |
+            tests/data/*.png
+            tests/data/*.ppm
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # --------------------------------------------------------------------------
+  # Sanitisers. The PDF corpus is adversarial by nature - every file Folio
+  # opens came from somewhere else - so ASan/UBSan on the engine is not
+  # optional hygiene, it is the security posture.
+  # --------------------------------------------------------------------------
+  sanitizers:
+    name: asan + ubsan
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build cmake
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/folio-deps
+          key: folio-deps-Linux-X64-${{ hashFiles('tools/fetch-deps.sh') }}
+      - run: ./tools/fetch-deps.sh || true
+      - name: Configure
+        run: >
+          cmake -S . -B build-asan -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DFOLIO_BUILD_UI=OFF
+          -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined"
+      - run: cmake --build build-asan
+      - name: Test
+        env:
+          # PDFium's own allocator trips LeakSanitizer on shutdown paths we do
+          # not control. Suppress leaks, keep every other ASan check armed.
+          ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1
+        run: ctest --test-dir build-asan --output-on-failure
+
+  # --------------------------------------------------------------------------
+  # Boundary rules. Cheap, fast, and the only thing standing between the
+  # project and a folio-core that quietly depends on a UI toolkit.
+  # --------------------------------------------------------------------------
+  boundaries:
+    name: architecture boundaries
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y cmake
+      - name: folio-core contains no toolkit types
+        run: cmake -DFOLIO_SCAN_DIR=$PWD/folio-core -P cmake/ScanCorePurity.cmake
+      - name: folio-ui has no hard-coded colours or durations
+        run: cmake -DFOLIO_SCAN_DIR=$PWD/folio-ui -P cmake/ScanHardcodedTokens.cmake
+      - name: design-tokens.json is valid
+        run: python3 -c "import json; json.load(open('design-tokens.json')); print('ok')"
+
+  # --------------------------------------------------------------------------
+  # Windows desktop build.
+  #
+  # This job is the Windows build machine. MSVC cannot run on Linux, so
+  # rather than cross-compiling, the runner - which has Visual Studio 2022
+  # and the Windows SDK preinstalled - compiles the real thing and uploads
+  # the .exe as an artifact. Anyone can download it without owning a
+  # Windows toolchain, and the Win32 backend cannot silently rot: a break
+  # fails this job on the commit that caused it.
+  # --------------------------------------------------------------------------
+  windows:
+    name: windows-msvc (desktop exe)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch prebuilt Skia and PDFium
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File tools/bootstrap-deps.ps1
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake -B build -G "Visual Studio 17 2022" -A x64 `
+                -DCMAKE_BUILD_TYPE=Release `
+                -DFOLIO_BUILD_UI=ON `
+                -DFOLIO_WITH_PODOFO=OFF `
+                -DFOLIO_DEPS_DIR="$env:LOCALAPPDATA\folio-deps"
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Confirm the Win32 backend was selected
+        shell: pwsh
+        run: |
+          $log = Get-Content build/CMakeCache.txt
+          if (-not (Select-String -Path build/CMakeCache.txt -Pattern 'FOLIO_PLATFORM_BACKEND:INTERNAL=win32')) {
+            throw "platform backend is not win32 - the build fell back to 'none'"
+          }
+
+      - name: Stage the artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item build/folio-ui/Release/folio-desktop.exe dist/Folio.exe
+          # PDFium ships as a DLL, so it travels with the exe. See the note
+          # in STATUS.md about what a genuinely single-file build needs.
+          Copy-Item "$env:LOCALAPPDATA\folio-deps\pdfium\bin\pdfium.dll" dist/
+          # Fonts are found beside the executable at run time. Without this
+          # the artifact starts on a machine that has no source tree and
+          # renders no text at all.
+          Copy-Item assets dist/assets -Recurse
+          Copy-Item documents dist/documents -Recurse
+          Copy-Item docs/RUNNING-WINDOWS.txt dist/README.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Folio-windows-x64
+          path: dist/

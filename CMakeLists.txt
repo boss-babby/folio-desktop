@@ -23,6 +23,16 @@ if(WIN32)
     add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
     # getenv, sscanf and friends are used deliberately and portably.
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
+
+    # Use the static MSVC runtime (/MT) for every target. The prebuilt Skia
+    # from skia-pack is built with /MT, and MSVC refuses to link objects
+    # built with the dynamic runtime (/MD) against it. Without this, every
+    # object that touches Skia fails with LNK2038 'RuntimeLibrary' mismatch,
+    # which is what produced the thousands of identical link errors on the
+    # first Windows CI run. PDFium ships as a DLL with its own runtime, so it
+    # is not affected. Set for all configurations: only Release Skia is
+    # fetched, so a Debug /MDd build would mismatch the same way.
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
 endif()
 
 set(CMAKE_CXX_STANDARD 20)

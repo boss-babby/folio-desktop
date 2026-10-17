@@ -1,99 +1,62 @@
-name: Release (Windows)
+name: Folio Windows FULL (PDFium + Skia)
 
-# Produces a downloadable Folio build without anyone needing a Windows
-# machine, a Visual Studio licence or a local toolchain. Two ways in:
-#
-#   * Actions -> "Release (Windows)" -> Run workflow   (artifact only)
-#   * git tag v0.1.0 && git push --tags                (artifact + Release)
-#
-# The CI workflow already builds and tests Windows on every push; this one
-# exists to package the result, so it deliberately repeats the build rather
-# than depending on CI's artifact retention.
-
+# Canonical template lives here, separate from Android and Office-format work.
+# GitHub Actions only executes a COPY committed to .github/workflows/ on GitHub.
+# This job is manual-only so it will not duplicate release-windows.yml CI.
 on:
-  push:
-    tags: ["v*"]
   workflow_dispatch:
-    inputs:
-      podofo:
-        description: "Build with PoDoFo (annotation save-back)"
-        type: boolean
-        default: false
 
 permissions:
-  contents: write          # needed to create the GitHub Release
+  contents: read
 
-env:
-  # A path the YAML can name. bootstrap-deps.ps1 honours FOLIO_DEPS_DIR;
-  # the runner's %LOCALAPPDATA% is not visible to the `env` context, so it
-  # cannot be used as a cache key path.
-  FOLIO_DEPS_DIR: ${{ github.workspace }}\.folio-deps
+concurrency:
+  group: folio-windows-full-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  windows:
-    name: Windows x64 package
+  build-windows-x64:
+    name: MSVC x64 / PDFium + Skia / annotations + Save As / CTest / ZIP
     runs-on: windows-2022
+    timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
-
-      # The heavy half of the build is Skia and PDFium, which never change
-      # between runs. Caching them turns a ~12 minute job into ~4.
-      - name: Cache prebuilt dependencies
-        uses: actions/cache@v4
+      - name: Check out this commit
+        uses: actions/checkout@v4
         with:
-          path: ${{ env.FOLIO_DEPS_DIR }}
-          key: folio-deps-windows-${{ hashFiles('tools/bootstrap-deps.ps1') }}
+          persist-credentials: false
 
-      - name: Fetch prebuilt Skia and PDFium
-        shell: pwsh
-        run: powershell -ExecutionPolicy Bypass -File tools/bootstrap-deps.ps1
-
-      - name: Configure
+      - name: Check full-build prerequisites
         shell: pwsh
         run: |
-          cmake -B build -G "Visual Studio 17 2022" -A x64 `
-                -DCMAKE_BUILD_TYPE=Release `
-                -DFOLIO_BUILD_UI=ON `
-                -DFOLIO_WITH_PODOFO=${{ inputs.podofo && 'ON' || 'OFF' }} `
-                -DFOLIO_DEPS_DIR="$env:FOLIO_DEPS_DIR"
+          if ($env:RUNNER_OS -ne 'Windows') { throw 'A real Windows runner is required' }
+          if (-not (Test-Path 'tools/build-windows-clean.ps1')) { throw 'Missing full Windows build script' }
+          if (-not (Test-Path 'tools/bootstrap-deps.ps1')) { throw 'Missing pinned PDFium/Skia bootstrap' }
+          cmake --version
+          if ($LASTEXITCODE -ne 0) { throw 'CMake is missing' }
+          # The script checks the actual VS/Win32 CMake configuration,
+          # PDFium and Skia libraries, required tests, PE GUI subsystem,
+          # bundled DLL/fonts and ZIP integrity. It stages dependencies,
+          # objects and tests in a unique Windows TEMP directory.
 
-      - name: Build
-        run: cmake --build build --config Release --parallel
-
-      - name: Test
-        run: ctest --test-dir build -C Release --output-on-failure
-
-      - name: Stage
+      - name: Build the real GUI, run all tests and package only on success
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item build/folio-ui/Release/folio-desktop.exe dist/Folio.exe
-          Copy-Item "$env:FOLIO_DEPS_DIR\pdfium\bin\pdfium.dll" dist/
-          # Fonts are resolved beside the executable at run time; without
-          # them the app starts and renders no text.
-          Copy-Item assets    dist/assets    -Recurse
-          Copy-Item documents dist/documents -Recurse
-          Copy-Item docs/RUNNING-WINDOWS.txt dist/README.txt
-          Compress-Archive -Path dist/* -DestinationPath Folio-windows-x64.zip
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass `
+            -File tools/build-windows-clean.ps1 `
+            -Compiler MSVC `
+            -OutputPath (Join-Path $env:GITHUB_WORKSPACE 'Folio-windows-full-x64.zip')
+          if ($LASTEXITCODE -ne 0) { throw 'Full Windows build, tests or package check failed' }
+          $zip = Join-Path $env:GITHUB_WORKSPACE 'Folio-windows-full-x64.zip'
+          if (-not (Test-Path -LiteralPath $zip -PathType Leaf)) { throw 'Verified ZIP was not produced' }
+          $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  Folio-windows-full-x64.zip" | Set-Content -Path 'Folio-windows-full-x64.sha256' -Encoding ascii
+          Write-Host "SHA-256: $hash"
 
-      - name: Smoke test the staged build
-        shell: pwsh
-        run: |
-          # Catches the packaging mistakes a compile cannot: a missing DLL
-          # or an assets folder that did not travel.
-          foreach ($p in @("dist/Folio.exe","dist/pdfium.dll","dist/assets/fonts")) {
-            if (-not (Test-Path $p)) { throw "missing from package: $p" }
-          }
-
-      - uses: actions/upload-artifact@v4
+      - name: Upload verified portable Windows build and checksum
+        uses: actions/upload-artifact@v4
         with:
-          name: Folio-windows-x64
-          path: Folio-windows-x64.zip
+          name: Folio-windows-full-x64
+          path: |
+            Folio-windows-full-x64.zip
+            Folio-windows-full-x64.sha256
+          if-no-files-found: error
           retention-days: 30
-
-      - name: Publish Release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: Folio-windows-x64.zip
-          generate_release_notes: true

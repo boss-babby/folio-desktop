@@ -2,10 +2,8 @@
 <!--
   Folio for Android.
 
-  This is a NativeActivity app: there is no Java Activity subclass, no
-  layout XML and no View hierarchy. The whole UI is the same C++ that runs
-  on the desktop, drawing through Skia onto the activity's surface. The
-  only Java involved is the framework's own NativeActivity.
+  FolioActivity extends NativeActivity only to connect Android's file picker,
+  clipboard and soft keyboard. The UI is still the same C++/Skia surface.
 -->
 <!-- The applicationId/namespace lives in build.gradle.kts. AGP 8 ignores a
      `package` attribute here and warns about it, so it is deliberately
@@ -15,10 +13,9 @@
     <!--
       API 26 is the floor. It is where NativeActivity's input handling,
       AAssetManager and the EGL/GLES3 surface behaviour we rely on are all
-      dependable, and it predates scoped storage becoming mandatory, which
-      keeps the file story honest while SAF is still unwritten.
+      dependable. Gradle owns minSdk/targetSdk; PDF imports use SAF rather
+      than requesting broad storage permissions.
     -->
-    <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="34" />
 
     <uses-feature android:glEsVersion="0x00030000" android:required="true" />
     <!--
@@ -29,13 +26,22 @@
     <uses-feature android:name="android.hardware.touchscreen.multitouch.jazzhand"
                   android:required="false" />
     <uses-feature android:name="android.hardware.touchscreen.multitouch"
-                  android:required="true" />
+                  android:required="false" />
 
     <application
         android:label="Folio"
-        android:hasCode="false"
-        android:allowBackup="true"
+        android:icon="@drawable/ic_folio"
+        android:hasCode="true"
+        android:allowBackup="false"
+        android:fullBackupContent="@xml/backup_rules"
+        android:dataExtractionRules="@xml/data_extraction_rules"
         android:supportsRtl="true">
+
+        <provider
+            android:name="ai.folio.reader.PdfShareProvider"
+            android:authorities="${applicationId}.share"
+            android:exported="false"
+            android:grantUriPermissions="true" />
 
         <!--
           configChanges lists everything Folio handles itself and must NOT
@@ -44,13 +50,11 @@
           native side gets APP_CMD_CONFIG_CHANGED instead.
         -->
         <activity
-            android:name="android.app.NativeActivity"
+            android:name="ai.folio.reader.FolioActivity"
             android:exported="true"
-            android:label="Folio"
             android:launchMode="singleTop"
-            android:screenOrientation="fullUser"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|density|smallestScreenSize|uiMode"
-            android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
+            android:theme="@android:style/Theme.Material.Light.NoActionBar">
 
             <!-- Names the library NativeActivity will dlopen: libfolio-android.so -->
             <meta-data android:name="android.app.lib_name"
@@ -63,15 +67,13 @@
 
             <!--
               Open a PDF from another app (Files, Gmail, Drive). The URI
-              arrives as content:// and currently cannot be resolved to a
-              path, so this is wired but not yet honoured - see the SAF
-              item in ANDROID-READINESS.md.
+              is copied from content:// to an app-private cache before PDFium
+              reads it; we never mistake the URI for a filesystem path.
             -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
-                <category android:name="android.intent.category.BROWSABLE" />
-                <data android:mimeType="application/pdf" />
+                <data android:scheme="content" android:mimeType="application/pdf" />
             </intent-filter>
         </activity>
     </application>

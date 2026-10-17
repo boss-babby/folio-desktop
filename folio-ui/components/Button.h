@@ -37,7 +37,7 @@ enum class ButtonStyle : std::uint8_t {
     Close,
     /// A cell inside a SegmentedControl; corners handled by the parent.
     Segment,
-    /// Floating card-styled button (the fullscreen-exit pill).
+    /// Floating card-styled button (the Focus exit control).
     Card,
 };
 

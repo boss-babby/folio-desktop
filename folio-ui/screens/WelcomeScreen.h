@@ -9,10 +9,13 @@
 #include "components/Containers.h"
 #include "components/Controls.h"
 #include "components/WindowChrome.h"
+#include "components/Overlays.h"
 #include "screens/AppState.h"
+#include "screens/RecentCovers.h"
 
 #include <functional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace folio::ui {
@@ -22,9 +25,27 @@ public:
     explicit WelcomeScreen(AppState& state);
 
     /// Raised when a document should be opened; the app switches screens.
-    std::function<void(const std::string& title, int pages)> onOpenDocument;
+    std::function<void(const std::string& path)> onOpenDocument;
+    void refreshRecents(double now);
+    void setRecentStateFile(const std::string& path) { covers_.setStateFile(path); }
+    void setCoverWakeCallback(std::function<void()> wake) {
+        covers_.setWake(std::move(wake));
+    }
+    [[nodiscard]] bool coversReady() const noexcept { return covers_.hasResults(); }
+    [[nodiscard]] bool coversBusy() const { return covers_.busy(); }
+    bool pollCovers();
+    void trimIdleCovers();
+    void releaseCoverMemory();
+    void setCoverRequestsEnabled(bool on) {
+        requestCovers_ = on;
+        if (!on) covers_.cancelQueued();
+    }
     /// Ask the app for a file chooser.
     std::function<void()> onBrowse;
+    std::function<void(const std::string&, int)> onStorageAction;
+    std::function<void(const std::string&)> onRemoveDocument;
+    std::function<void(bool)> onSetPreferSourceOnly;
+    void setPreferSourceOnly(bool enabled) { preferSourceOnly_ = enabled; }
     std::function<void()> onQuit;
     /// See ReaderScreen::windowControls.
     [[nodiscard]] WindowControls* windowControls() noexcept { return winCtl_; }
@@ -34,8 +55,9 @@ public:
     void replayEntrance(double now);
 
     void onLayout() override;
+    bool onPointer(const PointerEvent& e) override;
+    void dismissSettingsIfOutside(Point windowPoint, double now);
     void onPaint(IPaintTarget& t, const PaintCtx& ctx) override;
-    void onPaintOverlay(IPaintTarget& t, const PaintCtx& ctx) override;
     [[nodiscard]] bool animating(double now) const override;
 
 private:
@@ -60,6 +82,25 @@ private:
     /// and the sidebar is gone on a phone - without this there is no way
     /// to open a document that is not already in the recents grid.
     Button* openCompactBtn_ = nullptr;
+    Button* settingsCompactBtn_ = nullptr;
+    Button* settingsSidebarBtn_ = nullptr;
+    Popover* settingsPop_ = nullptr;
+    ScrollView* settingsScroll_ = nullptr;
+    Widget* settingsHost_ = nullptr;
+    std::vector<Button*> settingsChoices_;
+    Popover* cardMenu_ = nullptr;
+    Popover* storagePop_ = nullptr;
+    ScrollView* storageScroll_ = nullptr;
+    Widget* storageHost_ = nullptr;
+    std::vector<Button*> storageRows_;
+    std::vector<Button*> menuChoices_;
+    std::string menuPath_;
+    bool preferSourceOnly_ = false;
+    void openSettings(Button* anchor);
+    void openCardMenu(const std::string& path, Point anchor, RecentCard* card);
+    void runCardAction(int action);
+    void openStorageList();
+    void refreshStorageList();
     std::vector<Button*> sideItems_;
     SegmentedControl* themeSeg_ = nullptr;
     SegmentedControl* openModeSeg_ = nullptr;
@@ -70,12 +111,17 @@ private:
     Label* greeting_ = nullptr;
     Label* subtitle_ = nullptr;
     CardView* hero_ = nullptr;
+    Widget* heroContent_ = nullptr;
+    void paintHero(IPaintTarget& t, const PaintCtx& ctx);
     Dropzone* dropzone_ = nullptr;
     TextField* search_ = nullptr;
     SegmentedControl* sortSeg_ = nullptr;
     Widget* gridHost_ = nullptr;
     ScrollView* scroll_ = nullptr;
     std::vector<RecentCard*> cards_;
+    std::vector<std::string> cardPaths_;
+    RecentCovers covers_;
+    bool requestCovers_ = true;
 
     std::string filter_;
     Timeline heroEnter_;

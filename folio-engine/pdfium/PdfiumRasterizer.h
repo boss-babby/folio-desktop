@@ -41,6 +41,7 @@
 #include "folio/core/render/TileGrid.h"
 
 #include "SnapshotFileAccess.h"
+#include "FileMappedAccess.h"
 
 namespace folio::engine {
 
@@ -95,6 +96,8 @@ public:
     /// generation if the new one fails to parse - a corrupt incremental
     /// update must never blank the user's document.
     bool setSnapshot(core::SnapshotPtr snapshot);
+    /// Open an existing PDF without reading the entire file into private RAM.
+    bool openFile(const std::string& utf8Path);
 
     [[nodiscard]] std::size_t pageCount() const noexcept;
     [[nodiscard]] core::Generation generation() const noexcept;
@@ -139,19 +142,21 @@ public:
 
     [[nodiscard]] const Stats& stats() const noexcept { return stats_; }
     void resetStats() noexcept { stats_ = Stats{}; }
+    /// Worker-thread only. Close temporary page handles after each job.
+    void releasePages() { assertOnPdfiumThread(); dropAllPages(); }
 
 private:
     struct LoadedDoc {
         std::unique_ptr<SnapshotFileAccess> access;
+        std::unique_ptr<FileMappedAccess> mapped;
         FPDF_DOCUMENT doc = nullptr;
         std::size_t   pageCount = 0;
         ~LoadedDoc();
     };
 
-    /// LRU of open FPDF_PAGE handles. Opening a page parses its content
-    /// stream; at 6 tiles per page that is 6x the work if not cached. 16 is
-    /// three screens' worth either side of the viewport.
-    static constexpr std::size_t kMaxOpenPages = 16;
+    // At most one transient page handle per document/worker. The worker
+    // closes it after each operation; adjacent tiles may re-parse the page,
+    // trading CPU time for predictable idle memory.
 
     FPDF_PAGE acquirePage(core::PageId page);
     void      dropPage(core::PageId page);

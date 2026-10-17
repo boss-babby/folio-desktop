@@ -7,6 +7,9 @@
 #include "include/core/SkStream.h"
 #include "include/core/SkTextBlob.h"
 #include "include/ports/SkFontMgr_empty.h"
+#if defined(_WIN32)
+#include "include/ports/SkTypeface_win.h"
+#endif
 
 #if defined(FOLIO_SKIA_HAS_FONTCONFIG)
 #include "include/ports/SkFontMgr_fontconfig.h"
@@ -43,6 +46,18 @@ SkiaTextSystem& SkiaTextSystem::instance() {
     return s;
 }
 
+// The Windows prebuilt of Skia declares SkFontMgr_New_Custom_Empty in its
+// headers but does not compile it into skia.lib, so the link fails. On
+// Windows every empty-manager request goes to DirectWrite instead, which the
+// prebuilt does contain. It can still load the bundled font from memory.
+static sk_sp<SkFontMgr> makeEmptyFontMgr() {
+#if defined(_WIN32)
+    return SkFontMgr_New_DirectWrite();
+#else
+    return SkFontMgr_New_Custom_Empty();
+#endif
+}
+
 bool SkiaTextSystem::initialise(const std::string& fontDir) {
     if (initialised_) return bundled_;
     initialised_ = true;
@@ -51,7 +66,7 @@ bool SkiaTextSystem::initialise(const std::string& fontDir) {
     fontData_ = SkData::MakeFromFileName(path.c_str());
 
     if (fontData_ && fontData_->size() > 0) {
-        mgr_ = SkFontMgr_New_Custom_Empty();
+        mgr_ = makeEmptyFontMgr();
         // Probe with a default typeface to confirm the data actually parses.
         auto probe = mgr_->makeFromData(fontData_);
         if (probe) {
@@ -71,7 +86,7 @@ bool SkiaTextSystem::initialise(const std::string& fontDir) {
 #if defined(FOLIO_SKIA_HAS_FONTCONFIG)
     mgr_ = SkFontMgr_New_FontConfig(nullptr);
 #else
-    mgr_ = SkFontMgr_New_Custom_Empty();
+    mgr_ = makeEmptyFontMgr();
 #endif
     std::fprintf(stderr,
                  "[folio] WARNING: falling back to system fonts; chrome metrics "

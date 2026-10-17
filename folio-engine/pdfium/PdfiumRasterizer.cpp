@@ -60,6 +60,7 @@ constexpr unsigned long kPaperWhite = 0xFFFFFFFFul;
 // ---------------------------------------------------------------------------
 
 PdfiumRasterizer::LoadedDoc::~LoadedDoc() {
+    std::lock_guard<std::recursive_mutex> apiLock(pdfiumApiMutex());
     if (doc) {
         FPDF_CloseDocument(doc);
     }
@@ -71,6 +72,7 @@ PdfiumRasterizer::PdfiumRasterizer() {
 }
 
 PdfiumRasterizer::~PdfiumRasterizer() {
+    std::lock_guard<std::recursive_mutex> apiLock(pdfiumApiMutex());
     dropAllPages();
     current_.reset();
     retired_.clear();
@@ -82,11 +84,13 @@ PdfiumRasterizer::~PdfiumRasterizer() {
 // ---------------------------------------------------------------------------
 
 bool PdfiumRasterizer::setSnapshot(core::SnapshotPtr snapshot) {
+    std::lock_guard<std::recursive_mutex> apiLock(pdfiumApiMutex());
     assertOnPdfiumThread();
     if (!snapshot) {
         return false;
     }
-    if (current_ && current_->access->generation() >= snapshot->generation()) {
+    if (current_ && current_->access &&
+        current_->access->generation() >= snapshot->generation()) {
         return true;                      // already at or ahead of this state
     }
 
@@ -105,7 +109,7 @@ bool PdfiumRasterizer::setSnapshot(core::SnapshotPtr snapshot) {
     // Invalidate only what actually changed. Pages untouched by the edit keep
     // every cached tile across the save - this is what makes annotating a
     // 500-page document feel instant instead of re-rendering the world.
-    if (current_) {
+    if (current_ && current_->access) {
         for (core::PageId p : snapshot->dirtyPagesSince(current_->access->generation())) {
             dropPage(p);
             opaqueCache_.erase(p);
@@ -133,12 +137,34 @@ bool PdfiumRasterizer::setSnapshot(core::SnapshotPtr snapshot) {
     return true;
 }
 
+bool PdfiumRasterizer::openFile(const std::string& path) {
+    std::lock_guard<std::recursive_mutex> apiLock(pdfiumApiMutex());
+    assertOnPdfiumThread();
+    auto next = std::make_unique<LoadedDoc>();
+    next->mapped = std::make_unique<FileMappedAccess>(path);
+    if (!next->mapped->valid()) return false;
+    next->doc = FPDF_LoadCustomDocument(next->mapped->handle(),
+                                        password_.empty() ? nullptr : password_.c_str());
+    if (!next->doc) {
+        lastError_ = FPDF_GetLastError();
+        ++stats_.loadFailures;
+        return false;
+    }
+    next->pageCount = static_cast<std::size_t>(FPDF_GetPageCount(next->doc));
+    dropAllPages();
+    opaqueCache_.clear();
+    retired_.clear();
+    current_ = std::move(next);
+    ++stats_.documentsLoaded;
+    return true;
+}
+
 std::size_t PdfiumRasterizer::pageCount() const noexcept {
     return current_ ? current_->pageCount : 0;
 }
 
 core::Generation PdfiumRasterizer::generation() const noexcept {
-    return current_ ? current_->access->generation() : 0;
+    return current_ && current_->access ? current_->access->generation() : 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -146,6 +172,7 @@ core::Generation PdfiumRasterizer::generation() const noexcept {
 // ---------------------------------------------------------------------------
 
 FPDF_PAGE PdfiumRasterizer::acquirePage(core::PageId id) {
+    std::lock_guard<std::recursive_mutex> apiLock(pdfiumApiMutex());
     assertOnPdfiumThread();
     if (!current_ || !current_->doc) {
         return nullptr;
@@ -156,19 +183,8 @@ FPDF_PAGE PdfiumRasterizer::acquirePage(core::PageId id) {
     if (const auto it = pageCache_.find(id); it != pageCache_.end()) {
         return it->second;
     }
-    if (pageCache_.size() >= kMaxOpenPages) {
-        // Evict the page furthest from the one being asked for. std::map keeps
-        // the keys ordered, so the answer is always at one end or the other -
-        // and that beats true LRU here, because access is spatial (scrolling)
-        // rather than temporal.
-        const auto first = pageCache_.begin();
-        const auto last = std::prev(pageCache_.end());
-        const auto distFirst = (id > first->first) ? id - first->first : first->first - id;
-        const auto distLast = (id > last->first) ? id - last->first : last->first - id;
-        const auto victim = (distFirst >= distLast) ? first : last;
-        FPDF_ClosePage(victim->second);
-        pageCache_.erase(victim);
-    }
+    // A prior operation never leaves another page parsed and resident.
+    dropAllPages();
     FPDF_PAGE page = FPDF_LoadPage(current_->doc, static_cast<int>(id));
     if (page) {
         pageCache_.emplace(id, page);
@@ -177,6 +193,7 @@ FPDF_PAGE PdfiumRasterizer::acquirePage(core::PageId id) {
 }
 
 void PdfiumRasterizer::dropPage(core::PageId id) {
+    std::lock_guard<std::recursive_mutex> apiLock(pdfiumApiMutex());
     if (const auto it = pageCache_.find(id); it != pageCache_.end()) {
         FPDF_ClosePage(it->second);
         pageCache_.erase(it);
@@ -184,6 +201,7 @@ void PdfiumRasterizer::dropPage(core::PageId id) {
 }
 
 void PdfiumRasterizer::dropAllPages() {
+    std::lock_guard<std::recursive_mutex> apiLock(pdfiumApiMutex());
     for (auto& [id, page] : pageCache_) {
         FPDF_ClosePage(page);
     }
@@ -242,6 +260,7 @@ void walkBookmarks(FPDF_DOCUMENT doc, FPDF_BOOKMARK parent, int depth,
 }  // namespace
 
 std::vector<PdfiumRasterizer::Bookmark> PdfiumRasterizer::outline() const {
+    std::lock_guard<std::recursive_mutex> apiLock(pdfiumApiMutex());
     std::vector<Bookmark> out;
     if (!current_ || !current_->doc) return out;
     walkBookmarks(current_->doc, nullptr, 0, out);
@@ -249,6 +268,7 @@ std::vector<PdfiumRasterizer::Bookmark> PdfiumRasterizer::outline() const {
 }
 
 core::PageInfo PdfiumRasterizer::pageInfo(core::PageId id) const {
+    std::lock_guard<std::recursive_mutex> apiLock(pdfiumApiMutex());
     assertOnPdfiumThread();
     core::PageInfo info{};
     if (!current_ || !current_->doc) {
@@ -269,6 +289,7 @@ core::PageInfo PdfiumRasterizer::pageInfo(core::PageId id) const {
 }
 
 bool PdfiumRasterizer::pageIsOpaque(core::PageId id) {
+    std::lock_guard<std::recursive_mutex> apiLock(pdfiumApiMutex());
     if (const auto it = opaqueCache_.find(id); it != opaqueCache_.end()) {
         return it->second;
     }
@@ -286,6 +307,7 @@ std::unique_ptr<core::RasterTile> PdfiumRasterizer::renderInto(
     core::PageId pageId, const core::TileKey& key,
     std::int32_t w, std::int32_t h, const Matrix& matrix,
     bool slice, core::Priority priority, const TileRequest* cancelCheck) {
+    std::lock_guard<std::recursive_mutex> apiLock(pdfiumApiMutex());
 
     assertOnPdfiumThread();
     if (w <= 0 || h <= 0) {
@@ -369,12 +391,13 @@ std::unique_ptr<core::RasterTile> PdfiumRasterizer::renderInto(
 
 std::unique_ptr<core::RasterTile> PdfiumRasterizer::renderTile(
     const TileRequest& req, const TileSpec& spec) {
+    std::lock_guard<std::recursive_mutex> apiLock(pdfiumApiMutex());
     assertOnPdfiumThread();
 
     // By the time this dequeues, the document may have moved on. Rendering
     // stale content would put the wrong pixels on screen, so drop it - the
     // scheduler has already queued a replacement against the current state.
-    if (!current_ || req.snapshotGen != current_->access->generation()) {
+    if (!current_ || req.snapshotGen != generation()) {
         ++stats_.tilesStale;
         return nullptr;
     }
@@ -397,6 +420,7 @@ std::unique_ptr<core::RasterTile> PdfiumRasterizer::renderTile(
 
 std::unique_ptr<core::RasterTile> PdfiumRasterizer::renderFullPage(
     core::PageId pageId, float scale, int rotationDegrees, core::ColorScheme scheme) {
+    std::lock_guard<std::recursive_mutex> apiLock(pdfiumApiMutex());
     assertOnPdfiumThread();
 
     const core::PageInfo info = pageInfo(pageId);

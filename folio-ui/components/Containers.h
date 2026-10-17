@@ -8,8 +8,10 @@
 #include "folio/ui/Animation.h"
 #include "folio/ui/Draw.h"
 #include "folio/ui/Widget.h"
+#include "components/RecentCover.h"
 
 #include <cstdint>
+#include <memory>
 #include <functional>
 #include <string>
 #include <vector>
@@ -95,6 +97,15 @@ public:
 
     [[nodiscard]] float scrollY() const noexcept { return scrollY_; }
     void setScrollY(float y);
+    /// A tab switch restores the exact panel position, not an old animated
+    /// reveal target that might override it on the next frame.
+    void restoreScrollY(float y) {
+        setScrollY(y);
+        smooth_.reset(scrollY_);
+        smoothActive_ = false;
+        velocity_ = overscrollVelocity_ = 0.f;
+        touchHeld_ = barHeld_ = barTrackPress_ = false;
+    }
     void scrollBy(float dy);
     /// Bring [top, top+height] into view, animating over `durationMs`.
     void revealRange(float top, float height, double now, int durationMs);
@@ -111,10 +122,21 @@ public:
 protected:
     float scrollY_ = 0.f;
     float velocity_ = 0.f;
+    float overscrollVelocity_ = 0.f;
     double lastFrame_ = 0.0;
     AnimatedF smooth_{0.f};
     bool smoothActive_ = false;
     AnimatedF barAlpha_{0.f};
+    PointerId touchId_ = 0;
+    float touchStartY_ = 0.f;
+    float touchLastY_ = 0.f;
+    double touchLastTime_ = 0.0;
+    bool touchHeld_ = false;
+    bool touchMoved_ = false;
+    bool barHeld_ = false;
+    bool barTrackPress_ = false;
+    PointerId barId_ = 0;
+    float barGrabOffset_ = 0.f;
 };
 
 // ---------------------------------------------------------------------------
@@ -149,6 +171,8 @@ public:
     [[nodiscard]] float sheetProgress(double now) const;
 
     void setCollapsed(bool c, double now);
+    /// Initial state: avoid animating an open panel across the first frame.
+    void setCollapsedImmediately(bool c) noexcept;
 
     /// The width this panel animates to when expanded.
     ///
@@ -259,8 +283,10 @@ public:
     RecentCard(std::string title, std::string meta, int accentIndex);
 
     std::function<void()> onOpen;
+    std::function<void(Point)> onMenu; // window position of hold/right-click
     std::string title;
     std::string meta;
+    std::shared_ptr<const RecentCover> cover;
     /// 0..1 reading progress, drawn as a bar along the bottom.
     float progress = 0.f;
     int accentIndex = 0;
@@ -276,6 +302,9 @@ private:
     AnimatedF hoverT_{0.f};
     Timeline enter_;
     double barDelay_ = 0.0;
+    double pressStart_ = -1.0;
+    Point pressPos_{};
+    bool menuOpened_ = false;
 };
 
 // ---------------------------------------------------------------------------

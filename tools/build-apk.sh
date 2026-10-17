@@ -68,6 +68,20 @@ fi
 export ANDROID_HOME="$SDK"
 export ANDROID_SDK_ROOT="$SDK"
 
+# Install the exact Android CMake version required by CMakeLists.txt *before* starting Gradle.
+# Otherwise AGP starts sdkmanager inside its already memory-limited daemon;
+# the two Java heaps can OOM-kill that daemon on a 2 GiB build machine.
+if [ ! -x "$SDK/cmake/3.31.6/bin/cmake" ]; then
+    say "fetching Android CMake 3.31.6"
+    rm -rf "$SDK/cmake/3.31.6"   # remove an interrupted package install
+    JAVA_OPTS="-Xmx384m -XX:MaxMetaspaceSize=192m" \
+        "$SDK/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$SDK" \
+        "cmake;3.31.6" >/dev/null
+    test -x "$SDK/cmake/3.31.6/bin/cmake" || {
+        echo "Android CMake 3.31.6 was not installed" >&2; exit 1;
+    }
+fi
+
 # --- per-ABI prebuilts ---------------------------------------------------
 # Gradle builds every ABI in abiFilters, and CMake skips Skia-dependent
 # targets when the prebuilts are missing, which surfaces as
@@ -91,12 +105,25 @@ if [ ! -d "$D/gradle-$GRADLE_VER" ]; then
 fi
 export PATH="$D/gradle-$GRADLE_VER/bin:$JAVA_HOME/bin:$PATH"
 
+if [ "${FOLIO_PREPARE_ONLY:-0}" = 1 ]; then
+    say "Android toolchain and prebuilts ready (build skipped)"
+    exit 0
+fi
+
 # local.properties is generated, never committed: sdk.dir is an absolute
 # path to a machine-specific cache.
 printf 'sdk.dir=%s\n' "$SDK" > android/local.properties
 
 say "building"
-( cd android && gradle --no-daemon ":app:assemble${1:-Debug}" )
+# Native compilation and the Gradle daemon run in the same memory budget.
+# Unbounded Gradle workers OOM-killed the daemon on a 2 GiB builder. Keep
+# these overridable for larger CI machines, but make the default reproducible
+# on modest phones/VMs as well.
+GRADLE_WORKERS="${FOLIO_GRADLE_WORKERS:-1}"
+GRADLE_JVMARGS="${FOLIO_GRADLE_JVMARGS:--Xmx384m -XX:MaxMetaspaceSize=256m}"
+( cd android && gradle --no-daemon --max-workers="$GRADLE_WORKERS" \
+    "-Dorg.gradle.jvmargs=$GRADLE_JVMARGS" ":app:assemble${1:-Debug}" \
+    ":app:lint${1:-Debug}" )
 
 APK=$(find android/app/build/outputs/apk -name "*.apk" | head -1)
 [ -n "$APK" ] || { echo "no APK produced" >&2; exit 1; }
@@ -117,7 +144,7 @@ fi
 echo
 echo "install:   $ANDROID_HOME/platform-tools/adb install -r $APK"
 echo "run:       $ANDROID_HOME/platform-tools/adb shell am start \\"
-echo "               -n ai.folio.reader/android.app.NativeActivity"
+echo "               -n ai.folio.reader/ai.folio.reader.FolioActivity"
 echo "logs:      $ANDROID_HOME/platform-tools/adb logcat -s folio"
 echo
 echo "This sandbox has no /dev/kvm, so no emulator could be started here:"

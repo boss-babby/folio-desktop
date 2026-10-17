@@ -1,6 +1,6 @@
 // folio-ui/include/folio/ui/Theme.h
 //
-// Light/dark theme state and the 760 ms cross-fade between them.
+// Light/dark theme state and the 700 ms cubic reveal between them.
 //
 // WHY INTERPOLATE THE PALETTE RATHER THAN CROSS-FADE TWO FRAMES
 // -------------------------------------------------------------
@@ -34,18 +34,9 @@ enum class PageTheme : std::uint8_t { Light, Sepia, Dark };
 
 class Theme {
 public:
-    /// Begin a transition. Calling with the current scheme is a no-op, so UI
-    /// code can call it unconditionally.
-    /// Begin a transition. `originX/Y` are window coordinates for the centre
-    /// of the circular reveal - normally the centre of the button that was
-    /// pressed, so the new theme visibly comes out from under the user's
-    /// cursor. Pass the default to reveal from the top-right corner.
-    ///
-    /// The transition is a *reveal*, not a cross-fade. The prototype wipes
-    /// the new theme in behind an expanding circle (the View Transitions
-    /// idiom), and a palette lerp cannot reproduce that: lerping takes every
-    /// colour through a muddy mid-grey simultaneously, which is what made
-    /// the old implementation look broken rather than deliberate.
+    /// Dark expands outward from the control; light appears as the old dark
+    /// circle contracts inward to it. Both use one 700 ms cubic timeline.
+    /// originX/Y are window coordinates (default top-right).
     void setScheme(ColorScheme s, double now, float originX = -1.f,
                    float originY = -1.f) {
         if (s == target_) return;
@@ -58,7 +49,7 @@ public:
         from_ = outgoing_;
         fade_.reset(0.f);
         fade_.animateTo(1.f, tokens::dur::themeTransition, now,
-                        Curve::OutCubic);
+                        Curve::Standard);
     }
 
     /// The palette the *outgoing* frame is painted in during a reveal.

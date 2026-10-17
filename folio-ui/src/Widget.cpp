@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
 
 namespace folio::ui {
 
@@ -89,6 +90,15 @@ void Widget::applyContentClip(IPaintTarget& t, const PaintCtx&) {
 
 void Widget::paintTree(IPaintTarget& t, const PaintCtx& ctx) {
     if (!visible || opacity <= 0.003f) return;
+    if (ctx.chromeOnly && isDocumentCanvas()) return;
+    // A clipped subtree cannot draw outside its frame. Skipping it entirely
+    // avoids traversing/laying out the document canvas on a toolbar hover.
+    if (!ctx.damage.empty() && clipsContent) {
+        const Point origin = toWindow({0.f, 0.f});
+        if (origin.x + frame.w <= ctx.damage.x || origin.x >= ctx.damage.right() ||
+            origin.y + frame.h <= ctx.damage.y || origin.y >= ctx.damage.bottom())
+            return;
+    }
 
     setClock(ctx.now);
 
@@ -164,13 +174,21 @@ PointerEvent EventRouter::localise(const PointerEvent& e, Widget& target) {
 void EventRouter::forget(const Widget* w) {
     if (hover_ == w) hover_ = nullptr;
     if (capture_ == w) capture_ = nullptr;
+    for (auto it = touches_.begin(); it != touches_.end();) {
+        if (it->second.target == w) it = touches_.erase(it);
+        else ++it;
+    }
     if (focus_ == w) focus_ = nullptr;
 }
 
 void EventRouter::setFocus(Widget* w) {
     if (focus_ == w) return;
     Widget* prev = focus_;
+    const bool beforeText = prev && prev->wantsTextInput();
     focus_ = w;
+    const bool afterText = focus_ && focus_->wantsTextInput();
+    if (beforeText != afterText && onTextFocusChange)
+        onTextFocusChange(afterText);
     // Flags first, then notify, so a handler that inspects `focused` on
     // either widget sees the settled state rather than a half-applied one.
     if (prev) prev->focused = false;
@@ -196,21 +214,83 @@ bool EventRouter::dispatchPointer(Widget& root, const PointerEvent& windowEvent)
     // to place a stroke, not easier.
     const float minTarget = e.isTouch() ? touchTarget : 0.f;
 
-    // The pointer leaving the window must clear hover everywhere, or a button
-    // stays lit after the user alt-tabs away.
+    // Android sends one ACTION_CANCEL for the whole gesture. Deliver a
+    // separate cancellation to every captured finger before discarding them;
+    // otherwise PageStage's gesture tracker keeps phantom contacts forever.
     if (e.phase == PointerPhase::Cancel) {
+        for (const auto& [id, hold] : touches_) {
+            if (!hold.target) continue;
+            PointerEvent cancel = e;
+            cancel.pointerId = id;
+            cancel.pointerType = PointerType::Touch;
+            hold.target->onPointer(localise(cancel, *hold.target));
+            hold.target->pressed = false;
+        }
+        touches_.clear();
         if (hover_) {
             PointerEvent leave = e;
             leave.phase = PointerPhase::Leave;
             hover_->hovered = false;
-            hover_->onPointer(leave);
+            hover_->onPointer(localise(leave, *hover_));
             hover_ = nullptr;
         }
         if (capture_) {
+            capture_->onPointer(localise(e, *capture_));
             capture_->pressed = false;
             capture_ = nullptr;
         }
         return true;
+    }
+
+    // Each finger needs its OWN capture. One global capture loses the page
+    // as soon as either finger of a pinch lifts, and steals touches landing
+    // on another control. A child card keeps a tap, but a vertical drag
+    // past slop transfers to its scrollable ancestor instead.
+    if (e.isTouch()) {
+        if (e.phase == PointerPhase::Down) {
+            Widget* target = root.hitTest(e.windowPos, minTarget);
+            if (!target) return false;
+            touches_[e.pointerId] = {target, e.windowPos, e.timestamp};
+            setFocus(target);
+            target->pressed = true;
+            PointerEvent enter = localise(e, *target);
+            enter.phase = PointerPhase::Enter;
+            target->onPointer(enter);
+            return target->onPointer(localise(e, *target));
+        }
+        const auto it = touches_.find(e.pointerId);
+        if (it == touches_.end()) return false;
+        TouchCapture& hold = it->second;
+        if (e.phase == PointerPhase::Move && hold.target &&
+            !hold.target->touchScrollable) {
+            const float dx = e.windowPos.x - hold.start.x;
+            const float dy = e.windowPos.y - hold.start.y;
+            if (std::fabs(dy) > 10.f && std::fabs(dy) > std::fabs(dx)) {
+                for (Widget* w = hold.target->parent(); w; w = w->parent()) {
+                    if (!w->touchScrollable) continue;
+                    PointerEvent cancel = localise(e, *hold.target);
+                    cancel.phase = PointerPhase::Cancel;
+                    hold.target->onPointer(cancel);
+                    hold.target->pressed = false;
+                    hold.target = w;
+                    w->pressed = true;
+                    PointerEvent down = e;
+                    down.phase = PointerPhase::Down;
+                    down.windowPos = hold.start;
+                    down.timestamp = hold.startTime;
+                    w->onPointer(localise(down, *w));
+                    break;
+                }
+            }
+        }
+        Widget* target = hold.target;
+        if (!target) { touches_.erase(it); return false; }
+        const bool consumed = target->onPointer(localise(e, *target));
+        if (e.phase == PointerPhase::Up) {
+            target->pressed = false;
+            touches_.erase(it);
+        }
+        return consumed;
     }
 
     // --- captured drag ----------------------------------------------------
@@ -258,7 +338,8 @@ bool EventRouter::dispatchPointer(Widget& root, const PointerEvent& windowEvent)
     }
 
     // --- hover transitions --------------------------------------------------
-    if (under != hover_) {
+    const bool hoverChanged = under != hover_;
+    if (hoverChanged) {
         if (hover_) {
             PointerEvent lv = localise(e, *hover_);
             lv.phase = PointerPhase::Leave;
@@ -274,7 +355,7 @@ bool EventRouter::dispatchPointer(Widget& root, const PointerEvent& windowEvent)
         }
     }
 
-    if (!under) return false;
+    if (!under) return hoverChanged;
 
     PointerEvent le = localise(e, *under);
     if (e.phase == PointerPhase::Down) {
@@ -295,7 +376,7 @@ bool EventRouter::dispatchPointer(Widget& root, const PointerEvent& windowEvent)
         return false;
     }
 
-    return under->onPointer(le);
+    return under->onPointer(le) || hoverChanged;
 }
 
 bool EventRouter::dispatchKey(Widget& root, const KeyEvent& e) {

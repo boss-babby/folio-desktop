@@ -6,6 +6,11 @@
 
 namespace folio::engine {
 
+std::recursive_mutex& pdfiumApiMutex() {
+    static std::recursive_mutex mutex;
+    return mutex;
+}
+
 PdfiumLibrary& PdfiumLibrary::instance() {
     static PdfiumLibrary lib;
     return lib;

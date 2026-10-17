@@ -20,6 +20,9 @@ If SmartScreen blocks it
 Known limitations in this build
     - The Win32 window backend is new. If the window misbehaves, run with
       --software to bypass the GPU path.
-    - PoDoFo is off in the CI build (-DFOLIO_WITH_PODOFO=OFF), so saving
-      annotations back into a PDF is unavailable. Reading, rendering,
-      searching, selecting and annotating in-session all work.
+    - PoDoFo is off in the supported Windows build (-DFOLIO_WITH_PODOFO=OFF).
+      Save makes a separate annotated PDF via PDFium (highlights,
+      underlines, strikeouts, ink, notes, boxes and ellipses).
+      Free text, stamps and signatures are refused rather than dropped.
+      Save As does not rewrite the original; page-tree edits still need
+      PoDoFo. Edits not saved to a PDF remain session-only.

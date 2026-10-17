@@ -30,6 +30,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -64,6 +65,9 @@ struct PaintCtx {
     double now = 0.0;
     /// Device pixel ratio. Hairlines are drawn at 1/dpr so they stay crisp.
     float dpr = 1.f;
+    /// Non-empty only when painting a retained scene's damaged chrome.
+    Rect damage{};
+    bool chromeOnly = false;
 };
 
 class Widget {
@@ -141,6 +145,9 @@ public:
     /// If false the widget is transparent to the pointer; children are still
     /// tested. Containers and decorative layers set this.
     bool acceptsPointer = false;
+    /// A vertical touch drag may transfer capture from a child (such as a
+    /// document card) to this scroll container after the drag passes slop.
+    bool touchScrollable = false;
     /// Clip everything this widget draws - its own onPaint and
     /// onPaintOverlay as well as its children - to `localBounds()`.
     ///
@@ -161,6 +168,8 @@ public:
     /// between "showing a value" and "editing a value" without polling
     /// `focused` from inside onPaint.
     virtual void onFocusChanged(bool /*gained*/) {}
+    /// The host may need to show an on-screen keyboard for this control.
+    [[nodiscard]] virtual bool wantsTextInput() const { return false; }
 
     /// Area this widget can actually repaint, in its own coordinates.
     /// Defaults to the whole frame. Full-window containers that only ever
@@ -206,6 +215,8 @@ public:
     virtual void onPaint(IPaintTarget&, const PaintCtx&) {}
     /// Paint after children, for overlays like focus rings and scrim edges.
     virtual void onPaintOverlay(IPaintTarget&, const PaintCtx&) {}
+    /// Cached PDF pixels survive chrome-only frames in the backing surface.
+    [[nodiscard]] virtual bool isDocumentCanvas() const noexcept { return false; }
     /// Return true to consume. Position is in local coordinates.
     virtual bool onPointer(const PointerEvent&) { return false; }
     virtual bool onKey(const KeyEvent&) { return false; }
@@ -271,6 +282,7 @@ public:
     /// all converge on; it is a field rather than a constant so a test
     /// can turn the behaviour off and assert the exact geometry.
     float touchTarget = 44.f;
+    std::function<void(bool)> onTextFocusChange;
 
     /// Returns true if any widget consumed the event.
     bool dispatchPointer(Widget& root, const PointerEvent& windowEvent);
@@ -287,8 +299,14 @@ public:
 private:
     static PointerEvent localise(const PointerEvent& e, Widget& target);
 
+    struct TouchCapture {
+        Widget* target = nullptr;
+        Point start{};
+        double startTime = 0.0;
+    };
     Widget* hover_ = nullptr;
-    Widget* capture_ = nullptr;
+    Widget* capture_ = nullptr; // mouse / pen
+    std::unordered_map<PointerId, TouchCapture> touches_;
     Widget* focus_ = nullptr;
 };
 

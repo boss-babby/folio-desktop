@@ -58,6 +58,14 @@ public:
     /// by the time this returns.
     virtual void requestOpen(std::function<void(std::string)> done) = 0;
 
+    /// Native Save As when available. Defaults to cancellation for existing
+    /// non-native pickers; callers fall back to the in-app dialog instead.
+    virtual void requestSave(const std::string& suggestedName,
+                             std::function<void(std::string)> done) {
+        (void)suggestedName;
+        if (done) done({});
+    }
+
     /// Entries to show when falling back to the in-app dialog.
     [[nodiscard]] virtual std::vector<FileEntry> browse(const std::string& dir) = 0;
 
@@ -119,6 +127,11 @@ private:
     int selected_ = -1;
     int hover_ = -1;
     float scroll_ = 0.f;
+    PointerId touchId_ = 0;
+    float touchStartY_ = 0.f;
+    float touchLastY_ = 0.f;
+    bool touchHeld_ = false;
+    bool touchDragged_ = false;
     double now_ = 0.0;
 
     Button* cancelBtn_ = nullptr;

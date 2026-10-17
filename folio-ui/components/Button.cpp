@@ -47,7 +47,7 @@ float Button::measureWidth(IPaintTarget& t) const {
 bool Button::onPointer(const PointerEvent& e) {
     switch (e.phase) {
         case PointerPhase::Enter:
-            if (!tooltip.empty()) {
+            if (!e.isTouch() && !tooltip.empty()) {
                 OverlayHost::current().requestTooltip(this, tooltip, e.timestamp);
             }
             return true;

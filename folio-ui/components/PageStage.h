@@ -55,17 +55,32 @@ public:
     /// without re-deriving it from the rectangle.
     virtual void drawPage(IPaintTarget& t, int index, const Rect& dest, float scale,
                           PageTheme theme) = 0;
+    /// Canvas-only path: `visible` is the page-local intersection of dest
+    /// with the actual stage viewport (logical coordinates). Thumbnails still
+    /// use drawPage; other sources preserve their old drawing contract.
+    virtual void drawVisiblePage(IPaintTarget& t, int index, const Rect& dest,
+                                 const Rect& visible, float scale, PageTheme theme) {
+        if (!visible.empty()) drawPage(t, index, dest, scale, theme);
+    }
+    /// Paint ONLY resident pixels inside `visible` (page/stage-local coords).
+    /// A selection loupe must never request PDF work or alter the visible
+    /// viewport's wanted set. Return false if no pixels are resident.
+    virtual bool drawCachedRegion(IPaintTarget&, int, const Rect&, const Rect&,
+                                  float, PageTheme) { return false; }
+    /// Publish the new viewport's wanted set after all pages have drawn.
+    virtual void endVisibleFrame() {}
     /// Human-readable, for the status bar.
     [[nodiscard]] virtual std::string describe() const { return "document"; }
 
     /// Asynchronous sources override these two. `tick` is called once per
     /// frame before any drawing and installs whatever finished off-thread;
-    /// it returns true when the visible result changed. `pending` keeps the
-    /// frame loop running while work is outstanding, so a raster that lands
-    /// during an idle period is actually shown rather than waiting for the
-    /// next unrelated event.
+    /// it returns true when the visible result changed. `pending` should
+    /// report completed results awaiting installation, not CPU-only work in
+    /// flight: the shell polls completions without redrawing the GPU surface.
     virtual bool tick() { return false; }
     [[nodiscard]] virtual bool pending() const { return false; }
+    /// Changes when async page-size data replaces provisional dimensions.
+    [[nodiscard]] virtual unsigned geometryRevision() const { return 0; }
 
     /// True when drawPage() is already a blit of a bitmap the source keeps
     /// cached itself. The stage then draws straight to the canvas instead of
@@ -77,6 +92,10 @@ public:
     /// Hint that the user is looking at `page`; async sources render
     /// outwards from there.
     virtual void setFocusPage(int /*page*/) {}
+    /// The open Pages panel's visible range, inclusive. -1/-1 when hidden.
+    /// Canvas focus and sidebar focus are independent: a user may scroll
+    /// thumbnails to page 90 while reading page 2.
+    virtual void setVisibleThumbnailRange(int /*first*/, int /*last*/) {}
 
     /// The page's laid-out glyphs, 0..1 page-normalised with a top-left
     /// origin - the same space annotations use, so a selection rectangle
@@ -115,6 +134,10 @@ enum class ZoomMode : std::uint8_t { Free, FitWidth, FitPage };
 class PageStage : public Widget {
 public:
     PageStage();
+    [[nodiscard]] bool isDocumentCanvas() const noexcept override { return true; }
+    /// A held/open thumb palette changes only a bounded area of a static PDF.
+    [[nodiscard]] bool thumbOverlayOnly(double now) const noexcept;
+    [[nodiscard]] Rect damageBounds() const override;
 
     void setSource(std::shared_ptr<IPageSource> src, double now);
     [[nodiscard]] IPageSource* source() const noexcept { return source_.get(); }
@@ -125,6 +148,34 @@ public:
 
     void setZoom(float z, double now);
     void setZoomMode(ZoomMode m, double now);
+    /// Dismiss a pinned thumb palette even when the outside press hits chrome
+    /// or a side panel instead of this stage. A press inside its cards stays.
+    void dismissThumbIfOutside(Point windowPoint, double now);
+    /// New documents should paint their first page at the final fit scale,
+    /// not animate through the previous tab's zoom for 400 ms.
+    void snapZoomToTarget(double now);
+    struct ViewState {
+        LayoutMode layout = LayoutMode::Continuous;
+        ZoomMode zoomMode = ZoomMode::FitWidth;
+        float zoom = 1.f;
+        float scrollX = 0.f, scrollY = 0.f;
+        float viewportW = 0.f;
+        float gridSize = tokens::size::gridThumbDefault;
+        int rotation = 0;
+        int page = 1;
+    };
+    [[nodiscard]] ViewState captureViewState(double now) const;
+    void restoreViewState(const ViewState& state, double now);
+    /// Focus chrome and both page scrollbars have the same visibility gate.
+    /// Hiding also disables their otherwise-invisible touch targets.
+    void setFocusScrollbarsVisible(bool shown) noexcept {
+        focusBarsVisible_ = shown;
+        if (!shown) {
+            barDrag_ = barHover_ = Bar::None;
+            barTouchHeld_ = barTrackPress_ = false;
+        }
+    }
+    [[nodiscard]] bool focusScrollbarsVisible() const noexcept { return focusBarsVisible_; }
     [[nodiscard]] float zoom() const noexcept { return zoomTarget_; }
     [[nodiscard]] ZoomMode zoomMode() const noexcept { return zoomMode_; }
 
@@ -133,11 +184,13 @@ public:
     [[nodiscard]] int rotationQuarterTurns() const noexcept { return rotation_; }
 
     void setPageTheme(PageTheme t) noexcept { pageTheme_ = t; }
+    [[nodiscard]] PageTheme pageTheme() const noexcept { return pageTheme_; }
 
     /// 1-based, as shown in the UI.
     /// Horizontal pan, in content pixels. Only meaningful once the zoomed
     /// page is wider than the viewport.
     [[nodiscard]] float scrollX() const noexcept { return scrollX_; }
+    [[nodiscard]] float scrollY() const noexcept { return scrollY_; }
     [[nodiscard]] float contentWidth() const noexcept { return contentW_; }
 
     [[nodiscard]] int currentPage() const noexcept { return current_ + 1; }
@@ -172,7 +225,8 @@ public:
     /// What a pointer drag on a page does. Select/Hand pan and select; the
     /// rest author annotations.
     enum class EditTool : std::uint8_t {
-        None, Highlight, Ink, Note, Eraser, Box, Ellipse, Text, Stamp, Signature
+        None, Highlight, Ink, Note, Eraser, Box, Ellipse, Line, Arrow,
+        Text, Stamp, Signature
     };
 
     void setStore(AnnotationStore* s) noexcept { store_ = s; }
@@ -188,6 +242,7 @@ public:
     /// rather than to the document's shortcuts. 0 when nothing is being
     /// edited.
     [[nodiscard]] std::uint64_t editingText() const noexcept { return editText_; }
+    std::function<void(bool)> onTextInputRequested;
     /// Feed one key to the text being edited. Returns false when the key is
     /// not ours, so the caller can fall through to its own handling.
     bool handleTextKey(const KeyEvent& e);
@@ -206,11 +261,13 @@ public:
     /// Delete the selected annotation. The caller supplies the undo record,
     /// so the stage stays ignorant of the command stack.
     std::function<void(const Annotation&)> onAnnotationDeleted;
+    std::function<void(std::vector<Annotation>)> onAnnotationGroupDeleted;
     /// Fired once a drag finishes, with the geometry before and after, so
     /// the move lands on the undo stack as one entry rather than per frame.
     std::function<void(const Annotation&, const Annotation&)> onAnnotationMoved;
     /// Fired when the selection changes, so the panel can follow it.
-    std::function<void(std::uint64_t)> onAnnotSelectionChanged;
+    std::function<void(std::uint64_t, bool /*touch*/)> onAnnotSelectionChanged;
+    std::function<std::uint64_t(int, Point)> onImportedAnnotHit;
     /// Delete whatever is selected, if anything. Returns true if it went.
     bool deleteSelectedAnnot();
     // --- text selection -----------------------------------------------------
@@ -230,7 +287,11 @@ public:
     [[nodiscard]] bool hasSelection() const noexcept {
         return selA_.valid() && selB_.valid() && !(selA_ == selB_);
     }
-    void clearSelection() noexcept { selA_ = selB_ = TextPos{}; }
+    void clearSelection() noexcept {
+        selA_ = selB_ = TextPos{};
+        activeSelectionHandle_ = SelectionHandle::None;
+        magnifierActive_ = false;
+    }
     /// The selected text as UTF-8, empty when there is no selection.
     [[nodiscard]] std::string selectedText();
     /// Per-line boxes of the live selection as (page, normalised rect) - the
@@ -241,6 +302,15 @@ public:
     /// The argument is the pointer position in window coordinates, so the
     /// caller can put a popup exactly where the user let go.
     std::function<void(Point)> onSelectionCommitted;
+    /// A plain one-finger tap on paper (not a long press, annotation drag,
+    /// drawing gesture or double-tap). The reader can reveal/hide immersive
+    /// controls without hijacking page panning or text selection.
+    std::function<void()> onCanvasTap;
+    /// Blank-page thumb hold: tool 0=pan,1=highlight,2=pen,3=eraser;
+    /// option -1=tool only, 0=colour,1=width,2=opacity,3=pen shape.
+    /// The screen owns tool/style persistence; the stage owns gesture geometry.
+    std::function<void(int tool, int option, int value)> onThumbChoice;
+    std::function<Color(int)> thumbInk;
     /// Fired when the selection is cleared, so the caller can dismiss it.
     std::function<void()> onSelectionCleared;
     /// Double-click on a page in Grid ("All together") layout. The screen
@@ -258,7 +328,18 @@ public:
     }
     void clearSearchHits() { searchHits_.clear(); searchCurrent_ = -1; }
 
-    void setEditTool(EditTool t) noexcept { editTool_ = t; }
+    void setEditTool(EditTool t) noexcept {
+        editTool_ = t;
+        if (t != EditTool::None) magnifierActive_ = false;
+        if (t != EditTool::Highlight) highlightMagnifierActive_ = false;
+    }
+    void setSelectionMagnifierEnabled(bool value) noexcept {
+        magnifierEnabled_ = value;
+        if (!value) magnifierActive_ = highlightMagnifierActive_ = false;
+    }
+    [[nodiscard]] bool selectionMagnifierEnabled() const noexcept {
+        return magnifierEnabled_;
+    }
     [[nodiscard]] EditTool editTool() const noexcept { return editTool_; }
     void setAnnotStyle(Color c, float width, float opacity) noexcept {
         annotColor_ = c;
@@ -276,6 +357,14 @@ public:
     [[nodiscard]] bool hitPage(Point local, int* pageOut, Point* normOut) const;
 
 private:
+    /// A rotated page occupies the target rectangle, but the PDF raster and
+    /// Folio glyph/annotation coordinates always use its unrotated rectangle.
+    [[nodiscard]] Rect sourceRect(const Rect& target) const noexcept;
+    [[nodiscard]] Point toViewNorm(Point source) const noexcept;
+    [[nodiscard]] Point toSourceNorm(Point view) const noexcept;
+    [[nodiscard]] Rect toViewRect(const Rect& sourceBox, const Rect& target) const noexcept;
+
+private:
     bool handleAuthoring(const PointerEvent& e);
 
 public:
@@ -288,7 +377,13 @@ public:
     void updateCurrentFromScroll();
 
     std::shared_ptr<IPageSource> source_;
+    unsigned lastGeometryRevision_ = 0;
     std::vector<Placed> placed_;
+    bool pendingAnnotClear_ = false;
+    bool pendingTextClear_ = false;
+    Point blankDown_{};
+    [[nodiscard]] bool selectionContains(Point local) const;
+    [[nodiscard]] int hitAnnotGrip(Point local, bool touch) const;
     float contentW_ = 0.f;
     float scrollX_ = 0.f;
 
@@ -299,6 +394,11 @@ public:
     Bar   barDrag_ = Bar::None;
     float barGrabOffset_ = 0.f;
     Bar   barHover_ = Bar::None;
+    bool  barTouchHeld_ = false;
+    PointerId barTouchId_ = 0;
+    bool barTrackPress_ = false; // track is inert until the actual thumb is grabbed
+    PointerId barTrackId_ = 0;
+    bool focusBarsVisible_ = true;
     [[nodiscard]] bool canScrollX() const noexcept { return contentW_ > frame.w + 1.f; }
     [[nodiscard]] bool canScrollY() const noexcept { return contentH_ > frame.h + 1.f; }
     [[nodiscard]] Rect vBarTrack() const;
@@ -323,6 +423,8 @@ public:
     float scrollY_ = 0.f;
     float contentH_ = 0.f;
     float velocity_ = 0.f;
+    float overscrollY_ = 0.f;
+    float overscrollVelocity_ = 0.f;
     double lastFrame_ = 0.0;
     AnimatedF smoothScroll_{0.f};
     bool smoothing_ = false;
@@ -360,6 +462,12 @@ public:
     bool handleTouch(const PointerEvent& e);
     GestureTracker touch_;
     bool touchPanning_ = false;
+    enum class TouchAxis : std::uint8_t { Undecided, Vertical, Horizontal };
+    TouchAxis touchAxis_ = TouchAxis::Undecided;
+    bool touchDrawing_ = false; // an armed tool owns this finger until release
+    std::uint64_t touchAnnotId_ = 0; // existing mark owns one finger, not page pan
+    PointerId touchAnnotPointer_ = 0;
+    bool pinchWasActive_ = false; // prevent pinch release becoming a tap/fling
     float pinchZoom_ = 1.f;
     /// Mean nib pressure over the stroke in flight, so a pen can commit a
     /// heavier line than a light pass. Per-point pressure profiles would
@@ -378,13 +486,79 @@ public:
     // `selB_` the head; either may be the earlier one in document order.
     TextPos  selA_, selB_;
     bool     selecting_ = false;
+    // The visible dots are small; their hit radii are 44dp on a phone. A
+    // captured handle is never mistaken for a one-finger page-pan gesture.
+    enum class SelectionHandle : std::uint8_t { None, Start, End };
+    SelectionHandle activeSelectionHandle_ = SelectionHandle::None;
+    PointerId selectionPointer_ = 0;
+    TextPos selectionBeforeA_, selectionBeforeB_;
+    [[nodiscard]] bool selectionHandlePoint(bool start, Point& out) const;
+    [[nodiscard]] SelectionHandle hitSelectionHandle(Point local,
+                                                      float radius) const;
+    void paintSelectionHandles(IPaintTarget& t, const PaintCtx& ctx) const;
+    // Same paint geometry/blend for the viewport and the enlarged loupe.
+    void paintSelectionBands(IPaintTarget& t, const Rect& page,
+                             const std::vector<Rect>& lines) const;
+    void paintSelectionMagnifier(IPaintTarget& t, const PaintCtx& ctx,
+                                 float deviceScale, int page,
+                                 const std::vector<Rect>& lines) const;
+    bool magnifierEnabled_ = false;
+    bool magnifierActive_ = false;
+    PointerId magnifierPointer_ = 0;
+    Point magnifierFinger_{}; // local, never participates in hit testing
+    bool highlightMagnifierActive_ = false; // Annotate free-form highlighter only
+    PointerId highlightPointer_ = 0;
+    Point highlightCursor_{}; // page-normalised active marker position
+    // A finger can reposition the untouched highlighter vertically. Once it
+    // crosses horizontal touch slop, freeze Y and draw only along that row.
+    bool highlightTouchControlled_ = false;
+    bool highlightStrokeLocked_ = false;
+    // One-thumb radial palette; all positions are stage-local dp. An armed
+    // drawing tool defers Down until a real drag, except Highlight, whose
+    // existing touch-down preview remains immediate and uncommitted.
+    enum class ThumbLayer : std::uint8_t { Closed, Tools, Options, Values, Zoom };
+    ThumbLayer thumbLayer_ = ThumbLayer::Closed;
+    bool thumbCandidate_ = false;
+    bool thumbDeferred_ = false;
+    bool thumbReplay_ = false;
+    bool thumbAwaitingTap_ = false; // pinned palette survives a finger lift
+    bool thumbGestureFromPinned_ = false; // fresh tap, not uninterrupted hold
+    bool thumbToolApplied_ = false; // do not reselect tool on a second tap
+    bool thumbOnText_ = false;
+    bool thumbTextSelecting_ = false;
+    int thumbTextPage_ = -1;
+    int thumbTextGlyph_ = -1;
+    PointerEvent thumbDown_{};
+    float thumbMenuY_ = 0.f;
+    Point thumbLast_{};
+    float thumbMenuX_ = 0.f;
+    float thumbZoomStart_ = 1.f;
+    int thumbTool_ = -1;
+    int thumbOption_ = -1;
+    int thumbHover_ = -1;
+    AnimatedF thumbGrow_{0.f};
+    // Each glyph flies from the held point to its hit target. On release the
+    // tool arc returns there; after a final choice the remaining tiers do too.
+    AnimatedF thumbReveal_{0.f};
+    AnimatedF thumbOptionsReveal_{0.f};
+    AnimatedF thumbValuesReveal_{0.f};
+    AnimatedF thumbToolsExit_{1.f};
+    AnimatedF thumbExit_{1.f};
+    bool thumbClosing_ = false; // visual exit only; a new Down never waits
+    void closeThumb(double now);
+    [[nodiscard]] bool thumbOptionAvailable(int option) const noexcept;
+    bool handleThumb(const PointerEvent& e);
+    void beginThumb(double now, bool pinned = false);
+    void paintThumb(IPaintTarget& t, const PaintCtx& ctx);
+    [[nodiscard]] Rect thumbItem(int i, ThumbLayer layer) const;
+    Point highlightTouchDown_{}; // local device-independent coordinates
     std::vector<TextRun> searchHits_;
     int      searchCurrent_ = -1;
 
     /// Nearest glyph to a normalised point on `page`, or -1. Prefers a
     /// direct hit, then the closest glyph on the nearest text line, which is
     /// what makes dragging past the end of a line behave.
-    [[nodiscard]] int glyphAt(int page, Point n);
+    [[nodiscard]] int glyphAt(int page, Point n, bool nearbyOnly = false);
     /// Expand a glyph index to the whitespace-delimited word around it,
     /// writing the half-open range into selA_/selB_. A long press has no
     /// drag behind it, so selecting one character would be useless - every
@@ -417,6 +591,8 @@ public:
     float         textSize_ = 16.f / 792.f;
     folio::render::FontFamily textFont_ = folio::render::FontFamily::Sans;
     bool movingAnnot_ = false;
+    int resizeCorner_ = -1;  ///< 0..3 for free-form marks, -1 for move
+    bool annotChanged_ = false;
     Point moveLast_{0.f, 0.f};
     Annotation moveBefore_{};          // geometry when the drag started
     void paintAnnotSelection(IPaintTarget& t, const PaintCtx& ctx);

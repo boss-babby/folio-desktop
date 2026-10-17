@@ -11,6 +11,10 @@
 // files and Skia's font manager needs files.
 
 #include "NativeShell.h"
+#include "pdfium/PdfiumLibrary.h"
+#include "pdfium/FileMappedAccess.h"
+#include <fpdfview.h>
+#include <mutex>
 #include "folio/platform/Platform.h"
 
 #include <android/asset_manager.h>
@@ -112,6 +116,8 @@ extern "C" void android_main(android_app* app) {
 
     folio::ui::NativeShellOptions opts;
     opts.assetDir = unpackAssets(app);
+    if (app->activity->internalDataPath)
+        opts.stateDir = app->activity->internalDataPath;
     // Size and software-rendering flags are meaningless here: the activity
     // dictates the surface, and a phone without working GLES is not a
     // configuration worth a fallback path.
@@ -122,4 +128,17 @@ extern "C" void android_main(android_app* app) {
     // Returning from android_main ends the activity's thread. The glue
     // expects the process to go away, so do not try to keep it alive.
     ANativeActivity_finish(app->activity);
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_ai_folio_reader_FolioActivity_nativeValidatePdfFd(JNIEnv*, jclass, jint fd) {
+    folio::engine::FileMappedAccess input(static_cast<int>(fd)); // owns fd
+    if (!input.valid()) return JNI_FALSE;
+    folio::engine::ensurePdfiumInitialised();
+    std::lock_guard<std::recursive_mutex> lock(folio::engine::pdfiumApiMutex());
+    FPDF_DOCUMENT doc = FPDF_LoadCustomDocument(input.handle(), nullptr);
+    if (!doc) return JNI_FALSE;
+    const bool valid = FPDF_GetPageCount(doc) > 0;
+    FPDF_CloseDocument(doc);
+    return valid ? JNI_TRUE : JNI_FALSE;
 }

@@ -167,64 +167,31 @@ jobs:
         run: python3 -c "import json; json.load(open('design-tokens.json')); print('ok')"
 
   # --------------------------------------------------------------------------
-  # Windows desktop build.
-  #
-  # This job is the Windows build machine. MSVC cannot run on Linux, so
-  # rather than cross-compiling, the runner - which has Visual Studio 2022
-  # and the Windows SDK preinstalled - compiles the real thing and uploads
-  # the .exe as an artifact. Anyone can download it without owning a
-  # Windows toolchain, and the Win32 backend cannot silently rot: a break
-  # fails this job on the commit that caused it.
+  # Use the SAME fail-closed native Windows build as release-windows.yml:
+  # pinned PDFium/Skia, real Win32 GUI, full CTest inventory, verified ZIP.
+  # Never publish a different, unverified Windows directory as an artifact.
+  # Copying only the release workflow is sufficient for Windows CI; this
+  # job is for teams that also activate the broader cross-platform CI file.
   # --------------------------------------------------------------------------
   windows:
-    name: windows-msvc (desktop exe)
+    name: windows-msvc (verified portable ZIP)
     runs-on: windows-2022
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
-
-      - name: Fetch prebuilt Skia and PDFium
-        shell: pwsh
-        run: powershell -ExecutionPolicy Bypass -File tools/bootstrap-deps.ps1
-
-      - name: Configure
+        with:
+          persist-credentials: false
+      - name: Build, test and package in runner TEMP
         shell: pwsh
         run: |
-          cmake -B build -G "Visual Studio 17 2022" -A x64 `
-                -DCMAKE_BUILD_TYPE=Release `
-                -DFOLIO_BUILD_UI=ON `
-                -DFOLIO_WITH_PODOFO=OFF `
-                -DFOLIO_DEPS_DIR="$env:LOCALAPPDATA\folio-deps"
-
-      - name: Build
-        run: cmake --build build --config Release --parallel
-
-      - name: Test
-        run: ctest --test-dir build -C Release --output-on-failure
-
-      - name: Confirm the Win32 backend was selected
-        shell: pwsh
-        run: |
-          $log = Get-Content build/CMakeCache.txt
-          if (-not (Select-String -Path build/CMakeCache.txt -Pattern 'FOLIO_PLATFORM_BACKEND:INTERNAL=win32')) {
-            throw "platform backend is not win32 - the build fell back to 'none'"
-          }
-
-      - name: Stage the artifact
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item build/folio-ui/Release/folio-desktop.exe dist/Folio.exe
-          # PDFium ships as a DLL, so it travels with the exe. See the note
-          # in STATUS.md about what a genuinely single-file build needs.
-          Copy-Item "$env:LOCALAPPDATA\folio-deps\pdfium\bin\pdfium.dll" dist/
-          # Fonts are found beside the executable at run time. Without this
-          # the artifact starts on a machine that has no source tree and
-          # renders no text at all.
-          Copy-Item assets dist/assets -Recurse
-          Copy-Item documents dist/documents -Recurse
-          Copy-Item docs/RUNNING-WINDOWS.txt dist/README.txt
-
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass `
+            -File tools/build-windows-clean.ps1 `
+            -Compiler MSVC `
+            -OutputPath (Join-Path $env:GITHUB_WORKSPACE 'Folio-windows-x64.zip')
+          if ($LASTEXITCODE -ne 0) { throw 'Windows build, tests or package verification failed' }
       - uses: actions/upload-artifact@v4
         with:
           name: Folio-windows-x64
-          path: dist/
+          path: Folio-windows-x64.zip
+          if-no-files-found: error
+          retention-days: 30

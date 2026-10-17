@@ -9,7 +9,7 @@ namespace folio::ui {
 namespace {
 
 constexpr float kTabClose = 18.f;
-constexpr float kFlingFriction = 6.0f;   // e-folds per second
+constexpr float kFlingFriction = 4.6f;   // momentum decay; still controllable by touch
 constexpr float kFlingCutoff = 8.f;      // px/s below which we stop
 
 }  // namespace
@@ -87,6 +87,7 @@ void CardView::onPaint(IPaintTarget& t, const PaintCtx& ctx) {
 ScrollView::ScrollView() {
     clipsContent = true;
     acceptsPointer = true;
+    touchScrollable = true;
     debugName = "ScrollView";
 }
 
@@ -121,6 +122,49 @@ void ScrollView::revealRange(float top, float height, double now, int durationMs
 }
 
 bool ScrollView::onPointer(const PointerEvent& e) {
+    if (barTrackPress_ && e.pointerId == barId_) {
+        if (e.phase == PointerPhase::Up || e.phase == PointerPhase::Cancel)
+            barTrackPress_ = false;
+        return true; // rail taps never jump or start content gestures
+    }
+    if (barHeld_ && e.pointerId == barId_) {
+        if (e.phase == PointerPhase::Up || e.phase == PointerPhase::Cancel) {
+            barHeld_ = false;
+            barAlpha_.animateTo(0.f, tokens::dur::hover, e.timestamp);
+            return true;
+        }
+        if (e.phase == PointerPhase::Move) {
+            const float trackH = std::max(1.f, frame.h - 8.f);
+            const float thumbH = std::min(trackH, std::max(32.f,
+                trackH * (frame.h / std::max(1.f, contentHeight))));
+            const float span = trackH - thumbH;
+            if (span > 0.f)
+                setScrollY(std::clamp((e.pos.y - 4.f - barGrabOffset_) / span,
+                                      0.f, 1.f) * maxScroll());
+            return true;
+        }
+        return true;
+    }
+    if (barHeld_ && e.isTouch()) return true;
+    if (e.phase == PointerPhase::Down && showScrollbar && maxScroll() > 0.f &&
+        e.pos.x >= frame.w - (e.isTouch() ? 28.f : 12.f) &&
+        e.pos.x < frame.w && e.pos.y >= 0.f && e.pos.y < frame.h) {
+        const float trackH = std::max(1.f, frame.h - 8.f);
+        const float thumbH = std::min(trackH, std::max(32.f,
+            trackH * (frame.h / std::max(1.f, contentHeight))));
+        const float thumbY = 4.f + (trackH - thumbH) * scrollY_ / maxScroll();
+        barId_ = e.pointerId;
+        if (e.pos.y < thumbY || e.pos.y >= thumbY + thumbH) {
+            barTrackPress_ = true;
+            return true; // clicking the empty rail is deliberately inert
+        }
+        barGrabOffset_ = e.pos.y - thumbY;
+        barHeld_ = true;
+        velocity_ = 0.f;
+        smoothActive_ = false;
+        barAlpha_.reset(1.f);
+        return true;
+    }
     if (e.phase == PointerPhase::Wheel) {
         if (maxScroll() <= 0.f) return false;
         smoothActive_ = false;
@@ -130,11 +174,67 @@ bool ScrollView::onPointer(const PointerEvent& e) {
         barAlpha_.animateTo(1.f, tokens::dur::hoverFast, e.timestamp);
         return true;
     }
+    if (!e.isTouch()) return false;
+    if (e.phase == PointerPhase::Down) {
+        if (touchHeld_) return true;
+        touchHeld_ = true;
+        touchMoved_ = false;
+        touchId_ = e.pointerId;
+        touchStartY_ = touchLastY_ = e.pos.y;
+        touchLastTime_ = e.timestamp;
+        smoothActive_ = false;
+        velocity_ = overscrollVelocity_ = 0.f;
+        return false; // a stationary tap still belongs to the list row
+    }
+    if (e.phase == PointerPhase::Cancel) {
+        touchHeld_ = false;
+        touchMoved_ = false;
+        velocity_ = 0.f;
+        return true;
+    }
+    if (!touchHeld_ || e.pointerId != touchId_) return false;
+    if (e.phase == PointerPhase::Move) {
+        const float dy = e.pos.y - touchLastY_;
+        if (!touchMoved_ && std::fabs(e.pos.y - touchStartY_) > 10.f)
+            touchMoved_ = true;
+        if (touchMoved_) {
+            const float before = scrollY_;
+            const float wanted = scrollY_ - dy;
+            const float bound = std::clamp(wanted, 0.f, maxScroll());
+            // Resistance beyond either edge, capped so the panel cannot be
+            // dragged away indefinitely. The release spring settles it.
+            scrollY_ = bound + std::clamp((wanted - bound) * 0.42f,
+                                           -60.f, 60.f);
+            const double dt = e.timestamp - touchLastTime_;
+            if (dt >= 0.002 && scrollY_ != before) {
+                const float speed = std::clamp(-dy / static_cast<float>(dt),
+                                               -2200.f, 2200.f);
+                velocity_ = velocity_ * 0.65f + speed * 0.35f;
+            }
+            barAlpha_.animateTo(1.f, tokens::dur::hoverFast, e.timestamp);
+        }
+        touchLastY_ = e.pos.y;
+        touchLastTime_ = e.timestamp;
+        return touchMoved_;
+    }
+    if (e.phase == PointerPhase::Up) {
+        const bool dragged = touchMoved_;
+        touchHeld_ = touchMoved_ = false;
+        if (!dragged || e.timestamp - touchLastTime_ > 0.08 ||
+            std::fabs(velocity_) < 120.f) velocity_ = 0.f;
+        if (scrollY_ < 0.f || scrollY_ > maxScroll()) {
+            overscrollVelocity_ = std::clamp(velocity_ * 0.15f, -320.f, 320.f);
+            velocity_ = 0.f;
+        }
+        return dragged; // a tap may select a thumbnail/outline row
+    }
     return false;
 }
 
 bool ScrollView::animating(double now) const {
-    return smoothActive_ || std::fabs(velocity_) > kFlingCutoff || barAlpha_.active(now);
+    return smoothActive_ || std::fabs(velocity_) > kFlingCutoff ||
+           scrollY_ < -0.1f || scrollY_ > maxScroll() + 0.1f ||
+           std::fabs(overscrollVelocity_) > 1.f || barAlpha_.active(now);
 }
 
 void ScrollView::onPaint(IPaintTarget& t, const PaintCtx& ctx) {
@@ -148,9 +248,29 @@ void ScrollView::onPaint(IPaintTarget& t, const PaintCtx& ctx) {
         self->scrollY_ = smooth_.value(ctx.now);
         if (!smooth_.active(ctx.now)) self->smoothActive_ = false;
     } else if (std::fabs(velocity_) > kFlingCutoff && dt > 0.0) {
-        self->scrollBy(static_cast<float>(velocity_ * dt));
-        self->velocity_ *= std::exp(-kFlingFriction * static_cast<float>(dt));
-        if (scrollY_ <= 0.f || scrollY_ >= maxScroll()) self->velocity_ = 0.f;
+        const float wanted = scrollY_ + static_cast<float>(velocity_ * dt);
+        const float bound = std::clamp(wanted, 0.f, maxScroll());
+        if (std::fabs(wanted - bound) > 0.01f) {
+            self->scrollY_ = bound + std::clamp((wanted - bound) * 0.30f,
+                                                  -60.f, 60.f);
+            self->overscrollVelocity_ = std::clamp(velocity_ * 0.15f, -320.f, 320.f);
+            self->velocity_ = 0.f;
+        } else {
+            self->scrollY_ = wanted;
+            self->velocity_ *= std::exp(-kFlingFriction * static_cast<float>(dt));
+        }
+    }
+    if (!touchHeld_ && !barHeld_ && dt > 0.0 &&
+        (scrollY_ < 0.f || scrollY_ > maxScroll() ||
+         std::fabs(overscrollVelocity_) > 0.1f)) {
+        const float goal = std::clamp(scrollY_, 0.f, maxScroll());
+        const float step = static_cast<float>(std::min(dt, 0.032));
+        self->overscrollVelocity_ += (-144.f * (scrollY_ - goal) -
+                                      24.f * overscrollVelocity_) * step;
+        self->scrollY_ += overscrollVelocity_ * step;
+        if (std::fabs(scrollY_ - goal) < 0.3f &&
+            std::fabs(overscrollVelocity_) < 4.f)
+            { self->scrollY_ = goal; self->overscrollVelocity_ = 0.f; }
     }
 
     if (!hovered && barAlpha_.target() > 0.f && !smoothActive_ &&
@@ -170,7 +290,7 @@ void ScrollView::onPaintOverlay(IPaintTarget& t, const PaintCtx& ctx) {
     const Rect b = localBounds();
     const float trackH = b.h - 8.f;
     const float thumbH = std::max(32.f, trackH * (b.h / contentHeight));
-    const float y = 4.f + (trackH - thumbH) * (scrollY_ / maxS);
+    const float y = 4.f + (trackH - thumbH) * std::clamp(scrollY_ / maxS, 0.f, 1.f);
     t.fillRoundedRect(Rect{b.w - 7.f, y, 4.f, thumbH}, Corners::all(2.f),
                       fade(ctx.pal.muted, a * 0.55f));
 }
@@ -185,6 +305,13 @@ SidePanel::SidePanel(Side s)
       expanded_(s == Side::Left ? tokens::size::panelLeft
                                 : tokens::size::panelRight) {
     debugName = s == Side::Left ? "SidePanel(L)" : "SidePanel(R)";
+}
+
+void SidePanel::setCollapsedImmediately(bool c) noexcept {
+    collapsed_ = c;
+    width_.reset(c ? tokens::size::panelRailCollapsed : expanded_);
+    collapseT_.reset(c ? 1.f : 0.f);
+    sheetT_.reset(c ? 0.f : 1.f);
 }
 
 void SidePanel::setCollapsed(bool c, double now) {
@@ -341,14 +468,21 @@ Rect TabBar::plusRect() const {
 }
 
 bool TabBar::onPointer(const PointerEvent& e) {
+    const bool oldPlus = hoverTab_ < 0 &&
+        plusRect().contains(hoverPos_.x, hoverPos_.y);
     hoverPos_ = e.pos;
     switch (e.phase) {
         case PointerPhase::Move:
         case PointerPhase::Enter: {
             bool onX = false;
-            hoverTab_ = hitTab(e.pos, e.timestamp, &onX);
+            const int nextTab = hitTab(e.pos, e.timestamp, &onX);
+            const bool nextPlus = nextTab < 0 &&
+                plusRect().contains(e.pos.x, e.pos.y);
+            const bool changed = nextTab != hoverTab_ || onX != hoverClose_ ||
+                                 oldPlus != nextPlus;
+            hoverTab_ = nextTab;
             hoverClose_ = onX;
-            return true;
+            return changed;
         }
         case PointerPhase::Leave:
             hoverTab_ = -1;
@@ -474,17 +608,52 @@ void RecentCard::enter(double now, int indexInGrid) {
 }
 
 bool RecentCard::onPointer(const PointerEvent& e) {
-    if (e.phase == PointerPhase::Up && hitLocal(e.pos) && onOpen) onOpen();
-    return e.phase == PointerPhase::Up || e.phase == PointerPhase::Down ||
-           e.phase == PointerPhase::Enter || e.phase == PointerPhase::Leave;
+    if (e.phase == PointerPhase::Down) {
+        if (e.button == MouseButton::Right) {
+            pressStart_ = -1.0;
+            menuOpened_ = true;
+            if (onMenu) onMenu(toWindow(e.pos));
+            return true;
+        }
+        menuOpened_ = false;
+        pressStart_ = e.isTouch() ? e.timestamp : -1.0;
+        pressPos_ = e.pos;
+        return true;
+    }
+    if (e.phase == PointerPhase::Move && pressStart_ >= 0.0) {
+        const float dx = e.pos.x - pressPos_.x, dy = e.pos.y - pressPos_.y;
+        if (dx * dx + dy * dy > 100.f) pressStart_ = -1.0;
+    }
+    if (e.phase == PointerPhase::Cancel || e.phase == PointerPhase::Leave) {
+        pressStart_ = -1.0;
+        return true;
+    }
+    if (e.phase == PointerPhase::Up) {
+        if (pressStart_ >= 0.0 && e.timestamp - pressStart_ >= .5 &&
+            hitLocal(e.pos) && !menuOpened_) {
+            menuOpened_ = true;
+            if (onMenu) onMenu(toWindow(e.pos));
+        }
+        pressStart_ = -1.0;
+        if (!menuOpened_ && e.button != MouseButton::Right && hitLocal(e.pos) && onOpen)
+            onOpen();
+        menuOpened_ = false;
+        return true;
+    }
+    return e.phase == PointerPhase::Enter || e.phase == PointerPhase::Move;
 }
 
 bool RecentCard::animating(double now) const {
-    return hoverT_.active(now) || enter_.active(now) ||
+    return (pressStart_ >= 0.0 && !menuOpened_) ||
+           hoverT_.active(now) || enter_.active(now) ||
            (now - barDelay_) * 1000.0 < tokens::dur::heroBarFill;
 }
 
 void RecentCard::onPaint(IPaintTarget& t, const PaintCtx& ctx) {
+    if (pressStart_ >= 0.0 && !menuOpened_ && ctx.now - pressStart_ >= .5) {
+        menuOpened_ = true;
+        if (onMenu) onMenu(toWindow(pressPos_));
+    }
     const Rect full = localBounds();
     if (full.empty()) return;
 
@@ -507,26 +676,34 @@ void RecentCard::onPaint(IPaintTarget& t, const PaintCtx& ctx) {
     drawElevation(t, b, rr, tokens::elevation::cardHover(ctx.pal), hv);
     t.fillRoundedRect(b, rr, ctx.pal.card);
 
-    // Thumbnail: a paper-coloured rectangle with an accent spine, standing in
-    // for the real page raster until a document is open.
     const float thumbH = b.h * 0.56f;
     const Rect thumb{b.x + 10.f, b.y + 10.f, b.w - 20.f, thumbH};
     t.fillRoundedRect(thumb, Corners::all(tokens::radius::sm),
                       lerpColor(Color{254, 254, 254, 255}, ctx.pal.surfaceSunken,
                                 tokens::darkness(ctx.pal)));
-    t.strokeRoundedRect(thumb, Corners::all(tokens::radius::sm), ctx.pal.border, 1.f);
     const Color accent =
         tokens::docAccent[static_cast<std::size_t>(accentIndex) % tokens::docAccent.size()];
-    t.fillRoundedRect(Rect{thumb.x, thumb.y, 4.f, thumb.h},
-                      Corners{tokens::radius::sm, 0.f, 0.f, tokens::radius::sm}, accent);
-    // Fake text lines.
-    for (int i = 0; i < 5; ++i) {
-        const float ly = thumb.y + 16.f + static_cast<float>(i) * 11.f;
-        if (ly > thumb.bottom() - 10.f) break;
-        const float lw = (thumb.w - 34.f) * (i == 4 ? 0.5f : (i == 0 ? 0.75f : 0.92f));
-        t.fillRoundedRect(Rect{thumb.x + 16.f, ly, lw, 4.f}, Corners::all(2.f),
-                          fade(ctx.pal.muted, 0.3f));
+    if (cover && cover->width > 0 && cover->height > 0 && !cover->pixels.empty()) {
+        t.save();
+        t.clipRoundedRect(thumb, Corners::all(tokens::radius::sm));
+        const Rect image = recentCoverDestination(thumb, cover->width, cover->height);
+        t.drawImageBGRA(cover->pixels.data(), cover->width, cover->height,
+                        static_cast<std::size_t>(cover->width) * 4u, image,
+                        cover->imageKey, IPaintTarget::ImageFit::Transient);
+        t.restore();
+    } else {
+        // Cheap placeholder only until this file's REAL first page arrives.
+        t.fillRoundedRect(Rect{thumb.x, thumb.y, 4.f, thumb.h},
+                          Corners{tokens::radius::sm, 0.f, 0.f, tokens::radius::sm}, accent);
+        for (int i = 0; i < 5; ++i) {
+            const float ly = thumb.y + 16.f + static_cast<float>(i) * 11.f;
+            if (ly > thumb.bottom() - 10.f) break;
+            const float lw = (thumb.w - 34.f) * (i == 4 ? 0.5f : (i == 0 ? 0.75f : 0.92f));
+            t.fillRoundedRect(Rect{thumb.x + 16.f, ly, lw, 4.f}, Corners::all(2.f),
+                              fade(ctx.pal.muted, 0.3f));
+        }
     }
+    t.strokeRoundedRect(thumb, Corners::all(tokens::radius::sm), ctx.pal.border, 1.f);
 
     const float textY = thumb.bottom() + 10.f;
     t.drawTextInBox(title, Rect{b.x + 12.f, textY, b.w - 24.f, 20.f},

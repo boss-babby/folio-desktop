@@ -14,10 +14,13 @@
 
 #include "pdfium/PdfiumLibrary.h"
 #include "pdfium/PdfiumRasterizer.h"
+#include <fpdf_annot.h>
+#include <fpdfview.h>
 
 #include "folio/core/engine/DocumentSnapshot.h"
 #include "../Harness.h"
 
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -140,7 +143,7 @@ FOLIO_TEST_MAIN("podofo round-trip") {
         hl.l = 0.12f; hl.t = 0.26f; hl.r = 0.78f; hl.b = 0.30f;
         hl.cr = 255; hl.cg = 214; hl.cb = 10;
         hl.opacity = 0.45f;
-        hl.contents = "Highlighted by the round-trip test";
+        hl.contents = "\xE0\xA6\xA8\xE0\xA7\x8B\xE0\xA6\x9F \xE2\x80\x94 highlight comment";
         annots.push_back(hl);
 
         AnnotSpec ink;
@@ -169,6 +172,26 @@ FOLIO_TEST_MAIN("podofo round-trip") {
         check(doc.writeAnnotations(annots), "  annotations written");
         check(doc.dirty(), "  document reports itself dirty");
         check(doc.saveIncremental(), "  incremental save succeeds");
+        {
+            FPDF_DOCUMENT saved = FPDF_LoadDocument(work.string().c_str(), nullptr);
+            FPDF_PAGE page = saved ? FPDF_LoadPage(saved, 0) : nullptr;
+            bool foundUtf8Comment = false;
+            if (page) {
+                for (int i = 0; i < FPDFPage_GetAnnotCount(page); ++i) {
+                    FPDF_ANNOTATION annot = FPDFPage_GetAnnot(page, i);
+                    if (!annot) continue;
+                    std::array<FPDF_WCHAR, 128> value{};
+                    FPDFAnnot_GetStringValue(annot, "Contents", value.data(),
+                                              value.size() * sizeof(FPDF_WCHAR));
+                    foundUtf8Comment |= value[0] == 0x09a8u;
+                    FPDFPage_CloseAnnot(annot);
+                }
+                FPDF_ClosePage(page);
+            }
+            if (saved) FPDF_CloseDocument(saved);
+            check(foundUtf8Comment,
+                  "  exported highlight has Unicode comment readable by another PDF reader");
+        }
         check(!doc.dirty(), "  save clears the dirty flag");
 
         auto after = render(work, 0);
@@ -317,8 +340,25 @@ FOLIO_TEST_MAIN("podofo round-trip") {
         const std::string b((std::istreambuf_iterator<char>(raw)),
                             std::istreambuf_iterator<char>());
         check(b.find("/FreeText") != std::string::npos, "  /FreeText subtype present");
-        check(b.find("Reviewed by Legal") != std::string::npos,
-              "  the text itself is in the file");
+        {
+            FPDF_DOCUMENT saved = FPDF_LoadDocument(work.string().c_str(), nullptr);
+            FPDF_PAGE page = saved ? FPDF_LoadPage(saved, 0) : nullptr;
+            bool readable = false;
+            if (page) {
+                for (int i = 0; i < FPDFPage_GetAnnotCount(page); ++i) {
+                    FPDF_ANNOTATION annot = FPDFPage_GetAnnot(page, i);
+                    if (!annot) continue;
+                    std::array<FPDF_WCHAR, 128> value{};
+                    FPDFAnnot_GetStringValue(annot, "Contents", value.data(),
+                                              value.size() * sizeof(FPDF_WCHAR));
+                    readable |= value[0] == 'R' && value[1] == 'e';
+                    FPDFPage_CloseAnnot(annot);
+                }
+                FPDF_ClosePage(page);
+            }
+            if (saved) FPDF_CloseDocument(saved);
+            check(readable, "  FreeText contents readable by another PDF reader");
+        }
         // Without an appearance stream the annotation is valid, parses
         // everywhere, and is invisible everywhere - the exact trap that
         // cost a round earlier in this project.

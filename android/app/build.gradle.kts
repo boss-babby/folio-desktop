@@ -2,8 +2,8 @@
 //
 // Gradle's only jobs here are to drive our existing CMake build through
 // externalNativeBuild, stage the fonts as assets, and package the result.
-// There is no Java or Kotlin source: `android:hasCode="false"` in the
-// manifest says so, and the UI is the same C++ the desktop runs.
+// FolioActivity is a tiny Java bridge for SAF, IME and clipboard; the UI
+// remains the same C++/Skia surface as the desktop.
 plugins { id("com.android.application") }
 
 android {
@@ -25,6 +25,10 @@ android {
                 arguments += listOf(
                     "-DFOLIO_BUILD_UI=ON",
                     "-DFOLIO_BUILD_TESTS=OFF",
+                    // Full -g on the large ReaderScreen TU can exhaust a 2 GiB
+                    // builder. Keep line tables for native debug builds.
+                    "-DCMAKE_CXX_FLAGS_DEBUG=-O0 -g1",
+                    "-DCMAKE_C_FLAGS_DEBUG=-O0 -g1",
                     "-DANDROID_STL=c++_shared"
                 )
                 targets += "folio-android"

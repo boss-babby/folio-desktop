@@ -1,0 +1,136 @@
+name: Windows ClangCL (experimental)
+
+# Distribution template. GitHub only executes workflows under
+# .github/workflows/; see github-workflows/README.md for installation.
+# The Windows runner is required for the real SDK, linker and MSVC ABI.
+on:
+  workflow_dispatch:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  FOLIO_DEPS_DIR: ${{ github.workspace }}\.folio-deps
+
+jobs:
+  windows-clang:
+    name: Build, test and package (Windows x64 ClangCL)
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      # Set INCLUDE, LIB and PATH for the Windows SDK and MSVC link libraries.
+      # clang-cl alone is insufficient to target the MSVC ABI.
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Check compiler and tools
+        id: toolchain
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $clang = (Get-Command clang-cl -ErrorAction Stop).Source
+          & $clang --version
+          if ($LASTEXITCODE -ne 0) { throw 'clang-cl is broken' }
+          $cmake = (cmake --version | Select-Object -First 1)
+          $version = [regex]::Match($cmake, '\d+\.\d+\.\d+').Value
+          if (-not $version -or [version]$version -lt [version]'3.28.0') {
+            throw "Folio needs CMake >= 3.28; runner reports $cmake"
+          }
+          ninja --version
+          if ($LASTEXITCODE -ne 0) { throw 'Ninja is unavailable' }
+          "compiler=$clang" >> $env:GITHUB_OUTPUT
+
+      - uses: actions/cache@v4
+        with:
+          path: ${{ env.FOLIO_DEPS_DIR }}
+          key: folio-windows-deps-${{ hashFiles('tools/bootstrap-deps.ps1') }}
+
+      - name: Download and verify pinned Windows dependencies
+        shell: pwsh
+        run: |
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/bootstrap-deps.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'Dependency bootstrap failed' }
+          $pdf = Join-Path $env:FOLIO_DEPS_DIR 'pdfium\bin\pdfium.dll'
+          $imp = Join-Path $env:FOLIO_DEPS_DIR 'pdfium\lib\pdfium.dll.lib'
+          $skia = Join-Path $env:FOLIO_DEPS_DIR 'skia\out\Release-windows-x64\skia.lib'
+          foreach ($p in @($pdf, $imp, $skia)) {
+            if (-not (Test-Path $p)) { throw "Missing dependency: $p" }
+          }
+          Add-Content -Path $env:GITHUB_PATH -Value (Split-Path $pdf)
+
+      - name: Configure Ninja with ClangCL and Windows backend
+        shell: pwsh
+        run: |
+          cmake -S . -B build-clang -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_C_COMPILER="${{ steps.toolchain.outputs.compiler }}" `
+            -DCMAKE_CXX_COMPILER="${{ steps.toolchain.outputs.compiler }}" `
+            -DFOLIO_BUILD_UI=ON -DFOLIO_BUILD_TESTS=ON `
+            -DFOLIO_WITH_PODOFO=OFF `
+            -DFOLIO_DEPS_DIR="$env:FOLIO_DEPS_DIR"
+          if ($LASTEXITCODE -ne 0) { throw 'Windows configure failed' }
+          $cache = 'build-clang/CMakeCache.txt'
+          if (-not (Select-String -Path $cache -Pattern '^FOLIO_PLATFORM_BACKEND:INTERNAL=win32$' -Quiet)) {
+            throw 'Wrong platform backend; the Win32 shell was not selected'
+          }
+          if (-not (Select-String -Path $cache -Pattern '^FOLIO_WITH_PODOFO:BOOL=OFF$' -Quiet)) {
+            throw 'PoDoFo configuration was not honoured'
+          }
+
+      - name: Build all targets
+        id: build
+        shell: pwsh
+        run: |
+          cmake --build build-clang --parallel 2
+          if ($LASTEXITCODE -ne 0) { throw 'Windows compile/link failed' }
+
+      - name: Run all tests (including PDF Save As)
+        id: tests
+        shell: pwsh
+        run: |
+          ctest --test-dir build-clang --output-on-failure
+          if ($LASTEXITCODE -ne 0) { throw 'Windows tests failed' }
+
+      # A failed test should keep the job RED, but it must not throw away a
+      # successfully compiled executable. Package the build even if CTest
+      # failed so the user can download and diagnose it after the runner ends.
+      - name: Package the compiled native executable
+        id: package
+        if: ${{ always() && steps.build.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item build-clang/folio-ui/folio-desktop.exe dist/Folio.exe
+          Copy-Item "$env:FOLIO_DEPS_DIR\pdfium\bin\pdfium.dll" dist/
+          Copy-Item assets dist/assets -Recurse
+          Copy-Item documents dist/documents -Recurse
+          Copy-Item docs/RUNNING-WINDOWS.txt dist/README.txt
+          foreach ($p in @('dist/Folio.exe', 'dist/pdfium.dll', 'dist/assets/fonts')) {
+            if (-not (Test-Path $p)) { throw "Missing package content: $p" }
+          }
+          Compress-Archive -Path dist/* -DestinationPath Folio-windows-clang-x64.zip
+
+      - name: Smoke-test the packaged executable
+        id: smoke
+        if: ${{ always() && steps.package.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          & .\dist\Folio.exe --help
+          if ($LASTEXITCODE -ne 0) { throw 'Packaged Folio.exe could not load' }
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() && steps.package.outcome == 'success' }}
+        with:
+          # A red test/smoke run still delivers a build, but never labels it
+          # as verified. Do not distribute an UNVERIFIED artifact as a release.
+          name: ${{ steps.tests.outcome == 'success' && steps.smoke.outcome == 'success' && 'Folio-windows-clang-x64' || 'Folio-windows-clang-x64-UNVERIFIED' }}
+          path: |
+            Folio-windows-clang-x64.zip
+            build-clang/Testing/Temporary/LastTest.log
+          if-no-files-found: error
+          retention-days: 30

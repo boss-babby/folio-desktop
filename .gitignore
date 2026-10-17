@@ -1,0 +1,5 @@
+# Local CMake/Gradle build outputs (not source or audit artifacts)
+/build/
+/android/.gradle/
+/android/app/.cxx/
+/android/app/build/

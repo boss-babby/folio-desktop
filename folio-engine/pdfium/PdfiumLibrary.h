@@ -50,6 +50,13 @@ private:
     std::thread::id initThread_;
 };
 
+/// PDFium's font, codec and page-object caches are process-wide. Even when
+/// separate tabs own different documents, their API calls must not overlap.
+/// Keep the gate outside a document/worker so standalone rasterizers and
+/// background tab workers share the same protection. Recursive because
+/// pageInfo/render operations call acquirePage and other guarded helpers.
+[[nodiscard]] std::recursive_mutex& pdfiumApiMutex();
+
 /// Call before any FPDF_ use. Cheap after the first time.
 inline void ensurePdfiumInitialised() { (void)PdfiumLibrary::instance(); }
 

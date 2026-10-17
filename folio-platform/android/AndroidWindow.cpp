@@ -27,6 +27,7 @@
 #include <android/log.h>
 #include <android/native_window.h>
 #include <android_native_app_glue.h>
+#include <jni.h>
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -37,6 +38,7 @@
 #include <cstring>
 #include <deque>
 #include <memory>
+#include <mutex>
 #include <string>
 
 #define FOLIO_LOG(...) \
@@ -49,12 +51,195 @@ namespace {
 /// else runs. A process has exactly one activity, so this is a genuine
 /// singleton rather than a convenience global.
 ::android_app* g_app = nullptr;
+std::mutex gPendingMutex;
+std::deque<Event> gPendingEvents;
+
+// Java results arrive on Android's UI/import thread, never the native looper.
+// Only the native loop mutates FolioApp; the bridge enqueues and wakes it.
+void postFromJava(Event e) {
+    {
+        std::lock_guard<std::mutex> lock(gPendingMutex);
+        gPendingEvents.push_back(std::move(e));
+    }
+    if (g_app && g_app->looper) ALooper_wake(g_app->looper);
+}
+
+struct AttachedEnv {
+    JNIEnv* env = nullptr;
+    bool attached = false;
+    AttachedEnv() {
+        if (!g_app || !g_app->activity || !g_app->activity->vm) return;
+        JavaVM* vm = g_app->activity->vm;
+        if (vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK) {
+            attached = vm->AttachCurrentThread(&env, nullptr) == JNI_OK;
+        }
+    }
+    ~AttachedEnv() {
+        if (attached && g_app && g_app->activity)
+            g_app->activity->vm->DetachCurrentThread();
+    }
+};
+
+jmethodID activityMethod(JNIEnv* env, const char* name, const char* sig) {
+    if (!env || !g_app || !g_app->activity) return nullptr;
+    jclass cls = env->GetObjectClass(g_app->activity->clazz);
+    if (!cls) return nullptr;
+    jmethodID m = env->GetMethodID(cls, name, sig);
+    env->DeleteLocalRef(cls);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+    return m;
+}
+
+std::string fromJava(JNIEnv* env, jstring value) {
+    if (!value) return {};
+    const char* bytes = env->GetStringUTFChars(value, nullptr);
+    if (!bytes) return {};
+    std::string result(bytes);
+    env->ReleaseStringUTFChars(value, bytes);
+    return result;
+}
 
 constexpr double kPi = 3.14159265358979323846;
 
 }  // namespace
 
 void setAndroidApp(::android_app* app) noexcept { g_app = app; }
+
+bool requestAndroidPdfPicker() {
+    AttachedEnv thread;
+    if (!thread.env) return false;
+    jmethodID m = activityMethod(thread.env, "requestOpenPdf", "()V");
+    if (!m) return false;
+    thread.env->CallVoidMethod(g_app->activity->clazz, m);
+    if (thread.env->ExceptionCheck()) {
+        thread.env->ExceptionDescribe(); thread.env->ExceptionClear();
+        return false;
+    }
+    return true;
+}
+
+bool requestAndroidPdfExport(const std::string& staged, const std::string& name) {
+    AttachedEnv thread;
+    if (!thread.env) return false;
+    jmethodID m = activityMethod(thread.env, "requestSavePdf",
+                                 "(Ljava/lang/String;Ljava/lang/String;)V");
+    if (!m) return false;
+    jstring path = thread.env->NewStringUTF(staged.c_str());
+    jstring title = thread.env->NewStringUTF(name.c_str());
+    if (!path || !title) {
+        if (path) thread.env->DeleteLocalRef(path);
+        if (title) thread.env->DeleteLocalRef(title);
+        return false;
+    }
+    thread.env->CallVoidMethod(g_app->activity->clazz, m, path, title);
+    thread.env->DeleteLocalRef(path);
+    thread.env->DeleteLocalRef(title);
+    if (thread.env->ExceptionCheck()) {
+        thread.env->ExceptionDescribe(); thread.env->ExceptionClear();
+        return false;
+    }
+    return true;
+}
+
+int openAndroidLinkedPdfFd(const std::string& stablePath) {
+    AttachedEnv thread;
+    if (!thread.env) return -1;
+    const auto m = activityMethod(thread.env, "openLinkedPdfFd", "(Ljava/lang/String;)I");
+    if (!m) return -1;
+    jstring path = thread.env->NewStringUTF(stablePath.c_str());
+    if (!path) return -1;
+    const jint fd = thread.env->CallIntMethod(g_app->activity->clazz, m, path);
+    thread.env->DeleteLocalRef(path);
+    if (thread.env->ExceptionCheck()) {
+        thread.env->ExceptionDescribe(); thread.env->ExceptionClear(); return -1;
+    }
+    return static_cast<int>(fd);
+}
+
+bool requestAndroidStorageAction(const std::string& stablePath, int action) {
+    AttachedEnv thread;
+    if (!thread.env) return false;
+    const auto m = activityMethod(thread.env, "requestStorageAction", "(Ljava/lang/String;I)V");
+    if (!m) return false;
+    jstring path = thread.env->NewStringUTF(stablePath.c_str());
+    if (!path) return false;
+    thread.env->CallVoidMethod(g_app->activity->clazz, m, path, static_cast<jint>(action));
+    thread.env->DeleteLocalRef(path);
+    if (thread.env->ExceptionCheck()) {
+        thread.env->ExceptionDescribe(); thread.env->ExceptionClear(); return false;
+    }
+    return true;
+}
+
+bool androidPrefersSourceOnly() {
+    AttachedEnv thread;
+    if (!thread.env) return false;
+    const auto m = activityMethod(thread.env, "prefersSourceOnly", "()Z");
+    if (!m) return false;
+    const auto value = thread.env->CallBooleanMethod(g_app->activity->clazz, m);
+    if (thread.env->ExceptionCheck()) { thread.env->ExceptionClear(); return false; }
+    return value == JNI_TRUE;
+}
+
+void setAndroidPrefersSourceOnly(bool enabled) {
+    AttachedEnv thread;
+    if (!thread.env) return;
+    const auto m = activityMethod(thread.env, "setPrefersSourceOnly", "(Z)V");
+    if (m) thread.env->CallVoidMethod(g_app->activity->clazz, m,
+                                      enabled ? JNI_TRUE : JNI_FALSE);
+    if (thread.env->ExceptionCheck()) thread.env->ExceptionClear();
+}
+
+bool requestAndroidPdfShare(const std::string& staged, const std::string& name) {
+    AttachedEnv thread;
+    if (!thread.env) return false;
+    jmethodID m = activityMethod(thread.env, "requestSharePdf",
+                                 "(Ljava/lang/String;Ljava/lang/String;)V");
+    if (!m) return false;
+    jstring path = thread.env->NewStringUTF(staged.c_str());
+    jstring title = thread.env->NewStringUTF(name.c_str());
+    if (!path || !title) {
+        if (path) thread.env->DeleteLocalRef(path);
+        if (title) thread.env->DeleteLocalRef(title);
+        return false;
+    }
+    thread.env->CallVoidMethod(g_app->activity->clazz, m, path, title);
+    thread.env->DeleteLocalRef(path);
+    thread.env->DeleteLocalRef(title);
+    if (thread.env->ExceptionCheck()) {
+        thread.env->ExceptionDescribe(); thread.env->ExceptionClear();
+        return false;
+    }
+    return true;
+}
+
+void showAndroidKeyboard(bool visible) {
+    AttachedEnv thread;
+    if (!thread.env) return;
+    jmethodID m = activityMethod(thread.env, "setSoftKeyboardVisible", "(Z)V");
+    if (m) thread.env->CallVoidMethod(g_app->activity->clazz, m,
+                                     visible ? JNI_TRUE : JNI_FALSE);
+    if (thread.env->ExceptionCheck()) thread.env->ExceptionClear();
+}
+
+void setAndroidSystemBarsColor(int argb, bool darkIcons) {
+    AttachedEnv thread;
+    if (!thread.env) return;
+    jmethodID m = activityMethod(thread.env, "setSystemBarsThemeColor", "(IZ)V");
+    if (m) thread.env->CallVoidMethod(g_app->activity->clazz, m,
+                                     static_cast<jint>(argb),
+                                     darkIcons ? JNI_TRUE : JNI_FALSE);
+    if (thread.env->ExceptionCheck()) thread.env->ExceptionClear();
+}
+
+void setAndroidSystemBarsDark(bool dark) {
+    AttachedEnv thread;
+    if (!thread.env) return;
+    jmethodID m = activityMethod(thread.env, "setSystemBarsDark", "(Z)V");
+    if (m) thread.env->CallVoidMethod(g_app->activity->clazz, m,
+                                     dark ? JNI_TRUE : JNI_FALSE);
+    if (thread.env->ExceptionCheck()) thread.env->ExceptionClear();
+}
 
 namespace {
 
@@ -243,6 +428,13 @@ public:
 
     bool poll(Event& out) override {
         pumpLooper(0);
+        {
+            std::lock_guard<std::mutex> lock(gPendingMutex);
+            while (!gPendingEvents.empty()) {
+                queue_.push_back(std::move(gPendingEvents.front()));
+                gPendingEvents.pop_front();
+            }
+        }
         if (queue_.empty()) return false;
         out = std::move(queue_.front());
         queue_.pop_front();
@@ -348,9 +540,13 @@ private:
                 self->queue_.push_back(std::move(e));
                 break;
             }
-            case APP_CMD_TERM_WINDOW:
+            case APP_CMD_TERM_WINDOW: {
+                Event e;
+                e.type = Event::Type::Minimized;
+                self->queue_.push_back(std::move(e));
                 self->gl_.unbind();
                 break;
+            }
             case APP_CMD_WINDOW_RESIZED:
             case APP_CMD_CONFIG_CHANGED: {
                 if (!app->window) break;
@@ -431,7 +627,17 @@ private:
         e.pointerId =
             static_cast<std::uint32_t>(AMotionEvent_getPointerId(ev, i));
         e.source = toolToSource(AMotionEvent_getToolType(ev, i));
+        e.inputTimeSeconds = static_cast<double>(AMotionEvent_getEventTime(ev)) * 1e-9;
         e.button = Button::Left;
+        if (e.source == PointerSource::Mouse) {
+            if (type == Event::Type::PointerDown) {
+                mousePressButton_ =
+                    (AMotionEvent_getButtonState(ev) & AMOTION_EVENT_BUTTON_SECONDARY)
+                        ? Button::Right : Button::Left;
+            }
+            e.button = mousePressButton_;
+            if (type == Event::Type::PointerUp) mousePressButton_ = Button::Left;
+        }
         e.pressure = type == Event::Type::PointerUp
                          ? 0.f
                          : std::clamp(AMotionEvent_getPressure(ev, i), 0.f, 1.f);
@@ -488,6 +694,8 @@ private:
                             AMotionEvent_getPointerId(ev, p));
                         e.source =
                             toolToSource(AMotionEvent_getToolType(ev, p));
+                        e.inputTimeSeconds = static_cast<double>(
+                            AMotionEvent_getHistoricalEventTime(ev, h)) * 1e-9;
                         e.pressure = std::clamp(
                             AMotionEvent_getHistoricalPressure(ev, p, h), 0.f,
                             1.f);
@@ -556,6 +764,7 @@ private:
     std::deque<Event> queue_;
     float scale_ = 1.f;
     bool shouldClose_ = false;
+    Button mousePressButton_ = Button::Left;
     std::int64_t lastDownTime_ = 0;
     double lastDownX_ = 0.0, lastDownY_ = 0.0;
 };
@@ -563,26 +772,40 @@ private:
 AndroidWindow* AndroidWindow::instance = nullptr;
 
 // ---------------------------------------------------------------------------
-// Clipboard and file dialogs
-//
-// Both are JNI calls into the framework, and both are deliberately left as
-// honest no-ops rather than half-written bridges:
-//
-//  * The clipboard is android.content.ClipboardManager, reachable only from
-//    a thread attached to the JVM.
-//  * There is no file *path* dialog on modern Android at all. Scoped
-//    storage replaced it with the Storage Access Framework, which returns a
-//    content:// URI and a file descriptor. That does not fit IFileDialog's
-//    "give me a path" shape, and pretending otherwise by returning a path
-//    that cannot be opened would be worse than returning nothing.
-//
-// ANDROID-READINESS.md records what each needs.
+// Android clipboard goes through the Activity's ClipboardManager.
+// SAF documents are imported asynchronously; see the JNI callbacks below.
 // ---------------------------------------------------------------------------
 
-class NullClipboard final : public IClipboard {
+class AndroidClipboard final : public IClipboard {
 public:
-    bool setText(std::string_view) override { return false; }
-    [[nodiscard]] std::string text() override { return {}; }
+    bool setText(std::string_view text) override {
+        AttachedEnv thread;
+        if (!thread.env) return false;
+        jmethodID m = activityMethod(thread.env, "setClipboardText",
+                                     "(Ljava/lang/String;)V");
+        if (!m) return false;
+        std::string copy(text);
+        jstring value = thread.env->NewStringUTF(copy.c_str());
+        if (!value) return false;
+        thread.env->CallVoidMethod(g_app->activity->clazz, m, value);
+        thread.env->DeleteLocalRef(value);
+        if (!thread.env->ExceptionCheck()) return true;
+        thread.env->ExceptionClear();
+        return false;
+    }
+    [[nodiscard]] std::string text() override {
+        AttachedEnv thread;
+        if (!thread.env) return {};
+        jmethodID m = activityMethod(thread.env, "getClipboardText",
+                                     "()Ljava/lang/String;");
+        if (!m) return {};
+        auto result = static_cast<jstring>(
+            thread.env->CallObjectMethod(g_app->activity->clazz, m));
+        if (thread.env->ExceptionCheck()) { thread.env->ExceptionClear(); return {}; }
+        std::string s = fromJava(thread.env, result);
+        if (result) thread.env->DeleteLocalRef(result);
+        return s;
+    }
 };
 
 class NullFileDialog final : public IFileDialog {
@@ -595,9 +818,8 @@ public:
         const FileDialogRequest&) override {
         return std::nullopt;
     }
-    /// False, so FolioApp falls back to its own in-app OpenDialog. That
-    /// component browsing a sandboxed app directory is a real, usable
-    /// Android experience; a native picker that returns nothing is not.
+    /// NativeShell uses requestAndroidPdfPicker for non-blocking SAF access.
+    /// These synchronous path-based methods remain deliberately unavailable.
     [[nodiscard]] bool available() const override { return false; }
 };
 
@@ -611,7 +833,7 @@ std::unique_ptr<IWindow> createWindow(const WindowDesc& desc,
 }
 
 IClipboard& clipboard() {
-    static NullClipboard c;
+    static AndroidClipboard c;
     return c;
 }
 
@@ -621,5 +843,69 @@ IFileDialog& fileDialog() {
 }
 
 const char* backendName() noexcept { return "android"; }
+
+extern "C" JNIEXPORT void JNICALL
+Java_ai_folio_reader_FolioActivity_nativeOnSafeArea(JNIEnv*, jclass,
+                                                     jint topPixels) {
+    Event e;
+    e.type = Event::Type::SafeArea;
+    e.h = std::max(0, static_cast<int>(topPixels));
+    FOLIO_LOG("window safe-area event top=%dpx", e.h);
+    postFromJava(std::move(e));
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_ai_folio_reader_FolioActivity_nativeOnPdfResult(JNIEnv* env, jclass,
+                                                       jstring path) {
+    Event e;
+    e.type = Event::Type::FileOpened;
+    e.text = fromJava(env, path);
+    postFromJava(std::move(e));
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_ai_folio_reader_FolioActivity_nativeOnStorageResult(JNIEnv* env, jclass,
+                                                         jint status, jstring message) {
+    Event e;
+    e.type = Event::Type::StorageChanged;
+    e.w = status;
+    e.text = fromJava(env, message);
+    postFromJava(std::move(e));
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_ai_folio_reader_FolioActivity_nativeOnSaveResult(JNIEnv* env, jclass,
+                                                      jint status, jstring message) {
+    Event e;
+    e.type = Event::Type::FileExported;
+    e.w = status;
+    e.text = fromJava(env, message);
+    postFromJava(std::move(e));
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_ai_folio_reader_FolioActivity_nativeOnText(JNIEnv* env, jclass,
+                                                  jstring text) {
+    Event e;
+    e.type = Event::Type::Text;
+    e.text = fromJava(env, text);
+    if (!e.text.empty()) postFromJava(std::move(e));
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_ai_folio_reader_FolioActivity_nativeOnBackspace(JNIEnv*, jclass) {
+    Event e;
+    e.type = Event::Type::KeyDown;
+    e.key = Key::Backspace;
+    postFromJava(std::move(e));
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_ai_folio_reader_FolioActivity_nativeOnEnter(JNIEnv*, jclass) {
+    Event e;
+    e.type = Event::Type::KeyDown;
+    e.key = Key::Enter;
+    postFromJava(std::move(e));
+}
 
 }  // namespace folio::platform

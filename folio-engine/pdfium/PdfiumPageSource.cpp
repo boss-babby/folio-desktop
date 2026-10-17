@@ -3,8 +3,8 @@
 #include "pdfium/PdfiumPageSource.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
-#include <fstream>
 #include <vector>
 
 namespace folio::engine {
@@ -14,12 +14,18 @@ using folio::render::IPaintTarget;
 using folio::render::Rect;
 
 namespace {
-/// Above this the bitmap costs more than it is worth and the blit upscales
-/// instead. 4096 on the long edge is one 64 MB page at BGRA.
+// PDFium pixels, SkImage copies and GPU textures are SEPARATE allocations.
+// The previous 192 MiB source cache + 256 MiB image cache could each hold
+// the same pages independently, well before PDFium's open-page cache and the
+// display surface. Keep the phone's entire page pipeline bounded instead of
+// budgeting a single layer in isolation.
+#if defined(__ANDROID__)
+constexpr int kMaxLongEdge = 2048; // at most ~16 MiB for one square BGRA page
+constexpr std::size_t kByteBudget = 24u * 1024u * 1024u;
+#else
 constexpr int kMaxLongEdge = 4096;
-/// Resident page bitmaps. The stage keeps its own raster cache above this
-/// one; this budget only covers PDFium output.
-constexpr std::size_t kByteBudget = 192u * 1024u * 1024u;
+constexpr std::size_t kByteBudget = 48u * 1024u * 1024u;
+#endif
 }  // namespace
 
 PdfiumPageSource::PdfiumPageSource() : worker_(std::make_unique<PdfiumWorker>()) {}
@@ -27,46 +33,47 @@ PdfiumPageSource::~PdfiumPageSource() = default;
 
 bool PdfiumPageSource::open(const std::string& path) {
     cache_.clear();
+    tileCache_.clear();
+    tileBytes_ = 0;
+    requestedTiles_.clear();
+    nextRequestedTiles_.clear();
+    frame_ = 0;
+    exportResult_.reset();
     requested_.clear();
+    failedWidth_.clear();
+    previewWidth_.clear();
+    failedPreview_.clear();
+    adjacentPreviewQueued_.clear();
+    focusPage_ = -1;
+    scrollDirection_ = 1;
+    thumbnailFirst_ = thumbnailLast_ = -1;
+    worker_->setThumbnailRange(-1, -1);
     text_.clear();
     textRequested_.clear();
     uiGlyphs_.clear();
+    annotations_.clear();
+    requestedAnnotations_.clear();
     bytes_ = 0;
     stats_ = CacheStats{};
     pageCount_ = 0;
     error_.clear();
-    static std::uint64_t s_salt = 0;
+    static std::atomic<std::uint64_t> s_salt{0};
     salt_ = ++s_salt;
     staleKeys_.clear();
 
-    std::ifstream in(path, std::ios::binary);
-    if (!in) {
-        error_ = "cannot open " + path;
-        return false;
-    }
-    in.seekg(0, std::ios::end);
-    const auto len = static_cast<std::size_t>(in.tellg());
-    in.seekg(0, std::ios::beg);
-    std::vector<std::byte> fileBytes(len);
-    in.read(reinterpret_cast<char*>(fileBytes.data()),
-            static_cast<std::streamsize>(len));
-    if (!in && in.gcount() != static_cast<std::streamsize>(len)) {
-        error_ = "short read";
-        return false;
-    }
-    if (fileBytes.empty()) {
-        error_ = "empty file";
-        return false;
-    }
-
+    // An OS-backed mapping exposes PDFium's random-access file API without
+    // privately allocating the entire PDF on every open. Large PDFs fault
+    // only the ranges touched by parsing and the visible pages.
     std::string err;
-    if (!worker_->open(std::move(fileBytes), &err)) {
-        error_ = err.empty() ? "PDFium refused the file" : err;
+    if (!worker_->openFile(path, &err)) {
+        error_ = err.empty() ? "PDFium refused or could not map " + path : err;
         return false;
     }
 
     pageCount_ = worker_->pageCount();
     outline_.clear();
+    lastOutlineRevision_ = worker_->outlineRevision();
+    lastGeometryRevision_ = worker_->geometryRevision();
     for (const auto& b : worker_->outline())
         outline_.push_back(OutlineEntry{b.title, b.page, b.depth});
     path_ = path;
@@ -90,18 +97,110 @@ std::string PdfiumPageSource::describe() const {
     return slash == std::string::npos ? path_ : path_.substr(slash + 1);
 }
 
-bool PdfiumPageSource::tick() {
-    auto results = worker_->drain();
-    if (results.empty()) return false;
+const std::vector<PdfAnnotationInfo>* PdfiumPageSource::annotationsForPage(int page) {
+    if (page < 0 || page >= pageCount_) return nullptr;
+    if (auto it = annotations_.find(page); it != annotations_.end())
+        return &it->second;
+    if (requestedAnnotations_.insert(page).second)
+        worker_->requestAnnotations(page);
+    return nullptr;
+}
 
+void PdfiumPageSource::suppressSourceAnnotations(PdfiumWorker::Suppressed indices) {
+    worker_->setSuppressed(std::move(indices));
+    suspendVisualCaches();
+    annotations_.clear();
+    // Old GPU tile keys were collected by suspendVisualCaches(). A fresh
+    // worker revision will produce a correct PDF base under Folio overlays.
+}
+
+bool PdfiumPageSource::requestExport(std::vector<AnnotSpec> marks,
+                                     std::string output) {
+    if (!isOpen() || exportResult_) return false;
+    return worker_->requestExport(path_, std::move(output), std::move(marks));
+}
+
+std::optional<PdfiumWorker::Result> PdfiumPageSource::takeExportResult() {
+    auto result = std::move(exportResult_);
+    exportResult_.reset();
+    return result;
+}
+
+bool PdfiumPageSource::tick() {
     bool changed = false;
+    if (lastGeometryRevision_ != worker_->geometryRevision()) {
+        lastGeometryRevision_ = worker_->geometryRevision();
+        changed = true;
+    }
+    const auto revision = worker_->outlineRevision();
+    if (revision != lastOutlineRevision_) {
+        outline_.clear();
+        for (const auto& b : worker_->outline())
+            outline_.push_back(OutlineEntry{b.title, b.page, b.depth});
+        lastOutlineRevision_ = revision;
+        changed = true;
+    }
+    auto results = worker_->drain();
+    if (results.empty()) return changed;
     for (auto& r : results) {
+        if (r.kind == PdfiumWorker::Kind::Export) {
+            exportResult_ = std::move(r);
+            changed = true;
+            continue;
+        }
+        if (r.kind == PdfiumWorker::Kind::Annotations) {
+            if (!requestedAnnotations_.count(r.page)) continue;
+            requestedAnnotations_.erase(r.page);
+            annotations_[r.page] = std::move(r.annotations);
+            changed = true;
+            continue;
+        }
         if (r.kind == PdfiumWorker::Kind::Text) {
+            if (!textRequested_.count(r.page)) continue; // cancelled tab
             text_[r.page] = std::move(r.text);
             changed = true;
             continue;
         }
-        if (!r.tile) continue;
+        if (r.kind == PdfiumWorker::Kind::Tile) {
+            const TileId id{r.page, r.requestedWidth, r.spec.tx, r.spec.ty};
+            if (!requestedTiles_.count(tileRequestKey(id)) || !r.tile) continue;
+            VisibleTile entry;
+            entry.rect = r.spec.rect;
+            entry.lastUsed = ++clock_;
+            entry.pixels = std::move(r.tile);
+            auto& slot = tileCache_[id];
+            if (slot.pixels) {
+                tileBytes_ -= slot.pixels->pixels.size();
+                staleKeys_.push_back(tileImageKey(id));
+            }
+            tileBytes_ += entry.pixels->pixels.size();
+            slot = std::move(entry);
+            changed = true;
+            continue;
+        }
+        // Results from a suspended tab have no live request marker.
+        if (!requested_.count(key(r.page, r.requestedWidth))) continue;
+        if (focusPage_ >= 0 && std::abs(r.page - focusPage_) > 2 &&
+            !visibleThumbnail(r.page, r.requestedWidth)) {
+            requested_.erase(key(r.page, r.requestedWidth));
+            continue; // neither the canvas nor the Pages panel wants it
+        }
+        if (!r.tile) {
+            const auto preview = previewWidth_.find(r.page);
+            const bool wasPreview = preview != previewWidth_.end() &&
+                                    preview->second == r.requestedWidth;
+            if (wasPreview)
+                failedPreview_.insert(r.page); // don't spin on an unrenderable preview
+            // A failed high-resolution render must not leave a permanent
+            // white page. Try again at half resolution on the next frame.
+            const bool stillWanted =
+                requested_.erase(key(r.page, r.requestedWidth)) != 0;
+            if (stillWanted && r.requestedWidth > 256 && !wasPreview) {
+                failedWidth_[r.page] = r.requestedWidth;
+                changed = true;
+            }
+            continue;
+        }
         const std::size_t sz = r.tile->pixels.size();
         Rendered entry;
         entry.pxW = r.pxW;
@@ -109,25 +208,66 @@ bool PdfiumPageSource::tick() {
         entry.lastUsed = ++clock_;
         entry.tile = std::move(r.tile);
 
-        const auto k = key(r.page, r.pxW);
+        const auto k = key(r.page, r.requestedWidth);
         if (auto it = cache_.find(k); it != cache_.end()) {
             bytes_ -= it->second.tile ? it->second.tile->pixels.size() : 0;
-            staleKeys_.push_back(imageKey(r.page, r.pxW));
+            staleKeys_.push_back(imageKey(r.page, r.requestedWidth));
         }
         cache_[k] = std::move(entry);
         bytes_ += sz;
         changed = true;
     }
     evictTo(kByteBudget);
-    stats_.pages = cache_.size();
-    stats_.bytes = bytes_;
+    evictTilesTo(kByteBudget);
+    stats_.pages = cache_.size() + tileCache_.size();
+    stats_.bytes = bytes_ + tileBytes_;
     return changed;
 }
 
-bool PdfiumPageSource::pending() const { return worker_->busy(); }
+bool PdfiumPageSource::pending() const { return worker_->hasResults(); }
 
 void PdfiumPageSource::setFocusPage(int page) {
-    if (page >= 0 && page < pageCount_) worker_->setFocusPage(page);
+    if (page < 0 || page >= pageCount_ || page == focusPage_) return;
+    if (focusPage_ >= 0)
+        scrollDirection_ = page > focusPage_ ? 1 : -1;
+    focusPage_ = page;
+    for (auto it = adjacentPreviewQueued_.begin(); it != adjacentPreviewQueued_.end();)
+        it = std::abs(*it - page) > 2 ? adjacentPreviewQueued_.erase(it)
+                                         : std::next(it);
+    worker_->setFocusPage(page);
+    for (int p = std::max(0, page - 1); p <= page + 1 && p < pageCount_; ++p)
+        worker_->requestMeta(p);
+    // Discard superseded work as well as its markers: otherwise returning
+    // to a page can find an old marker for a job that was never rendered.
+    worker_->dropQueuedOutside(page, 2);
+    for (auto it = requested_.begin(); it != requested_.end();) {
+        const int p = static_cast<int>(*it >> 32);
+        const int width = static_cast<int>(*it & 0xFFFFFFFFu);
+        it = std::abs(p - page) > 2 && !visibleThumbnail(p, width)
+            ? requested_.erase(it) : std::next(it);
+    }
+    trimTo(page, 2);
+    for (auto it = previewWidth_.begin(); it != previewWidth_.end();)
+        it = std::abs(it->first - page) > 2 ? previewWidth_.erase(it) : std::next(it);
+    for (auto it = failedPreview_.begin(); it != failedPreview_.end();)
+        it = std::abs(*it - page) > 2 ? failedPreview_.erase(it) : std::next(it);
+}
+
+void PdfiumPageSource::setVisibleThumbnailRange(int first, int last) {
+    if (first == thumbnailFirst_ && last == thumbnailLast_) return;
+    thumbnailFirst_ = first;
+    thumbnailLast_ = last;
+    worker_->setThumbnailRange(first, last);
+    // Scrolling the sidebar does not change canvas focus. Cancel markers for
+    // thumbnails that have left the panel; keep the new range so arrivals
+    // don't get thrown away simply because they are far from the PDF page.
+    for (auto it = requested_.begin(); it != requested_.end();) {
+        const int p = static_cast<int>(*it >> 32);
+        const int width = static_cast<int>(*it & 0xFFFFFFFFu);
+        it = std::abs(p - focusPage_) > 2 && width <= 256 &&
+             !visibleThumbnail(p, width) ? requested_.erase(it) : std::next(it);
+    }
+    if (focusPage_ >= 0) trimTo(focusPage_, 2);
 }
 
 std::shared_ptr<const PageText> PdfiumPageSource::pageText(int index) {
@@ -157,6 +297,13 @@ void PdfiumPageSource::requestAllText() {
         textRequested_[i] = true;
         worker_->requestText(i);
     }
+}
+
+void PdfiumPageSource::releaseText(int page) {
+    if (std::abs(page - focusPage_) <= 2) return;
+    text_.erase(page);
+    textRequested_.erase(page);
+    uiGlyphs_.erase(page);
 }
 
 void PdfiumPageSource::drawPage(IPaintTarget& t, int index, const Rect& dest,
@@ -191,11 +338,15 @@ void PdfiumPageSource::drawPage(IPaintTarget& t, int index, const Rect& dest,
     if (longPt * eff > kMaxLongEdge)
         eff = static_cast<float>(kMaxLongEdge / std::max(1.0, longPt));
 
+    if (auto fail = failedWidth_.find(index); fail != failedWidth_.end() &&
+        m.widthPt * eff >= fail->second && fail->second > 256)
+        eff = std::min(eff, static_cast<float>(fail->second * 0.5 / std::max(1.0, m.widthPt)));
     const int pxW = std::max(1, static_cast<int>(std::lround(m.widthPt * eff)));
 
     // 1. exact size - the normal path.
     if (auto it = cache_.find(key(index, pxW)); it != cache_.end() && it->second.tile) {
         it->second.lastUsed = ++clock_;
+        it->second.lastFrame = frame_;
         ++stats_.hits;
         const auto& tile = *it->second.tile;
         t.drawImageBGRA(tile.pixels.data(), tile.width, tile.height, tile.stride,
@@ -205,10 +356,15 @@ void PdfiumPageSource::drawPage(IPaintTarget& t, int index, const Rect& dest,
     }
 
     ++stats_.misses;
-    if (requested_[index] != pxW) {
-        requested_[index] = pxW;
-        worker_->requestRender(index, eff, kExtraRotation);
+    if (pxW >= 768) {
+        for (auto it = requested_.begin(); it != requested_.end();)
+            it = static_cast<int>(*it >> 32) == index &&
+                 static_cast<int>(*it & 0xFFFFFFFFu) >= 768 &&
+                 static_cast<int>(*it & 0xFFFFFFFFu) != pxW
+                ? requested_.erase(it) : std::next(it);
     }
+    if (requested_.insert(key(index, pxW)).second)
+        worker_->requestRender(index, eff, kExtraRotation, pxW);
 
     // 2. any other raster for this page, stretched. Keeps a zoom gesture
     //    continuous instead of flashing blank between scales.
@@ -224,10 +380,11 @@ void PdfiumPageSource::drawPage(IPaintTarget& t, int index, const Rect& dest,
     }
     if (best != cache_.end()) {
         best->second.lastUsed = ++clock_;
+        best->second.lastFrame = frame_;
         ++stats_.proxies;
         const auto& tile = *best->second.tile;
         t.drawImageBGRA(tile.pixels.data(), tile.width, tile.height, tile.stride,
-                        dest, imageKey(index, best->second.pxW),
+                        dest, imageKey(index, static_cast<int>(best->first & 0xFFFFFFFFu)),
                         IPaintTarget::ImageFit::Transient, tint);
         return;
     }
@@ -236,31 +393,430 @@ void PdfiumPageSource::drawPage(IPaintTarget& t, int index, const Rect& dest,
     t.fillRect(dest, folio::render::Color{0xFF, 0xFF, 0xFF, 0xFF});
 }
 
+void PdfiumPageSource::beginVisibleFrame() {
+    // ReaderScreen begins its frame before PageStage::onPaint calls tick().
+    // Install completions against the *previous* frame's wanted set first;
+    // clearing markers earlier would discard every finished visible tile.
+    tick();
+    ++frame_;
+    nextRequestedTiles_.clear();
+    // Do not clear the queue here: scrolling animations can repaint at 45 Hz
+    // while a visible tile is still waiting. Keep identical jobs intact and
+    // cancel only those the completed frame no longer needs.
+}
+
+void PdfiumPageSource::endVisibleFrame() {
+    // Stage.tick() may run between beginVisibleFrame and this point. Keep
+    // the previous set alive until its last possible completion is drained.
+    worker_->retainQueuedTiles(nextRequestedTiles_);
+    requestedTiles_ = std::move(nextRequestedTiles_);
+    nextRequestedTiles_.clear();
+    if (focusPage_ < 0) return;
+    // Tab switches and first opens prioritize the actual visible page.
+    // After its first pixels, queue only tiny proxies: one in each direction
+    // and a second page ahead in the direction of scrolling. This bridges
+    // a fast fling without retaining an offscreen high-DPI tile grid.
+    const auto first = cache_.lower_bound(key(focusPage_, 0));
+    bool ready = first != cache_.end() &&
+                 static_cast<int>(first->first >> 32) == focusPage_;
+    if (!ready)
+        for (const auto& [id, tile] : tileCache_)
+            if (std::get<0>(id) == focusPage_) { ready = true; break; }
+    if (!ready) return;
+    for (int offset : {scrollDirection_, -scrollDirection_, 2 * scrollDirection_}) {
+        const int p = focusPage_ + offset;
+        if (p < 0 || p >= pageCount_ || adjacentPreviewQueued_.count(p)) continue;
+        auto cached = cache_.lower_bound(key(p, 0));
+        if (cached != cache_.end() && static_cast<int>(cached->first >> 32) == p)
+            continue;
+        const auto meta = worker_->pageMeta(p);
+        if (meta.widthPt <= 0 || meta.heightPt <= 0) continue;
+        const float scale = std::min(240.f / static_cast<float>(meta.widthPt),
+                                     320.f / static_cast<float>(meta.heightPt));
+        const int width = std::max(1, static_cast<int>(
+            std::lround(static_cast<float>(meta.widthPt) * scale)));
+        adjacentPreviewQueued_.insert(p);
+        if (requested_.insert(key(p, width)).second)
+            // Some pages still advertise provisional geometry. Recalculate
+            // the cap on the PDFium thread against this page's real size.
+            worker_->requestRender(p, scale, 0, width, true);
+    }
+}
+
+bool PdfiumPageSource::drawCachedRegion(IPaintTarget& t, int index,
+                                         const Rect& dest, const Rect& visible,
+                                         float scale, folio::ui::PageTheme theme) {
+    if (index < 0 || index >= pageCount_ || dest.empty() || visible.empty() ||
+        scale <= 0.f) return false;
+    const auto m = worker_->pageMeta(index);
+    if (m.widthPt <= 0 || m.heightPt <= 0) return false;
+    const core::TileGrid grid(static_cast<float>(m.widthPt),
+                              static_cast<float>(m.heightPt), scale, 0);
+    if (grid.deviceWidth() <= 0 || grid.deviceHeight() <= 0) return false;
+    const int x0 = std::clamp(static_cast<int>(std::floor(
+        (visible.x - dest.x) * grid.deviceWidth() / dest.w)), 0, grid.deviceWidth());
+    const int y0 = std::clamp(static_cast<int>(std::floor(
+        (visible.y - dest.y) * grid.deviceHeight() / dest.h)), 0, grid.deviceHeight());
+    const int x1 = std::clamp(static_cast<int>(std::ceil(
+        (visible.right() - dest.x) * grid.deviceWidth() / dest.w)), 0, grid.deviceWidth());
+    const int y1 = std::clamp(static_cast<int>(std::ceil(
+        (visible.bottom() - dest.y) * grid.deviceHeight() / dest.h)), 0, grid.deviceHeight());
+    if (x1 <= x0 || y1 <= y0) return false;
+    const auto specs = grid.tilesForViewport(core::DeviceRect{x0, y0, x1 - x0, y1 - y0});
+    auto proxy = cache_.end();
+    for (auto it = cache_.lower_bound(key(index, 0));
+         it != cache_.end() && static_cast<int>(it->first >> 32) == index; ++it)
+        if (it->second.tile && (proxy == cache_.end() || it->second.pxW > proxy->second.pxW))
+            proxy = it;
+    // Exactly one old-scale generation, only when no full-page proxy exists.
+    int oldWidth = -1, bestDelta = 0;
+    if (proxy == cache_.end()) {
+        for (const auto& [id, tile] : tileCache_) {
+            if (std::get<0>(id) != index || !tile.pixels ||
+                std::get<1>(id) == grid.deviceWidth()) continue;
+            const int d = std::abs(std::get<1>(id) - grid.deviceWidth());
+            if (oldWidth < 0 || d < bestDelta) {
+                oldWidth = std::get<1>(id);
+                bestDelta = d;
+            }
+        }
+    }
+    bool hasPixels = proxy != cache_.end();
+    for (const auto& spec : specs)
+        hasPixels = hasPixels || tileCache_.count(
+            TileId{index, grid.deviceWidth(), spec.tx, spec.ty}) != 0;
+    if (!hasPixels && oldWidth > 0) {
+        for (const auto& [id, tile] : tileCache_) {
+            if (std::get<0>(id) != index || std::get<1>(id) != oldWidth ||
+                !tile.pixels) continue;
+            const core::TileGrid oldGrid(static_cast<float>(m.widthPt),
+                static_cast<float>(m.heightPt),
+                static_cast<float>(oldWidth) / static_cast<float>(m.widthPt), 0);
+            const Rect r{dest.x + tile.rect.x * dest.w / oldGrid.deviceWidth(),
+                         dest.y + tile.rect.y * dest.h / oldGrid.deviceHeight(),
+                         tile.rect.w * dest.w / oldGrid.deviceWidth(),
+                         tile.rect.h * dest.h / oldGrid.deviceHeight()};
+            if (r.x < visible.right() && r.right() > visible.x &&
+                r.y < visible.bottom() && r.bottom() > visible.y) {
+                hasPixels = true; break;
+            }
+        }
+    }
+    if (!hasPixels) return false;
+    // Cached blits only. Do NOT touch requestedTiles_, the worker, viewport
+    // scheduling, image invalidation or cache lifetime from pointer moves.
+    const auto tint = theme == folio::ui::PageTheme::Sepia ? IPaintTarget::ImageTint::Sepia
+                    : theme == folio::ui::PageTheme::Dark ? IPaintTarget::ImageTint::Invert
+                    : IPaintTarget::ImageTint::None;
+    const auto paper = theme == folio::ui::PageTheme::Dark
+        ? folio::render::Color{0, 0, 0, 255}
+        : theme == folio::ui::PageTheme::Sepia
+        ? folio::render::Color{241, 228, 200, 255}
+        : folio::render::Color{255, 255, 255, 255};
+    t.fillRect(visible, paper);
+    t.save();
+    t.clipRect(visible);
+    if (proxy != cache_.end()) {
+        const auto& pixels = *proxy->second.tile;
+        t.drawImageBGRA(pixels.pixels.data(), pixels.width, pixels.height, pixels.stride,
+                        dest, imageKey(index, proxy->second.pxW),
+                        IPaintTarget::ImageFit::Transient, tint);
+    } else if (oldWidth > 0) {
+        const core::TileGrid oldGrid(static_cast<float>(m.widthPt),
+            static_cast<float>(m.heightPt),
+            static_cast<float>(oldWidth) / static_cast<float>(m.widthPt), 0);
+        for (const auto& [id, tile] : tileCache_) {
+            if (std::get<0>(id) != index || std::get<1>(id) != oldWidth ||
+                !tile.pixels) continue;
+            const Rect r{dest.x + tile.rect.x * dest.w / oldGrid.deviceWidth(),
+                         dest.y + tile.rect.y * dest.h / oldGrid.deviceHeight(),
+                         tile.rect.w * dest.w / oldGrid.deviceWidth(),
+                         tile.rect.h * dest.h / oldGrid.deviceHeight()};
+            if (r.x >= visible.right() || r.right() <= visible.x ||
+                r.y >= visible.bottom() || r.bottom() <= visible.y) continue;
+            const auto& pixels = *tile.pixels;
+            t.drawImageBGRA(pixels.pixels.data(), pixels.width, pixels.height,
+                            pixels.stride, r, tileImageKey(id),
+                            IPaintTarget::ImageFit::Transient, tint);
+        }
+    }
+    for (const auto& spec : specs) {
+        const TileId id{index, grid.deviceWidth(), spec.tx, spec.ty};
+        if (auto it = tileCache_.find(id);
+            it != tileCache_.end() && it->second.pixels) {
+            const Rect r{dest.x + spec.rect.x * dest.w / grid.deviceWidth(),
+                         dest.y + spec.rect.y * dest.h / grid.deviceHeight(),
+                         spec.rect.w * dest.w / grid.deviceWidth(),
+                         spec.rect.h * dest.h / grid.deviceHeight()};
+            const auto& pixels = *it->second.pixels;
+            t.drawImageBGRA(pixels.pixels.data(), pixels.width, pixels.height,
+                            pixels.stride, r, tileImageKey(id),
+                            IPaintTarget::ImageFit::Final, tint);
+        }
+    }
+    t.restore();
+    return true;
+}
+
+void PdfiumPageSource::drawVisiblePage(IPaintTarget& t, int index, const Rect& dest,
+                                       const Rect& visible, float scale,
+                                       folio::ui::PageTheme theme) {
+    if (index < 0 || index >= pageCount_ || dest.empty() || visible.empty()) return;
+    if (!staleKeys_.empty()) {
+        for (auto k : staleKeys_) t.invalidateImage(k);
+        staleKeys_.clear();
+    }
+    const auto m = worker_->pageMeta(index);
+    if (m.widthPt <= 0 || m.heightPt <= 0 || scale <= 0) return;
+    // Pixel budget is the *viewport*, not a cap on the page dimensions.
+    // Scale is fixed for the full page so scrolling doesn't shift tile seams.
+    const core::TileGrid grid(static_cast<float>(m.widthPt),
+                              static_cast<float>(m.heightPt), scale, 0);
+    if (grid.deviceWidth() <= 0 || grid.deviceHeight() <= 0) return;
+    const auto mapX = [&](float x) { return (x - dest.x) * grid.deviceWidth() / dest.w; };
+    const auto mapY = [&](float y) { return (y - dest.y) * grid.deviceHeight() / dest.h; };
+    const int x0 = std::clamp(static_cast<int>(std::floor(mapX(visible.x))), 0, grid.deviceWidth());
+    const int y0 = std::clamp(static_cast<int>(std::floor(mapY(visible.y))), 0, grid.deviceHeight());
+    const int x1 = std::clamp(static_cast<int>(std::ceil(mapX(visible.right()))), 0, grid.deviceWidth());
+    const int y1 = std::clamp(static_cast<int>(std::ceil(mapY(visible.bottom()))), 0, grid.deviceHeight());
+    if (x1 <= x0 || y1 <= y0) return;
+    const auto tint = theme == folio::ui::PageTheme::Sepia ? IPaintTarget::ImageTint::Sepia
+                    : theme == folio::ui::PageTheme::Dark ? IPaintTarget::ImageTint::Invert
+                    : IPaintTarget::ImageTint::None;
+    t.fillRect(visible, folio::render::Color{255, 255, 255, 255});
+    t.save();
+    t.clipRect(visible);
+    const auto specs = grid.tilesForViewport(core::DeviceRect{x0, y0, x1 - x0, y1 - y0});
+    bool allExact = true;
+    for (const auto& spec : specs)
+        if (!tileCache_.count(TileId{index, grid.deviceWidth(), spec.tx, spec.ty})) {
+            allExact = false;
+            break;
+        }
+    // A small thumbnail is a cheap continuous proxy during zoom/scroll.
+    // It is never submitted as a full-size canvas render.
+    auto proxy = cache_.end();
+    for (auto it = cache_.lower_bound(key(index, 0));
+         it != cache_.end() && static_cast<int>(it->first >> 32) == index; ++it)
+        if (it->second.tile && (proxy == cache_.end() || it->second.pxW > proxy->second.pxW))
+            proxy = it;
+    if (!allExact && proxy == cache_.end() && !failedPreview_.count(index)) {
+        // First paint should show the whole page quickly, not a growing
+        // checkerboard of white 512px tiles. Keep this proxy bounded to
+        // <=512 x 768 device pixels (~1.5 MiB) even for very tall pages.
+        const float previewScale = std::min(512.f / static_cast<float>(m.widthPt),
+                                            768.f / static_cast<float>(m.heightPt));
+        const int previewW = std::max(1, static_cast<int>(
+            std::lround(static_cast<float>(m.widthPt) * previewScale)));
+        previewWidth_[index] = previewW;
+        if (requested_.insert(key(index, previewW)).second)
+            worker_->requestRender(index, previewScale, 0, previewW, true);
+    }
+    if (proxy != cache_.end()) {
+        proxy->second.lastUsed = ++clock_;
+        proxy->second.lastFrame = frame_;
+        const auto& pixels = *proxy->second.tile;
+        t.drawImageBGRA(pixels.pixels.data(), pixels.width, pixels.height, pixels.stride,
+                        dest, imageKey(index, static_cast<int>(proxy->first & 0xFFFFFFFFu)),
+                        IPaintTarget::ImageFit::Transient, tint);
+    }
+    // Centre-first only visible specs are submitted; no speculative prefetch.
+    if (!allExact) {
+        // During an animated zoom rasterScale is held steady; when it snaps
+        // to the final level, stretch the previous tiles instead of showing
+        // paper for every frame until the new tiles are ready. Draw only one
+        // old generation to bound extra image copies and GPU composites.
+        int oldWidth = -1;
+        int bestDelta = 0;
+        for (const auto& [id, tile] : tileCache_) {
+            if (std::get<0>(id) != index || std::get<1>(id) == grid.deviceWidth()) continue;
+            const int delta = std::abs(std::get<1>(id) - grid.deviceWidth());
+            if (oldWidth < 0 || delta < bestDelta) {
+                oldWidth = std::get<1>(id);
+                bestDelta = delta;
+            }
+        }
+        if (oldWidth > 0) {
+            const float oldScale = static_cast<float>(oldWidth) / static_cast<float>(m.widthPt);
+            const core::TileGrid oldGrid(static_cast<float>(m.widthPt),
+                                         static_cast<float>(m.heightPt), oldScale, 0);
+            for (auto& [id, tile] : tileCache_) {
+                if (std::get<0>(id) != index || std::get<1>(id) != oldWidth) continue;
+                const Rect r{dest.x + tile.rect.x * dest.w / oldGrid.deviceWidth(),
+                             dest.y + tile.rect.y * dest.h / oldGrid.deviceHeight(),
+                             tile.rect.w * dest.w / oldGrid.deviceWidth(),
+                             tile.rect.h * dest.h / oldGrid.deviceHeight()};
+                if (r.right() <= visible.x || r.x >= visible.right() ||
+                    r.bottom() <= visible.y || r.y >= visible.bottom()) continue;
+                tile.lastUsed = ++clock_;
+                tile.lastFrame = frame_;
+                const auto& pixels = *tile.pixels;
+                t.drawImageBGRA(pixels.pixels.data(), pixels.width, pixels.height,
+                                pixels.stride, r, tileImageKey(id),
+                                IPaintTarget::ImageFit::Transient, tint);
+            }
+        }
+    }
+    for (std::size_t order = 0; order < specs.size(); ++order) {
+        const auto& spec = specs[order];
+        const TileId id{index, grid.deviceWidth(), spec.tx, spec.ty};
+        const auto k = tileRequestKey(id);
+        nextRequestedTiles_.insert(k);
+        const Rect tileDest{dest.x + spec.rect.x * dest.w / grid.deviceWidth(),
+                            dest.y + spec.rect.y * dest.h / grid.deviceHeight(),
+                            spec.rect.w * dest.w / grid.deviceWidth(),
+                            spec.rect.h * dest.h / grid.deviceHeight()};
+        if (auto it = tileCache_.find(id); it != tileCache_.end() && it->second.pixels) {
+            it->second.lastUsed = ++clock_;
+            it->second.lastFrame = frame_;
+            ++stats_.hits;
+            const auto& pixels = *it->second.pixels;
+            t.drawImageBGRA(pixels.pixels.data(), pixels.width, pixels.height, pixels.stride,
+                            tileDest, tileImageKey(id), IPaintTarget::ImageFit::Final, tint);
+        } else {
+            ++stats_.misses;
+            worker_->requestTile(index, scale, grid.deviceWidth(), spec,
+                                 static_cast<int>(order));
+        }
+    }
+    t.restore();
+}
+
+void PdfiumPageSource::evictTilesTo(std::size_t budget) {
+    while (tileBytes_ + bytes_ > budget && !tileCache_.empty()) {
+        auto oldest = tileCache_.end();
+        for (auto it = tileCache_.begin(); it != tileCache_.end(); ++it) {
+            const auto k = tileRequestKey(it->first);
+            // Keep the last presented viewport *and* the one currently being
+            // painted. A soft-budget overrun for visible tiles is preferable
+            // to evicting the first tile as the last tile arrives, which
+            // otherwise leaves a permanent checkerboard at large DPR/zoom.
+            if (it->second.lastFrame == frame_ || requestedTiles_.count(k) ||
+                nextRequestedTiles_.count(k)) continue;
+            if (oldest == tileCache_.end() || it->second.lastUsed < oldest->second.lastUsed)
+                oldest = it;
+        }
+        if (oldest == tileCache_.end()) break;
+        tileBytes_ -= oldest->second.pixels->pixels.size();
+        staleKeys_.push_back(tileImageKey(oldest->first));
+        tileCache_.erase(oldest);
+    }
+}
+
+void PdfiumPageSource::trimIdle() {
+    // A one-shot pass, not a periodic wakeup. The last completed paint is
+    // already in the retained surface; its source pixels remain available.
+    for (auto it = tileCache_.begin(); it != tileCache_.end();) {
+        if (it->second.lastFrame == frame_) { ++it; continue; }
+        tileBytes_ -= it->second.pixels->pixels.size();
+        staleKeys_.push_back(tileImageKey(it->first));
+        it = tileCache_.erase(it);
+    }
+    for (auto it = cache_.begin(); it != cache_.end();) {
+        const int p = static_cast<int>(it->first >> 32);
+        const bool tinyNeighbour = focusPage_ >= 0 &&
+            adjacentPreviewQueued_.count(p) && std::abs(p - focusPage_) <= 2 &&
+            it->second.pxW <= 240 && it->second.pxH <= 320;
+        if (it->second.lastFrame == frame_ || tinyNeighbour) { ++it; continue; }
+        bytes_ -= it->second.tile->pixels.size();
+        staleKeys_.push_back(imageKey(static_cast<int>(it->first >> 32),
+                                      static_cast<int>(it->first & 0xFFFFFFFFu)));
+        requested_.erase(it->first);
+        adjacentPreviewQueued_.erase(p);
+        it = cache_.erase(it);
+    }
+    for (auto it = text_.begin(); it != text_.end();) {
+        if (std::abs(it->first - focusPage_) <= 1) { ++it; continue; }
+        uiGlyphs_.erase(it->first);
+        textRequested_.erase(it->first);
+        it = text_.erase(it);
+    }
+    stats_.pages = cache_.size() + tileCache_.size();
+    stats_.bytes = bytes_ + tileBytes_;
+}
+
+void PdfiumPageSource::suspendVisualCaches() {
+    worker_->suspendVisualWork();
+    for (const auto& [k, v] : tileCache_) staleKeys_.push_back(tileImageKey(k));
+    for (const auto& [k, v] : cache_)
+        staleKeys_.push_back(imageKey(static_cast<int>(k >> 32), static_cast<int>(k & 0xFFFFFFFFu)));
+    tileCache_.clear();
+    cache_.clear();
+    tileBytes_ = bytes_ = 0;
+    requestedTiles_.clear();
+    nextRequestedTiles_.clear();
+    requested_.clear();
+    previewWidth_.clear();
+    failedPreview_.clear();
+    adjacentPreviewQueued_.clear();
+    text_.clear();
+    textRequested_.clear();
+    uiGlyphs_.clear();
+    requestedAnnotations_.clear();
+    stats_.pages = stats_.bytes = 0;
+}
+
 void PdfiumPageSource::evictTo(std::size_t budget) {
     while (bytes_ > budget && cache_.size() > 1) {
-        auto oldest = cache_.begin();
-        for (auto it = std::next(cache_.begin()); it != cache_.end(); ++it)
-            if (it->second.lastUsed < oldest->second.lastUsed) oldest = it;
+        // Keep at least one raster for each visible/adjacent page. At 4K a
+        // single page can nearly fill the soft budget: evicting the other
+        // visible page then makes every zoom/hover frame request it again,
+        // alternately drawing blank paper and thrashing PDFium/GPU memory.
+        auto oldest = cache_.end();
+        for (auto it = cache_.begin(); it != cache_.end(); ++it) {
+            const int p = static_cast<int>(it->first >> 32);
+            const bool nearby = focusPage_ >= 0 && std::abs(p - focusPage_) <= 1;
+            const auto next = std::next(it);
+            const bool lastForPage =
+                (it == cache_.begin() || static_cast<int>(std::prev(it)->first >> 32) != p) &&
+                (next == cache_.end() || static_cast<int>(next->first >> 32) != p);
+            if ((nearby || visibleThumbnail(p,
+                    static_cast<int>(it->first & 0xFFFFFFFFu))) && lastForPage) continue;
+            if (oldest == cache_.end() || it->second.lastUsed < oldest->second.lastUsed)
+                oldest = it;
+        }
+        if (oldest == cache_.end()) break; // temporary over-budget beats blinking
+        const int p = static_cast<int>(oldest->first >> 32);
         bytes_ -= oldest->second.tile ? oldest->second.tile->pixels.size() : 0;
-        staleKeys_.push_back(imageKey(static_cast<int>(oldest->first >> 32),
-                                      oldest->second.pxW));
+        staleKeys_.push_back(imageKey(p, static_cast<int>(oldest->first & 0xFFFFFFFFu)));
+        requested_.erase(oldest->first); // a revisited width must queue a render
         cache_.erase(oldest);
+        adjacentPreviewQueued_.erase(p); // no stale marker after eviction
     }
 }
 
 void PdfiumPageSource::trimTo(int page, int radius) {
+    for (auto it = tileCache_.begin(); it != tileCache_.end();) {
+        if (std::abs(std::get<0>(it->first) - page) <= radius) { ++it; continue; }
+        tileBytes_ -= it->second.pixels->pixels.size();
+        staleKeys_.push_back(tileImageKey(it->first));
+        it = tileCache_.erase(it);
+    }
     for (auto it = cache_.begin(); it != cache_.end();) {
         const int p = static_cast<int>(it->first >> 32);
-        if (std::abs(p - page) > radius) {
+        const int width = static_cast<int>(it->first & 0xFFFFFFFFu);
+        if (std::abs(p - page) > radius && !visibleThumbnail(p, width)) {
             bytes_ -= it->second.tile ? it->second.tile->pixels.size() : 0;
-            staleKeys_.push_back(imageKey(p, it->second.pxW));
+            staleKeys_.push_back(imageKey(p, width));
+            requested_.erase(it->first);
+            failedWidth_.erase(p);
             it = cache_.erase(it);
         } else {
             ++it;
         }
     }
-    stats_.pages = cache_.size();
-    stats_.bytes = bytes_;
+    for (auto it = uiGlyphs_.begin(); it != uiGlyphs_.end();)
+        it = std::abs(it->first - page) > radius ? uiGlyphs_.erase(it) : std::next(it);
+    for (auto it = text_.begin(); it != text_.end();) {
+        if (std::abs(it->first - page) > radius) {
+            textRequested_.erase(it->first);
+            it = text_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    stats_.pages = cache_.size() + tileCache_.size();
+    stats_.bytes = bytes_ + tileBytes_;
 }
 
 }  // namespace folio::engine

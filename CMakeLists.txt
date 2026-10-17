@@ -41,6 +41,15 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+if(ANDROID)
+    # Gradle can limit its workers but externalNativeBuild runs Ninja itself.
+    # Several simultaneous Clang/Skia translations exceed a 2 GiB builder;
+    # job pools keep native peak memory bounded without penalising desktop.
+    set_property(GLOBAL PROPERTY JOB_POOLS folio_compile=1 folio_link=1)
+    set(CMAKE_JOB_POOL_COMPILE folio_compile)
+    set(CMAKE_JOB_POOL_LINK folio_link)
+endif()
+
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
 
 find_package(Threads REQUIRED)
@@ -48,6 +57,20 @@ find_package(Threads REQUIRED)
 include(FolioOptions)
 include(FolioDependencies)
 include(FolioCoreGuard)
+
+# A Windows "successful" build without the reader or renderer is not a
+# deliverable. Other platforms retain the headless core-only fallback.
+if(WIN32 AND FOLIO_WITH_PODOFO AND NOT FOLIO_HAVE_PODOFO)
+    message(FATAL_ERROR
+        "PoDoFo was requested but no compatible library was found; "
+        "install with vcpkg or use -DFOLIO_WITH_PODOFO=OFF")
+endif()
+
+if(WIN32 AND FOLIO_BUILD_UI AND (NOT FOLIO_HAVE_PDFIUM OR NOT FOLIO_HAVE_SKIA))
+    message(FATAL_ERROR
+        "Windows UI requires both PDFium and Skia prebuilts; run "
+        "tools/bootstrap-deps.ps1 and check FOLIO_DEPS_DIR")
+endif()
 
 # ---------------------------------------------------------------------------
 # folio-core : portable C++20. No Qt, no Skia, no platform headers. Unit
@@ -89,11 +112,18 @@ if(FOLIO_HAVE_PDFIUM)
         folio-engine/pdfium/PdfiumLibrary.cpp     # WP B2
         folio-engine/pdfium/PdfiumRasterizer.cpp  # WP B3 / B4
         folio-engine/pdfium/PdfiumWorker.cpp     # async render + text thread
+        folio-engine/pdfium/PdfiumAnnotationWriter.cpp
     )
     # PDFium is PUBLIC because PdfiumRasterizer.h includes <fpdfview.h> for
     # FPDF_DOCUMENT. That is deliberate: hiding it behind a pimpl would cost
     # an indirection on the hottest path in the application to protect a
     # boundary that folio-core already protects properly.
+    if(FOLIO_HAVE_SKIA)
+        target_sources(folio-engine-pdfium PRIVATE folio-engine/pdfium/PdfiumOutlinedText.cpp)
+        target_include_directories(folio-engine-pdfium PRIVATE "${FOLIO_DEPS_DIR}/skia${_folio_dep_suffix}/third_party/externals/harfbuzz/src")
+        target_link_libraries(folio-engine-pdfium PRIVATE Skia::Skia)
+        target_compile_definitions(folio-engine-pdfium PRIVATE FOLIO_SHAPED_PDF_TEXT=1)
+    endif()
     target_include_directories(folio-engine-pdfium PUBLIC folio-engine)
     target_link_libraries(folio-engine-pdfium PUBLIC folio-core PDFium::PDFium)
     folio_enable_warnings(folio-engine-pdfium)

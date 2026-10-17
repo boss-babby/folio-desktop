@@ -67,6 +67,7 @@ add_library(Folio::UiCore ALIAS folio-ui-core)
 # ---------------------------------------------------------------------------
 add_library(folio-ui-app STATIC
     screens/WelcomeScreen.cpp
+    screens/RecentCovers.cpp
     screens/ReaderScreen.cpp
     screens/AppState.cpp
     screens/FolioApp.cpp
@@ -136,10 +137,16 @@ endif()
 # so the cross-platform claim is tested rather than asserted.
 # ---------------------------------------------------------------------------
 if(TARGET folio-render-skia)
-    add_executable(folio-desktop
-        shell/NativeShell.cpp
-        shell/main_native.cpp
-    )
+    # A Windows GUI binary must use the WINDOWS subsystem. A console-subsystem
+    # build creates a second CMD window that stays open for the app's lifetime.
+    if(WIN32)
+        add_executable(folio-desktop WIN32
+            shell/NativeShell.cpp shell/main_native.cpp)
+        target_compile_definitions(folio-desktop PRIVATE UNICODE _UNICODE)
+    else()
+        add_executable(folio-desktop
+            shell/NativeShell.cpp shell/main_native.cpp)
+    endif()
     target_link_libraries(folio-desktop PRIVATE
         folio-ui-app folio-render-skia folio-platform)
     folio_enable_warnings(folio-desktop)
@@ -182,5 +189,10 @@ if(ANDROID AND TARGET folio-render-skia)
     # Belt and braces: even compiled in, --gc-sections can take an export
     # that nothing references from inside the library.
     target_link_options(folio-android PRIVATE
-        "LINKER:--undefined=ANativeActivity_onCreate")
+        "LINKER:--undefined=ANativeActivity_onCreate"
+        "LINKER:--undefined=Java_ai_folio_reader_FolioActivity_nativeOnPdfResult"
+        "LINKER:--undefined=Java_ai_folio_reader_FolioActivity_nativeValidatePdfFd"
+        "LINKER:--undefined=Java_ai_folio_reader_FolioActivity_nativeOnStorageResult"
+        "LINKER:--undefined=Java_ai_folio_reader_FolioActivity_nativeOnText"
+        "LINKER:--undefined=Java_ai_folio_reader_FolioActivity_nativeOnBackspace")
 endif()

@@ -89,7 +89,9 @@ struct Event {
         None,
         Close,          ///< the user asked the window to go away
         Resize,         ///< `w`/`h` are new pixel dimensions
+        Minimized,      ///< free the retained scene and all visual caches
         ScaleChange,    ///< `scale` changed (moved to a different monitor)
+        SafeArea,       ///< Android: top inset still covering the native surface, in `h` pixels
         Expose,         ///< the compositor wants a frame
         PointerDown,
         PointerUp,
@@ -100,6 +102,9 @@ struct Event {
         KeyDown,
         KeyUp,
         Text,           ///< composed input, UTF-8, in `text`
+        FileOpened,     ///< Android SAF import finished; local path in `text`
+        FileExported,   ///< Android SAF result: status in `w`, error in `text`
+        StorageChanged, ///< Android source/copy operation: status in `w`, message in `text`
         FocusIn,
         FocusOut,
     };
@@ -117,6 +122,9 @@ struct Event {
     // so a single-pointer backend needs to set none of this.
     PointerSource source = PointerSource::Mouse;
     std::uint32_t pointerId = 0;
+    // OS sample time in monotonic seconds (Android MotionEvent history).
+    // Zero means the backend has no timestamp; the shell uses receive time.
+    double inputTimeSeconds = 0.0;
     float pressure = 0.f;            ///< 0..1, pen only; 0 when unsupported
     float tiltX = 0.f, tiltY = 0.f;  ///< degrees from vertical, pen only
 
@@ -322,6 +330,18 @@ IFileDialog& fileDialog();
 /// here would create a distinct folio::platform::android_app that silently
 /// fails to match the real one.
 void setAndroidApp(::android_app* app) noexcept;
+/// The document picker is asynchronous so NativeActivity can keep pumping
+/// lifecycle events while the system picker is in front of it.
+bool requestAndroidPdfPicker();
+bool requestAndroidPdfExport(const std::string& staged, const std::string& name);
+bool requestAndroidPdfShare(const std::string& staged, const std::string& name);
+int openAndroidLinkedPdfFd(const std::string& stablePath);
+bool requestAndroidStorageAction(const std::string& stablePath, int action);
+bool androidPrefersSourceOnly();
+void setAndroidPrefersSourceOnly(bool enabled);
+void showAndroidKeyboard(bool visible);
+void setAndroidSystemBarsDark(bool dark);
+void setAndroidSystemBarsColor(int argb, bool darkIcons);
 #endif
 
 }  // namespace folio::platform

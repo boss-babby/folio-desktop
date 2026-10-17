@@ -41,6 +41,7 @@ public:
     /// Arm the 380 ms hover delay. Re-arming for the same owner is a no-op.
     void requestTooltip(Widget* owner, std::string text, double now);
     void cancelTooltip(const Widget* owner);
+    void dismissTooltip();
 
     // --- toast -------------------------------------------------------------
     void showToast(std::string text, double now);
@@ -95,6 +96,7 @@ public:
     /// and flips above if it would leave the window.
     void open(Point anchorWindow, double now);
     void close(double now);
+    void constrainToWindow();
     [[nodiscard]] bool isOpen() const noexcept { return open_; }
 
     /// Content area the caller should lay children out within.

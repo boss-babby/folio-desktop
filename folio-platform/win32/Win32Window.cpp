@@ -37,6 +37,11 @@
 #define _UNICODE
 #endif
 
+// Windows 8+ unified pointer messages are required for real touchscreen and
+// pen input; relying on synthesized WM_LBUTTON loses hold, pinch and IDs.
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0A00
+#endif
 #include <windows.h>
 #include <windowsx.h>
 #include <shobjidl.h>
@@ -49,6 +54,7 @@
 #include <deque>
 #include <string>
 #include <vector>
+#include <unordered_set>
 
 #include "folio/platform/Platform.h"
 
@@ -328,6 +334,7 @@ private:
     float scale_ = 1.f;
     bool close_ = false;
     bool tracking_ = false;
+    std::unordered_set<UINT32> activePointers_;
     HCURSOR cursor_ = nullptr;
 };
 
@@ -406,6 +413,12 @@ LRESULT Win32Window::wndProc(UINT msg, WPARAM wp, LPARAM lp) {
         }
 
         case WM_SIZE: {
+            if (wp == SIZE_MINIMIZED) {
+                Event e;
+                e.type = Event::Type::Minimized;
+                push(e);
+                return 0;
+            }
             w_ = LOWORD(lp);
             h_ = HIWORD(lp);
             Event e;
@@ -442,7 +455,56 @@ LRESULT Win32Window::wndProc(UINT msg, WPARAM wp, LPARAM lp) {
             }
             break;
 
+        case WM_POINTERDOWN: case WM_POINTERUPDATE: case WM_POINTERUP:
+        case WM_POINTERCAPTURECHANGED: {
+            const UINT32 id = GET_POINTERID_WPARAM(wp);
+            if (msg == WM_POINTERCAPTURECHANGED) {
+                if (activePointers_.erase(id)) {
+                    Event cancel;
+                    cancel.type = Event::Type::PointerCancel;
+                    cancel.source = PointerSource::Touch;
+                    cancel.pointerId = id;
+                    push(cancel);
+                }
+                return 0;
+            }
+            POINTER_INFO info{};
+            if (!GetPointerInfo(id, &info) ||
+                (info.pointerType != PT_TOUCH && info.pointerType != PT_PEN))
+                break;
+            if (msg == WM_POINTERDOWN) activePointers_.insert(id);
+            if (msg == WM_POINTERUP && !activePointers_.erase(id)) return 0;
+            POINT pt = info.ptPixelLocation;
+            ScreenToClient(hwnd_, &pt);
+            Event e;
+            e.type = msg == WM_POINTERDOWN ? Event::Type::PointerDown
+                   : msg == WM_POINTERUP ? Event::Type::PointerUp
+                   : msg == WM_POINTERCAPTURECHANGED
+                       ? Event::Type::PointerCancel
+                       : Event::Type::PointerMove;
+            e.x = pt.x; e.y = pt.y;
+            e.pointerId = id;
+            e.source = info.pointerType == PT_PEN ? PointerSource::Pen
+                                                   : PointerSource::Touch;
+            e.pressure = e.type == Event::Type::PointerUp ? 0.f : 1.f;
+            e.mods = currentMods();
+            if (info.pointerType == PT_PEN) {
+                POINTER_PEN_INFO pen{};
+                if (GetPointerPenInfo(id, &pen)) {
+                    e.pressure = e.type == Event::Type::PointerUp ? 0.f :
+                        std::clamp(static_cast<float>(pen.pressure) / 1024.f,
+                                   0.f, 1.f);
+                    e.tiltX = static_cast<float>(pen.tiltX);
+                    e.tiltY = static_cast<float>(pen.tiltY);
+                }
+            }
+            push(e);
+            return 0;
+        }
+
         case WM_MOUSEMOVE: {
+            if ((static_cast<ULONG_PTR>(GetMessageExtraInfo()) & 0xFFFFFF00u)
+                 == 0xFF515700u) return 0;
             if (!tracking_) {
                 TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, hwnd_, 0};
                 TrackMouseEvent(&tme);
@@ -464,6 +526,8 @@ LRESULT Win32Window::wndProc(UINT msg, WPARAM wp, LPARAM lp) {
 
         case WM_LBUTTONDOWN: case WM_LBUTTONDBLCLK:
         case WM_RBUTTONDOWN: case WM_MBUTTONDOWN: {
+            if ((static_cast<ULONG_PTR>(GetMessageExtraInfo()) & 0xFFFFFF00u)
+                 == 0xFF515700u) return 0;
             SetCapture(hwnd_);
             Event e;
             e.type = Event::Type::PointerDown;
@@ -478,6 +542,8 @@ LRESULT Win32Window::wndProc(UINT msg, WPARAM wp, LPARAM lp) {
         }
 
         case WM_LBUTTONUP: case WM_RBUTTONUP: case WM_MBUTTONUP: {
+            if ((static_cast<ULONG_PTR>(GetMessageExtraInfo()) & 0xFFFFFF00u)
+                 == 0xFF515700u) return 0;
             ReleaseCapture();
             Event e;
             e.type = Event::Type::PointerUp;
@@ -746,7 +812,8 @@ private:
         // calling thread is the UI thread.
         const HRESULT init = CoInitializeEx(
             nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
-        const bool owns = SUCCEEDED(init);
+        if (FAILED(init)) return std::nullopt; // shell dialogs need STA
+        const bool owns = true;
 
         ::IFileDialog* dlg = nullptr;
         const HRESULT hr = CoCreateInstance(
@@ -755,9 +822,22 @@ private:
         std::optional<std::string> result;
 
         if (SUCCEEDED(hr) && dlg) {
+            DWORD opts = 0;
+            if (SUCCEEDED(dlg->GetOptions(&opts)))
+                dlg->SetOptions(opts | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
             if (!req.title.empty()) dlg->SetTitle(toWide(req.title).c_str());
             if (!req.suggestedName.empty())
                 dlg->SetFileName(toWide(req.suggestedName).c_str());
+            if (save) dlg->SetDefaultExtension(L"pdf");
+            if (!req.startDirectory.empty()) {
+                IShellItem* folder = nullptr;
+                const auto dir = toWide(req.startDirectory);
+                if (SUCCEEDED(SHCreateItemFromParsingName(
+                        dir.c_str(), nullptr, IID_PPV_ARGS(&folder))) && folder) {
+                    dlg->SetDefaultFolder(folder);
+                    folder->Release();
+                }
+            }
 
             // The filter spec has to outlive the call, so the wide strings
             // are kept alive in these vectors rather than built inline.

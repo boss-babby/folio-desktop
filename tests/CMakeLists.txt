@@ -39,6 +39,14 @@ add_test(NAME render.scheduler COMMAND folio-test-scheduler)
 
 # --- tests that need a real PDFium -----------------------------------------
 if(FOLIO_HAVE_PDFIUM)
+    add_executable(folio-test-pdfium-export engine/test_pdfium_export.cpp)
+    target_compile_definitions(folio-test-pdfium-export PRIVATE FOLIO_TEST_FONT_DIR="${PROJECT_SOURCE_DIR}/assets/fonts")
+    target_link_libraries(folio-test-pdfium-export PRIVATE folio-engine-pdfium PDFium::PDFium)
+    folio_enable_warnings(folio-test-pdfium-export)
+    add_test(NAME engine.pdfium.export COMMAND folio-test-pdfium-export
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/data)
+    set_tests_properties(engine.pdfium.export PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=${FOLIO_DEPS_DIR}/pdfium/lib:$ENV{LD_LIBRARY_PATH}")
     if(FOLIO_HAVE_PODOFO)
         add_executable(folio-test-podofo engine/test_podofo_roundtrip.cpp)
         target_link_libraries(folio-test-podofo
@@ -97,8 +105,76 @@ endif()
 # folio-ui-core deliberately links only folio-render + folio-core, so this
 # suite exercises the icon parser without dragging in Skia.
 if(FOLIO_BUILD_UI)
+    add_executable(folio-test-navigation-recents ui/test_navigation_recents.cpp)
+    target_link_libraries(folio-test-navigation-recents PRIVATE folio-ui-app)
+    target_compile_definitions(folio-test-navigation-recents PRIVATE
+        FOLIO_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+    folio_enable_warnings(folio-test-navigation-recents)
+    add_test(NAME ui.navigation-recents COMMAND folio-test-navigation-recents)
+    if(FOLIO_HAVE_PDFIUM AND UNIX AND NOT APPLE)
+        set_tests_properties(ui.navigation-recents PROPERTIES
+            ENVIRONMENT "LD_LIBRARY_PATH=${FOLIO_DEPS_DIR}/pdfium/lib:$ENV{LD_LIBRARY_PATH}")
+    endif()
+    if(FOLIO_HAVE_SKIA)
+        add_executable(folio-test-partial-redraw ui/test_partial_redraw.cpp)
+        target_link_libraries(folio-test-partial-redraw PRIVATE folio-ui-app folio-render-skia)
+        folio_enable_warnings(folio-test-partial-redraw)
+        add_test(NAME ui.partial-redraw COMMAND folio-test-partial-redraw)
+        if(FOLIO_HAVE_PDFIUM AND UNIX AND NOT APPLE)
+            set_tests_properties(ui.partial-redraw PROPERTIES
+                ENVIRONMENT "LD_LIBRARY_PATH=${FOLIO_DEPS_DIR}/pdfium/lib:$ENV{LD_LIBRARY_PATH}")
+        endif()
+    endif()
+    if(FOLIO_HAVE_PDFIUM)
+        add_executable(folio-test-recent-covers ui/test_recent_covers.cpp)
+        target_link_libraries(folio-test-recent-covers PRIVATE folio-ui-app PDFium::PDFium)
+        folio_enable_warnings(folio-test-recent-covers)
+        add_test(NAME ui.recent-covers COMMAND folio-test-recent-covers
+                 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/data)
+        if(UNIX AND NOT APPLE)
+            set_tests_properties(ui.recent-covers PROPERTIES
+                ENVIRONMENT "LD_LIBRARY_PATH=${FOLIO_DEPS_DIR}/pdfium/lib:$ENV{LD_LIBRARY_PATH}")
+        endif()
+        add_executable(folio-test-pdfium-page-source ui/test_pdfium_page_source.cpp)
+        target_link_libraries(folio-test-pdfium-page-source
+            PRIVATE folio-ui-pdfium folio-engine-pdfium PDFium::PDFium)
+        folio_enable_warnings(folio-test-pdfium-page-source)
+        add_test(NAME ui.pdfium.zoom-eviction COMMAND folio-test-pdfium-page-source
+                 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/data)
+        add_executable(folio-test-pdfium-visible ui/test_pdfium_visible_tiles.cpp)
+        target_link_libraries(folio-test-pdfium-visible
+            PRIVATE folio-ui-pdfium folio-engine-pdfium PDFium::PDFium)
+        folio_enable_warnings(folio-test-pdfium-visible)
+        add_test(NAME ui.pdfium.visible-tiles COMMAND folio-test-pdfium-visible
+                 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/data)
+        if(UNIX AND NOT APPLE)
+            set_tests_properties(ui.pdfium.visible-tiles PROPERTIES
+                ENVIRONMENT "LD_LIBRARY_PATH=${FOLIO_DEPS_DIR}/pdfium/lib:$ENV{LD_LIBRARY_PATH}")
+        endif()
+        if(UNIX AND NOT APPLE)
+            set_tests_properties(ui.pdfium.zoom-eviction PROPERTIES
+                ENVIRONMENT "LD_LIBRARY_PATH=${FOLIO_DEPS_DIR}/pdfium/lib:$ENV{LD_LIBRARY_PATH}")
+        endif()
+    endif()
     add_executable(folio-test-icons ui/test_icons.cpp)
     target_link_libraries(folio-test-icons PRIVATE folio-ui-core)
     folio_enable_warnings(folio-test-icons)
     add_test(NAME ui.icons COMMAND folio-test-icons)
+
+    if(FOLIO_HAVE_PDFIUM AND NOT FOLIO_HAVE_PODOFO AND NOT ANDROID)
+        add_executable(folio-test-saveas ui/test_pdfium_saveas.cpp)
+        target_link_libraries(folio-test-saveas PRIVATE folio-ui-app folio-engine-pdfium)
+        folio_enable_warnings(folio-test-saveas)
+        add_test(NAME ui.pdfium.saveas COMMAND folio-test-saveas
+                 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/data)
+        if(UNIX AND NOT APPLE)
+            set_tests_properties(ui.pdfium.saveas PROPERTIES
+                ENVIRONMENT "LD_LIBRARY_PATH=${FOLIO_DEPS_DIR}/pdfium/lib:$ENV{LD_LIBRARY_PATH}")
+        endif()
+    endif()
+
+    add_executable(folio-test-mobile-input ui/test_mobile_input.cpp)
+    target_link_libraries(folio-test-mobile-input PRIVATE folio-ui-core)
+    folio_enable_warnings(folio-test-mobile-input)
+    add_test(NAME ui.mobile.input COMMAND folio-test-mobile-input)
 endif()

@@ -106,6 +106,24 @@ private:
     Annotation annot_;
 };
 
+/// One tap deletes a multi-line text markup as one action, so one Undo
+/// restores all of its quads (not only the last line).
+class RemoveManyCommand final : public Command {
+public:
+    RemoveManyCommand(AnnotationStore& s, std::vector<Annotation> annots)
+        : store_(s), annots_(std::move(annots)) {}
+    void undo() override {
+        for (const Annotation& a : annots_) store_.addExisting(a);
+    }
+    void redo() override {
+        for (const Annotation& a : annots_) store_.removeById(a.id);
+    }
+    [[nodiscard]] std::string label() const override { return "delete markup"; }
+private:
+    AnnotationStore& store_;
+    std::vector<Annotation> annots_;
+};
+
 /// Geometry or text changed on an existing annotation.
 class ModifyAnnotCommand final : public Command {
 public:

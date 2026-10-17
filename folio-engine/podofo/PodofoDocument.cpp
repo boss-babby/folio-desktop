@@ -104,12 +104,14 @@ void buildAppearance(PdfMemDocument& doc, PdfAnnotation* annot,
             p.Fill();
             break;
 
-        case AnnotSpec::Kind::FreeText: {
+        case AnnotSpec::Kind::FreeText:
+        case AnnotSpec::Kind::Stamp: {
             // A FreeText annotation without an appearance stream is drawn
             // by the viewer from /DA, and viewers disagree wildly about
             // what that means. Baking the glyphs into /AP is the only way
             // the saved file looks like what the editor showed.
-            if (a.contents.empty()) break;
+            const std::string& label = a.label.empty() ? a.contents : a.label;
+            if (label.empty()) break;
             const double h = local.GetHeight();
             const double size = a.fontSize > 0.f ? a.fontSize : h * 0.74;
             PdfFont* font =
@@ -121,7 +123,7 @@ void buildAppearance(PdfMemDocument& doc, PdfAnnotation* annot,
             p.SetColor(cr, cg, cb);
             // PDF text sits on its baseline; the UI positions by the top of
             // the box, so drop by the ascender to line the two up.
-            p.DrawText(0.0, h - size * 0.82, PdfString(a.contents.c_str()));
+            p.DrawText(0.0, h - size * 0.82, PdfString(label.c_str()));
             break;
         }
 
@@ -435,13 +437,15 @@ bool PodofoDocument::writeAnnotations(const std::vector<AnnotSpec>& annots) {
                 case AnnotSpec::Kind::Box:       type = ePdfAnnotation_Square;    break;
                 case AnnotSpec::Kind::Ellipse:   type = ePdfAnnotation_Circle;    break;
                 case AnnotSpec::Kind::FreeText:  type = ePdfAnnotation_FreeText;  break;
+                case AnnotSpec::Kind::Stamp:     type = ePdfAnnotation_Stamp;     break;
             }
 
             PdfAnnotation* annot = page->CreateAnnotation(type, box);
             annot->SetColor(a.cr / 255.0, a.cg / 255.0, a.cb / 255.0);
             annot->SetTitle(PdfString(kFolioTag));
             if (!a.contents.empty())
-                annot->SetContents(PdfString(a.contents.c_str()));
+                annot->SetContents(PdfString(
+                    reinterpret_cast<const pdf_utf8*>(a.contents.c_str())));
             annot->SetFlags(4);  // Print
 
             PdfDictionary& dict = annot->GetObject()->GetDictionary();

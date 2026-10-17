@@ -118,8 +118,12 @@ public:
     /// an existing surface - the page number in the zoom pill - must look
     /// like the label it replaced until the pointer says otherwise.
     bool flat = false;
+    /// Inspector note/comment editor: Enter inserts a newline instead of
+    /// submitting, with wrapped rows rather than a clipped one-line field.
+    bool multiline = false;
 
     void onFocusChanged(bool gained) override;
+    [[nodiscard]] bool wantsTextInput() const override { return true; }
     /// Put the caret after the last character - what "click to edit this
     /// value" should do, so typing appends rather than inserting mid-word.
     void setCaretToEnd() { caret_ = text.size(); }
@@ -130,6 +134,13 @@ public:
     [[nodiscard]] bool animating(double now) const override;
 
 private:
+    struct EditRow {
+        float y = 0.f;
+        std::vector<std::size_t> positions; // UTF-8 byte boundaries in text
+        std::vector<float> advances;         // matching glyph advances
+    };
+    std::vector<EditRow> visibleRows_;
+    float editLeft_ = 0.f;
     std::size_t caret_ = 0;
     double caretReset_ = 0.0;
     AnimatedF focusT_{0.f};

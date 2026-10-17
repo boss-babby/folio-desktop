@@ -56,6 +56,7 @@ struct LayoutMetrics {
     float typeScale = 1.f;      ///< headings shrink on small frames
 
     [[nodiscard]] static LayoutMetrics forWidth(float w) noexcept;
+    [[nodiscard]] static LayoutMetrics forViewport(float w, float h) noexcept;
 };
 
 /// The editing mode the prototype's mode button cycles through.
@@ -76,11 +77,14 @@ enum class Tool : std::uint8_t {
 [[nodiscard]] std::vector<Tool> toolsFor(Mode m);
 
 struct RecentDoc {
+    std::string path;  ///< actual opened PDF, never a synthetic demo entry
     std::string title;
     std::string meta;
     float progress = 0.f;
     int accent = 0;
     int pages = 12;
+    bool linked = false;  ///< private stable locator; original opened through fresh SAF FD
+    bool unavailable = false;
 };
 
 struct OpenDoc {
@@ -108,12 +112,27 @@ struct AppState {
     /// Notes, Layers - the prototype's .seg.tabs4.
     int leftTab = 0;
     bool leftPanelCollapsed = false;
-    bool rightPanelCollapsed = false;
+    bool rightPanelCollapsed = true;  ///< inspector is opt-in, not shown on open
     bool focusMode = false;
+    /// Reading preference shared by all PDFs: reveal focus controls on tap,
+    /// then remove them after three seconds without activity. Can be turned
+    /// off in the inspector; retained with the recent-document state file.
+    bool autoHideFocusControls = true;
+    // A phone finger covers the glyph it is choosing. Desktop/mouse stays
+    // unchanged unless the user explicitly enables this touch-only option.
+#if defined(__ANDROID__)
+    bool selectionMagnifier = true;
+#else
+    bool selectionMagnifier = false;
+#endif
 
-    /// Seeded sample content, so the UI has something to show. Replaced by
-    /// real documents once the engine layer is wired in.
-    void seedDemoContent();
+    /// A small, bounded list of real files. The shell supplies a per-user
+    /// state file (Android's internal files directory on mobile).
+    void loadRecents(std::string file);
+    void rememberDocument(const std::string& path, int pages, int page = 1);
+    void forgetDocument(const std::string& path);
+    void saveRecents() const;
+    std::string recentStateFile;
 };
 
 }  // namespace folio::ui

@@ -391,6 +391,10 @@ constexpr Def kIcons[] = {
     {"thumbnails",   "M4 4h5v6H4zM4 14h5v6H4zM12 5h8M12 9h8M12 15h8M12 19h8"},
     {"rotate-cw",    "M20 7v5h-5 M19.4 12a7.5 7.5 0 10-2 6"},
     {"rotate-ccw",   "M4 7v5h5 M4.6 12a7.5 7.5 0 112 6"},
+    // Page orientation before/after, with a short right-angle arrow. Unlike
+    // history's curved Undo/Redo glyphs these cannot be mistaken for edits.
+    {"view-rotate-cw",  "M3 3h8v13H3z M12 15h9v6h-9z M14 8h6M18 6l2 2-2 2"},
+    {"view-rotate-ccw", "M13 3h8v13h-8z M3 15h9v6H3z M10 8H4M6 6L4 8l2 2"},
     {"maximise-view", "M14 4h6v6M20 4l-7 7M10 20H4v-6M4 20l7-7"},
     {"minimise-view", "M20 10h-6V4M14 10l7-7M4 14h6v6M10 14l-7 7"},
 
@@ -399,6 +403,10 @@ constexpr Def kIcons[] = {
     {"hand",         "M8 12V6a1.5 1.5 0 013 0v5V4.5a1.5 1.5 0 013 0V11V6.5a1.5 1.5 0 013 0V14a6 6 0 01-6 6h-1a5 5 0 01-5-5v-4a1.5 1.5 0 013 0z"},
     {"highlighter",  "M4 20h6l9-9a2.5 2.5 0 00-3.5-3.5l-9 9zM13 8l3 3"},
     {"pen",          "M4 20l1-4L16 5a2.1 2.1 0 013 3L8 19zM14 7l3 3"},
+    {"shape-rect",   "M4 5h16v14H4z"},
+    {"shape-oval",   "M20 12a8 7 0 1 1-16 0a8 7 0 1 1 16 0"},
+    {"shape-line",   "M4 20L20 4"},
+    {"shape-arrow",  "M4 20L20 4M12 4h8v8"},
     {"eraser",       "M8 20H5l-2-2 10-10a2 2 0 013 0l4 4a2 2 0 010 3l-7 7zM11 8l5 5"},
     {"text",         "M5 6V4h14v2M12 4v16M9 20h6"},
     {"note",         "M5 4h14v10l-5 6H5zM14 20v-6h5"},
@@ -420,7 +428,7 @@ constexpr Def kIcons[] = {
     {"lock",         "M6 11h12v9H6zM9 11V8a3 3 0 016 0v3"},
     {"eye",          "M2 12s4-6 10-6 10 6 10 6-4 6-10 6-10-6-10-6z @c 12 12 2.6"},
     {"home",         "M3 10.6L12 3.2L21 10.6M5.4 9.4V20.4H18.6V9.4M9.6 20.4V14.2H14.4V20.4"},
-    {"settings",     "@c 12 12 3 M12 3v2M12 19v2M4.5 7.5l1.7 1M17.8 15.5l1.7 1M4.5 16.5l1.7-1M17.8 8.5l1.7-1"},
+    {"settings",     "M10 2.8h4l.6 2.2 1.4.8 2.2-.6 2 3.5-1.6 1.6v1.6l1.6 1.6-2 3.5-2.2-.6-1.4.8-.6 2.2h-4l-.6-2.2-1.4-.8-2.2.6-2-3.5 1.6-1.6v-1.6L3.8 8.7l2-3.5 2.2.6 1.4-.8z @c 12 12 3"},
     {"clock",        "@c 12 12 8 M12 7v5l3 2"},
     {"undo",         "M4 8v5h5 M4.8 13a7.5 7.5 0 112 6"},
     {"redo",         "M20 8v5h-5 M19.2 13a7.5 7.5 0 10-2 6"},

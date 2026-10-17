@@ -16,8 +16,13 @@
 
 include_guard(GLOBAL)
 
-set(FOLIO_DEPS_DIR "$ENV{HOME}/.cache/folio-deps" CACHE PATH
-    "Directory populated by tools/fetch-deps.sh")
+if(DEFINED ENV{FOLIO_DEPS_DIR} AND NOT "$ENV{FOLIO_DEPS_DIR}" STREQUAL "")
+    set(_folio_default_deps "$ENV{FOLIO_DEPS_DIR}")
+else()
+    set(_folio_default_deps "$ENV{HOME}/.cache/folio-deps")
+endif()
+set(FOLIO_DEPS_DIR "${_folio_default_deps}" CACHE PATH
+    "Directory populated by tools/bootstrap-deps.sh")
 
 set(FOLIO_HAVE_PDFIUM OFF)
 set(FOLIO_HAVE_SKIA   OFF)
@@ -128,8 +133,12 @@ if(EXISTS "${_skia_root}/include/core/SkCanvas.h")
         # symbols in the archive, not optional extras.
         set(_skia_sys "")
         if(WIN32)
+            # dwrite: DWriteCreateFactory, used by SkFontMgr_New_DirectWrite.
+            # d3d12 / d3dcompiler: D3D12SerializeRootSignature and D3DCompile,
+            # both referenced from skia.lib in the m144 Windows prebuilt.
             set(_skia_sys opengl32 user32 gdi32 ole32 oleaut32 advapi32
-                          usp10 fontsub shlwapi windowscodecs)
+                          usp10 fontsub shlwapi windowscodecs
+                          dwrite d3d12 d3dcompiler)
         elseif(ANDROID)
             # Skia's Android pack calls __android_log_vprint from SkDebugf
             # and uses the platform GLES/EGL loaders. These are platform
@@ -188,51 +197,53 @@ endif()
 # Two shapes are accepted. A source build installs a CMake package config;
 # the Debian prebuilt that tools/bootstrap-deps.sh extracts does not, so the
 # headers and shared object are located by hand.
-set(_podofo_root "${FOLIO_DEPS_DIR}/podofo/install")
-if(EXISTS "${_podofo_root}")
-    list(APPEND CMAKE_PREFIX_PATH "${_podofo_root}")
-endif()
-find_package(podofo CONFIG QUIET)
-if(podofo_FOUND)
-    set(FOLIO_HAVE_PODOFO ON)
-    set(FOLIO_PODOFO_FLAVOUR "package config")
-else()
-    set(_podofo_deb "${FOLIO_DEPS_DIR}/podofo/usr")
-    find_path(FOLIO_PODOFO_INCLUDE podofo/podofo.h
-              PATHS "${_podofo_deb}/include" NO_DEFAULT_PATH)
-    find_library(FOLIO_PODOFO_LIB NAMES podofo
-                 PATHS "${_podofo_deb}/lib" NO_DEFAULT_PATH)
-    find_library(FOLIO_IDN_LIB NAMES idn
-                 PATHS "${_podofo_deb}/lib/x86_64-linux-gnu" NO_DEFAULT_PATH)
-    if(FOLIO_PODOFO_INCLUDE AND FOLIO_PODOFO_LIB)
-        add_library(podofo::podofo UNKNOWN IMPORTED)
-        set_target_properties(podofo::podofo PROPERTIES
-            IMPORTED_LOCATION "${FOLIO_PODOFO_LIB}"
-            INTERFACE_INCLUDE_DIRECTORIES "${FOLIO_PODOFO_INCLUDE}")
-        if(FOLIO_IDN_LIB)
-            set_target_properties(podofo::podofo PROPERTIES
-                INTERFACE_LINK_LIBRARIES "${FOLIO_IDN_LIB}")
-        endif()
-        # PoDoFo 0.9.8's headers predate C++17 and use std::iterator and
-        # friends. They are not ours to fix and the warnings are noise.
-        set_target_properties(podofo::podofo PROPERTIES
-            INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${FOLIO_PODOFO_INCLUDE}")
+if(FOLIO_WITH_PODOFO)
+    set(_podofo_root "${FOLIO_DEPS_DIR}/podofo/install")
+    if(EXISTS "${_podofo_root}")
+        list(APPEND CMAKE_PREFIX_PATH "${_podofo_root}")
+    endif()
+    find_package(podofo CONFIG QUIET)
+    if(podofo_FOUND)
         set(FOLIO_HAVE_PODOFO ON)
-        set(FOLIO_PODOFO_FLAVOUR "Debian prebuilt 0.9.8")
-        # The prebuilt shared objects live in the dep cache, not on the
-        # loader's default path. Bake the directories into the RPATH so the
-        # binaries run without LD_LIBRARY_PATH; a packaged build would
-        # instead vendor the .so next to the executable.
-        list(APPEND CMAKE_BUILD_RPATH
-             "${_podofo_deb}/lib" "${_podofo_deb}/lib/x86_64-linux-gnu")
-        # DT_RUNPATH, which modern linkers emit by default, applies only to
-        # a binary's *direct* dependencies. libpodofo needs libidn, and that
-        # lookup does not consult the executable's RUNPATH - so the library
-        # is reported missing despite sitting in a listed directory. DT_RPATH
-        # is inherited by the whole dependency chain, which is what we want
-        # for a dep cache that lives outside the loader's default paths.
-        add_link_options(-Wl,--disable-new-dtags)
+        set(FOLIO_PODOFO_FLAVOUR "package config")
+    else()
+        set(_podofo_deb "${FOLIO_DEPS_DIR}/podofo/usr")
+        find_path(FOLIO_PODOFO_INCLUDE podofo/podofo.h
+                  PATHS "${_podofo_deb}/include" NO_DEFAULT_PATH)
+        find_library(FOLIO_PODOFO_LIB NAMES podofo
+                     PATHS "${_podofo_deb}/lib" NO_DEFAULT_PATH)
+        find_library(FOLIO_IDN_LIB NAMES idn
+                     PATHS "${_podofo_deb}/lib/x86_64-linux-gnu" NO_DEFAULT_PATH)
+        if(FOLIO_PODOFO_INCLUDE AND FOLIO_PODOFO_LIB)
+            add_library(podofo::podofo UNKNOWN IMPORTED)
+            set_target_properties(podofo::podofo PROPERTIES
+                IMPORTED_LOCATION "${FOLIO_PODOFO_LIB}"
+                INTERFACE_INCLUDE_DIRECTORIES "${FOLIO_PODOFO_INCLUDE}")
+            if(FOLIO_IDN_LIB)
+                set_target_properties(podofo::podofo PROPERTIES
+                    INTERFACE_LINK_LIBRARIES "${FOLIO_IDN_LIB}")
+            endif()
+            # PoDoFo 0.9.8's headers predate C++17 and use std::iterator and
+            # friends. They are not ours to fix and the warnings are noise.
+            set_target_properties(podofo::podofo PROPERTIES
+                INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${FOLIO_PODOFO_INCLUDE}")
+            set(FOLIO_HAVE_PODOFO ON)
+            set(FOLIO_PODOFO_FLAVOUR "Debian prebuilt 0.9.8")
+            # The prebuilt shared objects live in the dep cache, not on the
+            # loader's default path. Bake the directories into the RPATH so the
+            # binaries run without LD_LIBRARY_PATH; a packaged build would
+            # instead vendor the .so next to the executable.
+            list(APPEND CMAKE_BUILD_RPATH
+                 "${_podofo_deb}/lib" "${_podofo_deb}/lib/x86_64-linux-gnu")
+            # DT_RUNPATH, which modern linkers emit by default, applies only to
+            # a binary's *direct* dependencies. libpodofo needs libidn, and that
+            # lookup does not consult the executable's RUNPATH - so the library
+            # is reported missing despite sitting in a listed directory. DT_RPATH
+            # is inherited by the whole dependency chain, which is what we want
+            # for a dep cache that lives outside the loader's default paths.
+            add_link_options(-Wl,--disable-new-dtags)
 
+        endif()
     endif()
 endif()
 

@@ -52,9 +52,18 @@ bool GestureTracker::onPointer(const PointerEvent& e) {
         case PointerPhase::Move: {
             ActivePointer* p = find(e.pointerId);
             if (!p) return false;
-            const double dt = std::max(1e-4, e.timestamp - p->lastTime);
+            const double dt = e.timestamp - p->lastTime;
             const Point d{e.pos.x - p->pos.x, e.pos.y - p->pos.y};
-
+            // MotionEvents update fingers one at a time. The *old* midpoint
+            // must contain the other finger's CURRENT position, not its
+            // position at its last event; otherwise each alternating move
+            // counts the other finger's displacement twice and the page
+            // wobbles sideways even during a vertical two-finger drag.
+            Point oldCentre{};
+            if (pointers_.size() >= 2) {
+                oldCentre = {(pointers_[0].pos.x + pointers_[1].pos.x) * 0.5f,
+                             (pointers_[0].pos.y + pointers_[1].pos.y) * 0.5f};
+            }
             p->prev = p->pos;
             p->pos = e.pos;
             p->lastTime = e.timestamp;
@@ -63,20 +72,24 @@ bool GestureTracker::onPointer(const PointerEvent& e) {
 
             // Smoothed, so one stuttered frame at release does not fling
             // the page across the screen.
-            const float a = gesture::kVelocityAlpha;
-            const Point inst{static_cast<float>(d.x / dt),
-                             static_cast<float>(d.y / dt)};
-            p->velocity = Point{p->velocity.x * (1.f - a) + inst.x * a,
-                                p->velocity.y * (1.f - a) + inst.y * a};
+            if (dt >= 0.002) {
+                const float a = gesture::kVelocityAlpha;
+                const Point inst{
+                    std::clamp(static_cast<float>(d.x / dt),
+                               -gesture::kFlingMax, gesture::kFlingMax),
+                    std::clamp(static_cast<float>(d.y / dt),
+                               -gesture::kFlingMax, gesture::kFlingMax)};
+                p->velocity = Point{p->velocity.x * (1.f - a) + inst.x * a,
+                                    p->velocity.y * (1.f - a) + inst.y * a};
+            } // same-timestamp samples update position, not fling speed
 
             if (pointers_.size() >= 2) {
                 const Point a0 = pointers_[0].pos, b0 = pointers_[1].pos;
-                const Point ap = pointers_[0].prev, bp = pointers_[1].prev;
                 const float span = dist(a0, b0);
                 const Point c{(a0.x + b0.x) * 0.5f, (a0.y + b0.y) * 0.5f};
-                const Point cp{(ap.x + bp.x) * 0.5f, (ap.y + bp.y) * 0.5f};
                 pinch_.centroid = c;
-                pinch_.centroidDelta = Point{c.x - cp.x, c.y - cp.y};
+                pinch_.centroidDelta = Point{c.x - oldCentre.x,
+                                              c.y - oldCentre.y};
                 // Guard the degenerate case: two fingers landing on the
                 // same pixel gives span 0 and an infinite scale.
                 pinch_.scale = (lastSpan_ > 1.f && span > 1.f) ? span / lastSpan_ : 1.f;

@@ -1,15 +1,34 @@
 #include "screens/FolioApp.h"
+#if FOLIO_HAVE_PDFIUM_SOURCE
+#include "pdfium/PdfiumPageSource.h"
+#endif
 
 #include <filesystem>
 #include <system_error>
 
 #include <algorithm>
 #include <cmath>
+#include <chrono>
+#include <exception>
 
 namespace folio::ui {
+namespace {
+Rect joinDamage(Rect a, Rect b) {
+    if (a.empty()) return b;
+    if (b.empty()) return a;
+    const float x = std::min(a.x, b.x), y = std::min(a.y, b.y);
+    return {x, y, std::max(a.right(), b.right()) - x,
+                   std::max(a.bottom(), b.bottom()) - y};
+}
+Rect widgetDamage(const Widget* w) {
+    if (!w) return {};
+    const Point p = w->toWindow({0.f, 0.f});
+    const Rect r = w->damageBounds();
+    return {p.x + r.x - 24.f, p.y + r.y - 24.f, r.w + 48.f, r.h + 48.f};
+}
+}  // namespace
 
 FolioApp::FolioApp(float w, float h) {
-    state_.seedDemoContent();
     root_.setFrame(0.f, 0.f, w, h);
     root_.debugName = "root";
 
@@ -22,43 +41,54 @@ FolioApp::FolioApp(float w, float h) {
     OverlayHost::setCurrent(overlay_);
 
     openDlg_->onOpen = [this](const std::string& path) {
-        // Real file, real engine. openFile() falls back to the placeholder
-        // and reports why if PDFium refuses it, so a damaged PDF shows a
-        // message rather than an empty window.
-        if (reader_->openFile(path, lastNow_)) {
-            showScreen(Screen::Reader, lastNow_);
-            return;
-        }
-        std::string title = path;
-        const auto slash = title.find_last_of("/\\");
-        if (slash != std::string::npos) title = title.substr(slash + 1);
-        reader_->openDocument(title, 24, lastNow_);
-        showScreen(Screen::Reader, lastNow_);
+        openFileFromHost(path);
     };
 
     reader_->visible = false;
-
-    welcome_->onOpenDocument = [this](const std::string& title, int pages) {
-        // The recents list is seeded with names; if a file of that name is
-        // sitting in the documents folder, open the real thing.
-        namespace fs = std::filesystem;
-        std::error_code ec;
-        const fs::path p = fs::path("documents") / title;
-        if (fs::exists(p, ec) && reader_->openFile(p.string(), lastNow_)) {
-            showScreen(Screen::Reader, lastNow_);
-            return;
-        }
-        reader_->openDocument(title, pages, lastNow_);
-        showScreen(Screen::Reader, lastNow_);
+    welcome_->onOpenDocument = [this](const std::string& path) {
+        int resumePage = 1;
+        for (const RecentDoc& r : state_.recents)
+            if (r.path == path) {
+                resumePage = std::clamp(
+                    static_cast<int>(std::lround(r.progress * r.pages)) + 1,
+                    1, r.pages);
+                break;
+            }
+        queueOpen(OpenRequest{path, resumePage, true});
     };
     welcome_->onBrowse = [this] { requestOpenFile(); };
+    welcome_->onRemoveDocument = [this](const std::string& path) {
+        state_.forgetDocument(path); // not source, not private copy, not sidecars
+        removedFromLibrary_ = path;
+        welcome_->refreshRecents(lastNow_);
+        overlay_->showToast("Removed from library; PDF and annotations retained", lastNow_);
+        invalidate();
+    };
+    welcome_->onStorageAction = [this](const std::string& path, int action) {
+        if (!host_.storageAction || !host_.storageAction(path, action))
+            overlay_->showToast("Storage option unavailable for this file", lastNow_);
+    };
+    welcome_->onSetPreferSourceOnly = [this](bool value) {
+        if (host_.setPrefersSourceOnly) host_.setPrefersSourceOnly(value);
+    };
     reader_->onBrowse = [this] { requestOpenFile(); };
     // Extract asks where to put the result. Routed through the app rather
     // than the screen because the dialog lives on the overlay layer.
     reader_->onPickSavePath = [this](const std::string& suggested,
                                      std::function<void(std::string)> done) {
+        FilePicker& picker = FilePicker::current();
+#ifndef __ANDROID__
+        if (picker.isNative()) {
+            picker.requestSave(suggested, std::move(done));
+            return;
+        }
+#endif
         openDlg_->onSave = [done](const std::string& p) { if (done) done(p); };
         openDlg_->openSave(suggested, lastNow_);
+    };
+    reader_->onDocumentChanged = [this] {
+        purgeRasterCache_ = true;
+        invalidate();
     };
     reader_->onBackToWelcome = [this] {
         showScreen(Screen::Welcome, lastNow_);
@@ -70,11 +100,72 @@ FolioApp::FolioApp(float w, float h) {
 }
 
 FolioApp::~FolioApp() {
+    if (welcome_) welcome_->setCoverWakeCallback({});
+    if (target_ == Screen::Reader && reader_ && !reader_->currentFilePath().empty() &&
+        reader_->currentFilePath() != removedFromLibrary_)
+        state_.rememberDocument(reader_->currentFilePath(),
+                                reader_->stage()->source()->pageCount(),
+                                reader_->stage()->currentPage());
     if (&OverlayHost::current() == overlay_) OverlayHost::setCurrent(nullptr);
+}
+
+bool FolioApp::hasBackgroundWork() const {
+    return openTask_.valid() || (reader_ && reader_->hasDocumentWork()) ||
+           (target_ == Screen::Welcome && welcome_ && welcome_->coversBusy());
+}
+
+void FolioApp::trimIdleVisualCaches() {
+    if (reader_) reader_->trimIdleVisualCaches();
+    if (welcome_) welcome_->trimIdleCovers();
+}
+
+void FolioApp::releaseVisualCaches() {
+    if (reader_) reader_->releaseVisualCaches();
+    if (welcome_) welcome_->releaseCoverMemory();
+    purgeRasterCache_ = true;
+    invalidate();
+}
+
+bool FolioApp::pollExport() {
+    const bool changed = reader_ && reader_->pollExport();
+    if (changed) fullRepaint_ = true; // a page raster may have landed
+    return changed;
+}
+
+void FolioApp::storageChanged(int status, const std::string& message) {
+    // Re-evaluate markers without changing path-based sidecar identity.
+    if (status > 0 && !state_.recentStateFile.empty())
+        state_.loadRecents(state_.recentStateFile);
+    welcome_->refreshRecents(lastNow_);
+    if (status != 0) overlay_->showToast(message, lastNow_);
+    invalidate();
+}
+
+void FolioApp::exportFinished(int status, const std::string& message) {
+    if (reader_) reader_->exportFinished(status, message);
+    invalidate();
 }
 
 void FolioApp::setHostServices(HostServices s) {
     host_ = std::move(s);
+    if (welcome_ && host_.prefersSourceOnly)
+        welcome_->setPreferSourceOnly(host_.prefersSourceOnly());
+    // The two close glyphs are app-level actions, not merely decorative.
+    // They were never connected to the host's WM_CLOSE request.
+    if (welcome_) {
+        welcome_->onQuit = host_.close;
+        welcome_->setCoverWakeCallback(host_.wake);
+    }
+    if (reader_) {
+        reader_->onQuit = host_.close;
+        reader_->setWorkerWakeCallback(host_.wake);
+    }
+    router_.onTextFocusChange = host_.showKeyboard;
+    if (reader_) {
+        reader_->setTextInputCallback(host_.showKeyboard);
+        reader_->onExportPdf = host_.exportPdf;
+        reader_->onSharePdf = host_.sharePdf;
+    }
 
     // The window controls exist on both screens and must behave the same on
     // each, so they are wired here rather than in either screen. Close is
@@ -101,6 +192,98 @@ void FolioApp::setHostServices(HostServices s) {
     }
 }
 
+void FolioApp::recordOpen(const std::string& path) {
+    removedFromLibrary_.clear();
+    auto* source = reader_->stage()->source();
+    if (!source) return;
+    state_.rememberDocument(path, source->pageCount(),
+                            reader_->stage()->currentPage());
+    recentsDirty_ = true;
+    purgeRasterCache_ = true;
+}
+
+void FolioApp::loadRecents(const std::string& path) {
+    state_.loadRecents(path);
+    reader_->syncFocusAutoHidePreference();
+    welcome_->setRecentStateFile(path);
+    welcome_->refreshRecents(lastNow_);
+}
+
+void FolioApp::startOpen(OpenRequest request) {
+#if FOLIO_HAVE_PDFIUM_SOURCE
+    openTask_ = std::async(std::launch::async, [request = std::move(request)]() mutable {
+        OpenResult result;
+        result.request = std::move(request);
+        try {
+            auto pdf = std::make_shared<folio::engine::PdfiumPageSource>();
+            if (pdf->open(result.request.path)) result.source = std::move(pdf);
+            else result.error = pdf->error();
+        } catch (const std::exception& e) {
+            result.error = e.what();
+        }
+        return result;
+    });
+    overlay_->showToast("Opening PDF in background…", lastNow_);
+    invalidate();
+#else
+    if (reader_->openFile(request.path, lastNow_)) {
+        recordOpen(request.path);
+        showScreen(Screen::Reader, lastNow_);
+    }
+#endif
+}
+
+void FolioApp::queueOpen(OpenRequest request) {
+    if (request.path.empty()) return;
+    if (openTask_.valid()) {
+        // The current parse cannot be interrupted safely inside PDFium.
+        // Only remember the last user choice rather than spawning a pool of
+        // expensive document parsers or blocking on future destruction.
+        nextOpen_ = std::move(request);
+        overlay_->showToast("Opening the latest selected PDF next…", lastNow_);
+        return;
+    }
+    startOpen(std::move(request));
+}
+
+bool FolioApp::pollOpen() {
+    using namespace std::chrono_literals;
+    if (!openTask_.valid() || openTask_.wait_for(0ms) != std::future_status::ready)
+        return false;
+    OpenResult result = openTask_.get();
+    if (nextOpen_) {
+        OpenRequest next = std::move(*nextOpen_);
+        nextOpen_.reset();
+        startOpen(std::move(next));
+        return true;
+    }
+    if (result.source &&
+        reader_->openPreparedFile(result.request.path, std::move(result.source), lastNow_)) {
+        reader_->stage()->goToPage(result.request.resumePage, lastNow_);
+        recordOpen(result.request.path);
+        showScreen(Screen::Reader, lastNow_);
+    } else {
+        overlay_->showToast("Could not open PDF: " +
+                            (result.error.empty() ? std::string("invalid PDF") : result.error),
+                            lastNow_);
+        if (result.request.recent) {
+            const auto it = std::find_if(state_.recents.begin(), state_.recents.end(),
+                [&](const RecentDoc& r) { return r.path == result.request.path; });
+            if (it != state_.recents.end() && it->linked) {
+                it->unavailable = true; // preserve recents + sidecar for relink
+                it->meta += " · Unavailable · Relink";
+            } else state_.forgetDocument(result.request.path);
+            recentsDirty_ = true;
+        }
+    }
+    invalidate();
+    return true;
+}
+
+void FolioApp::openFileFromHost(const std::string& path) {
+    queueOpen(OpenRequest{path, 1, false});
+}
+
 void FolioApp::requestOpenFile() {
     // Prefer the host's own dialog; fall back to the in-app browser on the
     // platforms that have none (web, iOS, and this streamed demo).
@@ -122,12 +305,24 @@ void FolioApp::resize(float w, float h) {
     openDlg_->setFrame(0.f, 0.f, w, h);
     overlay_->setFrame(0.f, 0.f, w, h);
     root_.layoutTree();
+    fullRepaint_ = true;
     forceFrames_ = 2;
 }
 
 void FolioApp::showScreen(Screen s, double now) {
     if (s == target_) return;
+    if (target_ == Screen::Reader && s == Screen::Welcome) {
+        if (!reader_->currentFilePath().empty() && reader_->stage()->source())
+            state_.rememberDocument(reader_->currentFilePath(),
+                                    reader_->stage()->source()->pageCount(),
+                                    reader_->stage()->currentPage());
+        recentsDirty_ = true;
+        purgeRasterCache_ = true;
+    }
+    overlay_->dismissTooltip();
     target_ = s;
+    welcome_->setCoverRequestsEnabled(s == Screen::Welcome);
+    fullRepaint_ = true;
     state_.screen = s;
     // Both screens must be visible during the cross-fade; the one being
     // left is hidden again once the fade completes (in paint).
@@ -139,26 +334,61 @@ void FolioApp::showScreen(Screen s, double now) {
 bool FolioApp::pointer(const PointerEvent& e) {
     lastNow_ = e.timestamp;
     Widget::setClock(e.timestamp);
-    forceFrames_ = std::max(forceFrames_, 1);
+    // Do not wake the renderer for mouse moves within a stationary widget;
+    // a 1000 Hz mouse otherwise repaints the entire GL framebuffer at 1000 Hz.
+    // A hover transition or a consumed drag still needs a frame.
     // A press anywhere must first give open popovers a chance to dismiss,
     // before the router hands the event to whatever is underneath.
-    if (e.phase == PointerPhase::Down && target_ == Screen::Reader) {
-        reader_->handleOutsideClick(e.windowPos, e.timestamp);
+    if (target_ == Screen::Reader) {
+        reader_->noteFocusInteraction(e);
+        if (e.phase == PointerPhase::Down)
+            reader_->handleOutsideClick(e.windowPos, e.timestamp);
+    } else if (target_ == Screen::Welcome && e.phase == PointerPhase::Down) {
+        welcome_->dismissSettingsIfOutside(e.windowPos, e.timestamp);
     }
-    return router_.dispatchPointer(root_, e);
+    const Widget* before = router_.hovered();
+    const bool changed = router_.dispatchPointer(root_, e);
+    if (changed || e.phase != PointerPhase::Move) {
+        forceFrames_ = std::max(forceFrames_, 1);
+        if (e.phase == PointerPhase::Move && e.isTouch() &&
+            target_ == Screen::Reader &&
+            reader_->stage()->thumbOverlayOnly(e.timestamp)) {
+            // Moving across the thumb palette changes only its small HUD.
+            // A page pan/zoom is never classified as thumbOverlayOnly.
+            pointerDamage_ = joinDamage(pointerDamage_, widgetDamage(reader_->stage()));
+        } else if (e.phase == PointerPhase::Move && !e.isTouch()) {
+            pointerDamage_ = joinDamage(pointerDamage_, widgetDamage(before));
+            pointerDamage_ = joinDamage(pointerDamage_, widgetDamage(router_.hovered()));
+            if (router_.hovered() && router_.hovered()->isDocumentCanvas())
+                fullRepaint_ = true; // scrollbar or page gesture is not chrome
+        } else {
+            fullRepaint_ = true;
+        }
+    }
+    return changed;
 }
 
 bool FolioApp::key(const KeyEvent& e) {
+    fullRepaint_ = true;
     Widget::setClock(lastNow_);
     if (openDlg_->isOpen()) return openDlg_->onKey(e);
     forceFrames_ = std::max(forceFrames_, 1);
     if (router_.dispatchKey(root_, e)) return true;
     // Unhandled keys fall through to the active screen as shortcuts.
     if (target_ == Screen::Reader) return reader_->onKey(e);
+#if defined(__ANDROID__)
+    // NativeActivity consumes the Android Back event. If nothing in the
+    // library is dismissible, finish the activity instead of trapping Back.
+    if (e.pressed && e.key == Key::Escape && host_.close) {
+        host_.close();
+        return true;
+    }
+#endif
     return false;
 }
 
 bool FolioApp::needsFrame(double now) const {
+    if (target_ == Screen::Welcome && welcome_->coversReady()) return true;
     if (forceFrames_ > 0) return true;
     if (screenFade_.active(now)) return true;
     if (state_.theme.animating(now)) return true;
@@ -217,36 +447,69 @@ Rect FolioApp::computeDamage(double now) const {
     return Rect{r.x - 24.f, r.y - 24.f, r.w + 48.f, r.h + 48.f};
 }
 
-void FolioApp::paint(IPaintTarget& t, double now, float dpr) {
+void FolioApp::paint(IPaintTarget& t, double now, float dpr, bool retained) {
     lastNow_ = now;
+    if (purgeRasterCache_) {
+        t.invalidateRasterCache();
+        purgeRasterCache_ = false;
+    }
+    if (recentsDirty_) {
+        recentsDirty_ = false;
+        welcome_->refreshRecents(now);
+    }
+    // A finished cover changes pixels without an animation or pointer event;
+    // repaint the library only when one actually becomes available.
+    if (welcome_->pollCovers() && target_ == Screen::Welcome) fullRepaint_ = true;
     if (forceFrames_ > 0) --forceFrames_;
 
-    // --- partial repaint: REMOVED -------------------------------------------
-    // A damage-rectangle pass lived here. Its premise was that the set of
-    // widgets reporting animating() is the set of pixels that change, and
-    // that is simply false: a widget moves when some *other* widget's
-    // animation drives a relayout. Collapsing a panel animates the panel,
-    // but it is the stage, the pill and the thumbnails that change position,
-    // and none of them are "animating", so none of them were repainted.
-    // Stale rectangles everywhere layout moved - exactly as reported.
-    //
-    // Doing it properly means tracking each widget's previously painted rect
-    // and damaging both old and new, plus forcing a full frame on every
-    // layoutTree(). Worth building; not worth shipping half-built. A
-    // renderer that is fast and wrong is worse than one that is correct.
-    const bool partial = false;
-    (void)partial;
-    lastDamage_ = Rect{};
-    lastPartial_ = false;
+    // Partial painting is safe only on a retained surface. A WGL swap buffer
+    // is NOT retained; NativeShell paints into a persistent Ganesh surface
+    // and blits that complete image to the swap buffer. Large/layout/page
+    // animations deliberately take the full path so moved widgets cannot
+    // leave stale rectangles behind.
+    const Rect moving = computeDamage(now);
+    Rect damage = joinDamage(joinDamage(prevDamage_, moving), pointerDamage_);
+    const float x0 = std::max(0.f, damage.x), y0 = std::max(0.f, damage.y);
+    const float x1 = std::min(root_.frame.w, damage.right());
+    const float y1 = std::min(root_.frame.h, damage.bottom());
+    damage = x1 > x0 && y1 > y0 ? Rect{x0, y0, x1 - x0, y1 - y0} : Rect{};
+    // On a retained surface a bounded popup over a *static* page can
+    // repaint just the covered page tiles under its changing clip. A pure
+    // chrome hover still skips the document completely. Zoom/scroll/layout
+    // animations remain full-frame, so no stale page pixels are exposed.
+    const Point canvasOrigin = reader_->stage()->toWindow({0.f, 0.f});
+    const Rect canvas{canvasOrigin.x, canvasOrigin.y,
+                      reader_->stage()->frame.w, reader_->stage()->frame.h};
+    const bool damageTouchesCanvas = reader_->visible && !damage.empty() &&
+        damage.x < canvas.right() && damage.right() > canvas.x &&
+        damage.y < canvas.bottom() && damage.bottom() > canvas.y;
+    const float maxDamageFraction = damageTouchesCanvas ? .55f : .30f;
+    const bool partial = retained && !fullRepaint_ && forceFrames_ <= 1 &&
+        !state_.theme.animating(now) && !screenFade_.active(now) &&
+        (!reader_->visible || !reader_->requiresFullFrame(now)) &&
+        !damage.empty() &&
+        damage.w * damage.h < root_.frame.w * root_.frame.h * maxDamageFraction;
+    prevDamage_ = moving;
+    pointerDamage_ = {};
+    fullRepaint_ = false;
+    lastPartial_ = partial;
+    lastDamage_ = partial ? damage : Rect{0.f, 0.f, root_.frame.w, root_.frame.h};
 
-    // During a theme change the frame is painted twice: once in the
-    // outgoing palette, then again in the incoming one clipped to a growing
-    // circle. That is the prototype's reveal, and it costs a second tree
-    // traversal for the ~0.8s the animation lasts.
+    // One hard-edged clip, no ring, buffer, or gradient. Day reverses the
+    // geometry: paint light first, then the old dark inside a shrinking
+    // circle. Night paints light first and reveals dark outward.
     const bool revealing = state_.theme.animating(now);
-    const tokens::Palette pal =
-        revealing ? state_.theme.outgoing() : state_.theme.effective(now);
-    const PaintCtx ctx{pal, now, dpr};
+    const bool dayInward = revealing &&
+        state_.theme.scheme() == ColorScheme::Light;
+    const tokens::Palette pal = revealing
+        ? (dayInward ? state_.theme.incoming() : state_.theme.outgoing())
+        : state_.theme.effective(now);
+    const PaintCtx ctx{pal, now, dpr, partial ? damage : Rect{},
+                       partial && !damageTouchesCanvas};
+    if (partial) {
+        t.save();
+        t.clipRect(damage, false);
+    }
 
     const float f = screenFade_.value(now);
 
@@ -257,7 +520,8 @@ void FolioApp::paint(IPaintTarget& t, double now, float dpr) {
         reader_->visible = (f >= 0.5f);
     }
 
-    t.clear(pal.bg);
+    if (partial) t.fillRect({0.f, 0.f, root_.frame.w, root_.frame.h}, pal.bg);
+    else t.clear(pal.bg);
 
     // Cross-fade with a slight counter-slide: the outgoing screen drifts
     // left and the incoming one arrives from the right, which reads as
@@ -282,30 +546,20 @@ void FolioApp::paint(IPaintTarget& t, double now, float dpr) {
         float ox = state_.theme.revealOriginX();
         float oy = state_.theme.revealOriginY();
         if (ox < 0.f) { ox = width - 90.f; oy = 30.f; }
-
-        // The circle has to cover the furthest corner, or the old theme is
-        // left in a sliver at the far edge when the animation ends.
         const float dx = std::max(ox, width - ox);
         const float dy = std::max(oy, height - oy);
         const float rMax = std::sqrt(dx * dx + dy * dy);
-        const float r = rMax * p;
-
+        const float r = rMax * (dayInward ? 1.f - p : p);
         t.save();
         t.clipRoundedRect(Rect{ox - r, oy - r, r * 2.f, r * 2.f},
                           Corners::all(r), true);
-        const tokens::Palette np = state_.theme.incoming();
-        const PaintCtx nctx{np, now, dpr};
-        t.fillRect(Rect{0.f, 0.f, width, height}, np.bg);
-        root_.paintTree(t, nctx);
+        const tokens::Palette clipPal = dayInward
+            ? state_.theme.outgoing() : state_.theme.incoming();
+        t.fillRect(Rect{0.f, 0.f, width, height}, clipPal.bg);
+        root_.paintTree(t, PaintCtx{clipPal, now, dpr});
         t.restore();
-
-        // A hairline on the leading edge. Without it the boundary between
-        // two similar-luminance palettes is invisible and the whole effect
-        // reads as a flicker.
-        t.strokeRoundedRect(Rect{ox - r, oy - r, r * 2.f, r * 2.f},
-                            Corners::all(r),
-                            fade(np.accent, 0.5f * (1.f - p)), 2.f);
     }
+    if (partial) t.restore();
 }
 
 }  // namespace folio::ui

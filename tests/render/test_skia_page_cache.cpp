@@ -44,6 +44,42 @@ FOLIO_TEST_MAIN("skia page raster cache") {
     auto surf = makeSurface(400, 400);
     SkiaPaintTarget target(surf->getCanvas());
 
+    section("PDF marker blends tint paper without fogging rendered text pixels");
+    for (const bool night : {false, true}) {
+        auto page = makeSurface(80, 30);
+        SkiaPaintTarget marker(page->getCanvas());
+        marker.clear(night ? Color{0, 0, 0, 255} : Color{255, 255, 255, 255});
+        marker.fillRect({30.f, 4.f, 12.f, 22.f},
+                        night ? Color{255, 255, 255, 255}
+                              : Color{0, 0, 0, 255});
+        marker.setBlendMode(night ? BlendMode::Screen : BlendMode::Multiply);
+        marker.fillRectVerticalGradient({5.f, 2.f, 64.f, 26.f},
+                                       {255, 210, 65, 170}, {230, 150, 50, 170});
+        marker.setBlendMode(BlendMode::SrcOver);
+        marker.fillRect({70.f, 5.f, 5.f, 5.f}, {250, 12, 18, 255});
+        SkPixmap px;
+        check(page->peekPixels(&px), "marker pixels accessible");
+        if (px.addr()) {
+            const auto ink = px.getColor(36, 14);
+            const auto paper = px.getColor(12, 14);
+            const auto next = px.getColor(72, 7);
+            const bool inkSharp = night
+                ? SkColorGetR(ink) > 250 && SkColorGetG(ink) > 250 &&
+                  SkColorGetB(ink) > 250
+                : SkColorGetR(ink) < 5 && SkColorGetG(ink) < 5 &&
+                  SkColorGetB(ink) < 5;
+            const bool tintedPaper = night
+                ? SkColorGetR(paper) > 10 && SkColorGetG(paper) > 10
+                : SkColorGetB(paper) < 245 && SkColorGetG(paper) < 250;
+            check(inkSharp && tintedPaper,
+                  night ? "screen keeps inverted glyph white on tinted dark paper"
+                        : "multiply keeps original glyph black on tinted light paper");
+            check(SkColorGetR(next) == 250 && SkColorGetG(next) == 12 &&
+                  SkColorGetB(next) == 18,
+                  "later non-highlight drawing uses normal blending");
+        }
+    }
+
     section("a repeated draw runs its paint callback once");
     {
         SkiaPaintTarget::setRasterCacheBudget(64u * 1024u * 1024u);

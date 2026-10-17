@@ -1,181 +1,91 @@
-# Building Folio for Windows
+# Clean, on-demand Windows build
 
-Three routes, in order of how little you have to install.
+The current workspace is Linux. A Windows `.exe` needs a **real Windows SDK and
+MSVC-compatible compiler**; no native Windows binary is claimed to exist in
+this workspace yet. `tools/build-windows-clean.ps1` is the repeatable build
+entry point for a Windows PC or hosted Windows runner. It builds the current
+source, tests it, checks that `Folio.exe` is a GUI (not console) program,
+smoke-tests it, and emits one portable ZIP containing `Folio.exe`,
+`pdfium.dll`, fonts, sample documents and a README.
 
-| | You need | Time | Gives you |
-|---|---|---|---|
-| **A. GitHub Actions** | a GitHub account | ~10 min, unattended | `Folio.exe` as a downloadable zip |
-| **B. Local MSVC** | Visual Studio 2022 + CMake | ~15 min first time | a build tree you can debug |
-| **C. Tagged release** | a `git tag` | ~10 min | a public GitHub Release page |
+## Workspace contract
 
-Route A is the recommended one. Nothing in this project needs a Windows
-machine *you* own — the `windows-2022` runner is a perfectly good build box,
-and it is the only Windows machine this code has ever been compiled on.
+- The script makes a unique working directory under Windows `%TEMP%` and
+  copies the checkout there, **including current uncommitted source**.
+  Downloaded Skia/PDFium, CMake files, objects, test logs, staging and the
+  intermediate ZIP stay under that directory. It removes the whole working
+  directory on both success and failure. It never runs `cmake -B build` in
+  the source checkout.
+- Only after all tests, checks and the ZIP integrity check pass is a final
+  `Folio-windows-x64.zip` copied next to the checkout by default. `-OutputPath`
+  selects another final location. On failure, an earlier final ZIP is left
+  untouched; **do not mistake that older file for a fresh build**.
+- The script requires temporary free disk space for the Windows prebuilts and
+  native build. It downloads them again on a new invocation so no build cache
+  lives in the workspace. No admin rights are needed.
+- `FOLIO_WITH_PODOFO=OFF` is deliberate: PDFium Save As works for the supported
+  annotation types, but in-place incremental save/page-tree writing remains
+  unavailable. See [PoDoFo scope](#podofo-scope).
 
----
+## Local Windows machine
 
-## A. Build on GitHub (no Windows machine)
-
-1. Push this repository to GitHub.
-2. **Actions** tab → enable workflows if prompted.
-3. Left sidebar → **Release (Windows)** → **Run workflow** → *Run workflow*.
-4. When it goes green, open the run and download **Folio-windows-x64** from
-   the *Artifacts* box at the bottom.
-5. Unzip, run `Folio.exe`.
-
-Leave the *Build with PoDoFo* box unticked the first time. See
-[PoDoFo](#podofo-and-what-you-lose-without-it) below for what that costs you.
-
-The ordinary **CI** workflow also builds and tests Windows on every push to
-`main`, and uploads the same artifact. Use *Release (Windows)* when you
-specifically want a package; use CI to know whether `main` compiles.
-
-### If the Actions run fails
-
-| Symptom | Cause | Fix |
-|---|---|---|
-| `bootstrap-deps.ps1` 404s | skia-pack retagged the release | Bump `$SkiaTag` in `tools/bootstrap-deps.ps1` |
-| `platform backend is not win32` | CMake could not find the Windows SDK and silently chose the `none` backend | Check the *Configure* step log; the guard exists to stop a headless binary being shipped as a desktop app |
-| Link errors naming `skia.lib` | 32-bit/64-bit or Debug/Release mismatch | The workflow pins `-A x64` and Release; do not change one without the other |
-
----
-
-## B. Build locally with MSVC
-
-### Prerequisites
-
-* **Visual Studio 2022**, with the *Desktop development with C++* workload.
-  The free Community edition is enough. The workload brings MSVC, the
-  Windows 10/11 SDK and CMake.
-* **PowerShell 5.1** (ships with Windows) or newer.
-* No administrator rights are needed. Nothing is installed system-wide.
-
-### Steps
-
-Open **x64 Native Tools Command Prompt for VS 2022** (not a plain `cmd` — it
-sets the compiler environment), then:
-
-```bat
-git clone <your-fork-url> folio
-cd folio
-
-:: Fetches Skia + PDFium into %LOCALAPPDATA%\folio-deps. Idempotent:
-:: safe to re-run, re-uses what it already downloaded. ~250 MB, a few
-:: minutes on a normal connection.
-powershell -ExecutionPolicy Bypass -File tools\bootstrap-deps.ps1
-
-cmake -B build -G "Visual Studio 17 2022" -A x64 ^
-      -DCMAKE_BUILD_TYPE=Release ^
-      -DFOLIO_BUILD_UI=ON ^
-      -DFOLIO_WITH_PODOFO=OFF ^
-      -DFOLIO_DEPS_DIR="%LOCALAPPDATA%\folio-deps"
-
-cmake --build build --config Release --parallel
-ctest --test-dir build -C Release --output-on-failure
-```
-
-The executable lands at `build\folio-ui\Release\folio-desktop.exe`.
-
-### Running it from the build tree
-
-```bat
-copy "%LOCALAPPDATA%\folio-deps\pdfium\bin\pdfium.dll" build\folio-ui\Release\
-build\folio-ui\Release\folio-desktop.exe documents\Annual_Report_2026.pdf
-```
-
-Fonts resolve automatically: the shell looks for `assets\fonts` beside the
-executable, then one directory up, then at the path baked in at configure
-time — which is how a build tree works without copying anything.
-
-### To package it the way CI does
+Use Windows 10/11 x64 with the Visual Studio 2022 **Desktop development with
+C++** workload (Windows SDK), PowerShell 5.1+ and CMake >= 3.28. From a
+PowerShell session in the checkout:
 
 ```powershell
-mkdir dist
-copy build\folio-ui\Release\folio-desktop.exe dist\Folio.exe
-copy "$env:LOCALAPPDATA\folio-deps\pdfium\bin\pdfium.dll" dist\
-xcopy /E /I assets    dist\assets
-xcopy /E /I documents dist\documents
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\build-windows-clean.ps1
+# Optional: -OutputPath 'C:\deliverables\Folio-windows-x64.zip'
 ```
 
-All four must travel together.
+The script uses the VS 2022 x64 CMake generator by default. For ClangCL,
+launch from an **x64 Native Tools** shell with clang-cl and Ninja available:
 
----
-
-## C. Cut a release
-
-```bash
-git tag v0.1.0
-git push origin v0.1.0
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\build-windows-clean.ps1 -Compiler ClangCL
 ```
 
-`.github/workflows/release-windows.yml` builds, tests, packages, verifies the
-package contains the exe + DLL + fonts, and attaches
-`Folio-windows-x64.zip` to a GitHub Release with generated notes.
+ClangCL still needs the MSVC libraries and Windows SDK. MinGW cannot link the
+pinned MSVC-ABI Skia `.lib` files. When the build succeeds the script prints
+the final path and SHA-256. Unzip the package before running `Folio.exe`;
+`pdfium.dll` and `assets/fonts` must stay alongside it. The app is unsigned,
+so Windows SmartScreen may ask for confirmation.
 
----
+## Hosted Windows runner / GitHub Actions
 
-## What actually gets built on Windows
+The **canonical workflow templates** are `github-workflows/release-windows.yml`
+and `github-workflows/windows-clang.yml`, **not** in `.github/`. As required by
+GitHub itself, to activate one you must copy its YAML to `.github/workflows/`
+**in the remote repository** and push it together with the latest source.
+Keeping the template only in `github-workflows/` does not register an Action.
+This checkout deliberately has no active Windows YAML in `.github/workflows/`.
+See [github-workflows/README.md](github-workflows/README.md) for the copy
+commands and constraints.
 
-| Target | Windows | Why |
-|---|---|---|
-| `folio-core`, `folio-render`, `folio-engine` | yes | portable C++ |
-| `folio-platform` (`win32` backend) | yes | `Win32Window.cpp` |
-| `folio-desktop` → `Folio.exe` | **yes — this is the app** | |
-| `folio-stream` | **no** | the HTTP shell is built on BSD sockets; it is a development transport, not a product |
-| tests | yes | `ctest -C Release` |
+After activation, Actions → **Windows x64 (build, test, package)** → **Run
+workflow** builds, tests and uploads `Folio-windows-x64` (ZIP inside). It also
+runs on pushes and pull requests to `main`; a `v*` tag publishes a release
+**only after** the build, required test inventory, full CTest suite, GUI
+subsystem/smoke test and ZIP check pass. A failed job uploads **no** verified
+Windows ZIP. The ClangCL template provides a separate optional compiler gate.
+If activating the broader `github-workflows/ci.yml` too, its Windows job uses
+the same builder, so PR/push Windows jobs would be duplicated. Hosted runs build the **pushed Git commit**, not unpushed edits
+in this workspace. A remote runner and a way to fetch its artifact are
+necessary before this assistant can actually hand over a Windows package;
+there is no connected runner or Windows SDK here now.
 
-`folio-stream` is the thing you have been clicking in the live preview. It is
-deliberately Unix-only; on Windows the native shell is the real app, and
-there is nothing the stream shell does that `Folio.exe` does not do better.
+The earlier user-run ClangCL workflow compiled but failed 1/14 tests due to
+42 PDFium subpixels differing by 1/255 at 2x; its regression threshold has
+since been corrected. **A new green Windows run has not yet happened.**
+Build/lint here on Linux is not a substitute for that check.
 
----
+## PoDoFo scope
 
-## PoDoFo, and what you lose without it
-
-CI builds with `-DFOLIO_WITH_PODOFO=OFF`. Without PoDoFo:
-
-* **You keep:** opening, rendering, zoom, search, text selection, every
-  annotation tool, undo/redo, page operations in-session.
-* **You lose:** writing annotations back into the PDF file. Annotations
-  exist for the session and are not saved to disk.
-
-PoDoFo has no official Windows prebuilt that matches this project's layout.
-To enable it you would use vcpkg (`vcpkg install podofo:x64-windows`) and
-pass `-DFOLIO_WITH_PODOFO=ON -DCMAKE_TOOLCHAIN_FILE=<vcpkg>/scripts/buildsystems/vcpkg.cmake`.
-That path is **untested** — flagged rather than claimed.
-
----
-
-## Honest status of the Windows port
-
-Read this before judging the first build.
-
-* `folio-platform/win32/Win32Window.cpp` is **808 lines that have never been
-  compiled by a Windows SDK.** It was written against the same `IWindow`
-  interface the working X11 backend implements, but first contact with
-  `cl.exe` will almost certainly produce errors. Expect to iterate.
-* The CI job has a guard that fails the build if CMake quietly selects the
-  `none` backend, so you cannot accidentally ship a window-less binary.
-* **There is no single-file exe.** `pdfium-binaries` ships PDFium as a DLL,
-  not a static library, so `pdfium.dll` must sit beside `Folio.exe`. A
-  genuinely self-contained binary means building PDFium from source with
-  `is_component_build=false` — hours of Chromium toolchain, and not worth it
-  until the app is otherwise finished.
-* **The binary is unsigned**, so SmartScreen will warn on first run. Signing
-  needs a purchased certificate.
-* MinGW is not an option: skia-pack's `.lib` files are MSVC-ABI, and
-  MinGW-w64 uses the Itanium C++ ABI. They cannot be linked together.
-
-## Licence exposure, per dependency
-
-| Dependency | Licence | Obligation if you ship |
-|---|---|---|
-| Skia | BSD-3-Clause | attribution |
-| PDFium | BSD-3-Clause | attribution |
-| FreeType (in Skia) | FTL or GPLv2 | attribution under FTL |
-| HarfBuzz, ICU (in Skia) | MIT / Unicode | attribution |
-| PoDoFo *(optional)* | LGPL-2.0+ **or** MPL-2.0 | if statically linked under LGPL, you must allow relinking; dynamic linking avoids this |
-
-Nothing here is copyleft-viral as configured, **provided PoDoFo is either
-left off or dynamically linked.** This is a summary written by an engineer,
-not legal advice.
+Windows packaging uses `-DFOLIO_WITH_PODOFO=OFF`. It can open, render,
+search, select text and work with annotations; PDFium Save As can export
+highlights, underlines, strikeouts, ink, notes, boxes and ellipses as a
+separate PDF. In-place incremental save and page-tree writing remain
+PoDoFo-only; free text, stamps and signatures cannot be exported by that
+PDFium route and should report failure rather than silently disappearing.
+A Windows PoDoFo build via vcpkg is untested and is not advertised as part of
+the clean deliverable process.

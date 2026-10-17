@@ -25,6 +25,8 @@
 #include "folio/render/IPaintTarget.h"
 
 #include <cstdint>
+#include <array>
+#include <unordered_map>
 #include <string>
 #include <utility>
 #include <vector>
@@ -54,6 +56,8 @@ enum class AnnotKind : std::uint8_t {
     Text,       ///< free text
     Stamp,
     Signature,
+    Line,       ///< straight free-form line
+    Arrow,      ///< line with arrowhead at its end
 };
 
 struct Annotation {
@@ -63,6 +67,17 @@ struct Annotation {
     /// markup is per-quad), but it is ONE thing to the person who made it:
     /// clicking any line selects, recolours and deletes all of them.
     std::uint64_t group = 0;
+    /// True only for markup created from selected PDF glyph quads. A box
+    /// drawn with the highlighter tool is free-form and remains movable.
+    bool textLinked = false;
+    // Imported editable PDF annotation converted to a Folio overlay. The
+    // source object remains in the original PDF; the viewer suppresses it
+    // and export replaces ONLY the matching subtype/index. A tombstone keeps
+    // deletions durable and undoable without deleting unrelated PDF objects.
+    int sourceIndex = -1;
+    int sourceSubtype = 0;
+    std::uint64_t sourceFingerprint = 0;
+    bool deleted = false;
     AnnotKind kind = AnnotKind::Ink;
     int page = 0;
 
@@ -75,6 +90,7 @@ struct Annotation {
     /// Normalised polyline, used by Ink.
     std::vector<Point> points;
     std::string text;
+    std::string comment; ///< note body / attached comment (PDF /Contents)
 
     // --- free text only ------------------------------------------------------
     /// Glyph height as a fraction of page height, so the size is a property
@@ -91,20 +107,27 @@ struct Annotation {
     }
 
     [[nodiscard]] bool empty() const {
-        return kind == AnnotKind::Ink ? points.size() < 2
-                                      : (box.w <= 0.0005f && box.h <= 0.0005f);
+        if (kind == AnnotKind::Line || kind == AnnotKind::Arrow) {
+            if (points.size() < 2) return true;
+            const float dx = points.back().x - points.front().x;
+            const float dy = points.back().y - points.front().y;
+            return dx * dx + dy * dy < .000004f;
+        }
+        if (kind == AnnotKind::Ink || kind == AnnotKind::Signature)
+            return points.size() < 2;
+        return box.w <= .0005f && box.h <= .0005f;
     }
 };
 
-/// Flat store with page indexing done by scan. A document with thousands of
-/// annotations would want a per-page bucket; at the scale a reader actually
-/// produces (tens per page) a scan is faster than maintaining the index.
+/// Authoritative annotations plus a lazily rebuilt per-page lookup. Index
+/// entries are offsets, never pointers, so vector reallocations cannot dangle.
 class AnnotationStore {
 public:
     std::uint64_t add(Annotation a) {
         a.id = ++nextId_;
         items_.push_back(std::move(a));
         ++revision_;
+        ++indexEpoch_;
         return nextId_;
     }
 
@@ -112,15 +135,25 @@ public:
     /// must restore the *same* id so any later command referring to it still
     /// resolves. Keeps the id counter above anything reinstated.
     void addExisting(const Annotation& a) {
+        for (auto& existing : items_) {
+            if (existing.id == a.id) {
+                existing = a;
+                ++revision_;
+                ++indexEpoch_;
+                return;
+            }
+        }
         items_.push_back(a);
         if (a.id > nextId_) nextId_ = a.id;
         ++revision_;
+        ++indexEpoch_;
     }
 
     /// Overwrite an annotation in place. Returns false if the id is gone.
     bool replace(std::uint64_t id, const Annotation& with) {
         for (auto& it : items_) {
             if (it.id != id) continue;
+            if (it.page != with.page) ++indexEpoch_;
             it = with;
             it.id = id;
             ++revision_;
@@ -171,12 +204,23 @@ public:
     void clear() {
         items_.clear();
         ++revision_;
+        ++indexEpoch_;
     }
 
     [[nodiscard]] const std::vector<Annotation>& all() const noexcept { return items_; }
+    bool saveSidecar(const std::string& file, const std::string& document) const;
+    bool loadSidecar(const std::string& file, const std::string& document);
     [[nodiscard]] std::vector<const Annotation*> forPage(int page) const;
     [[nodiscard]] std::size_t count() const noexcept { return items_.size(); }
     [[nodiscard]] std::size_t countOn(int page) const;
+    void setKindVisible(AnnotKind kind, bool on) noexcept {
+        visible_[static_cast<std::size_t>(kind)] = on;
+        ++revision_;
+    }
+    [[nodiscard]] bool kindVisible(AnnotKind kind) const noexcept {
+        return visible_[static_cast<std::size_t>(kind)];
+    }
+    void resetVisibility() noexcept { visible_.fill(true); ++revision_; }
 
     /// Bumped on every mutation, so views can tell when to redraw without
     /// diffing the contents.
@@ -211,6 +255,15 @@ public:
     [[nodiscard]] bool canUndo() const noexcept { return !items_.empty(); }
 
 private:
+    void ensurePageIndex() const;
+    mutable std::unordered_map<int, std::vector<std::size_t>> pageIndex_;
+    mutable std::uint64_t indexedEpoch_ = ~std::uint64_t{0};
+    std::uint64_t indexEpoch_ = 0;
+    std::array<bool, static_cast<std::size_t>(AnnotKind::Arrow) + 1> visible_ = [] {
+        std::array<bool, static_cast<std::size_t>(AnnotKind::Arrow) + 1> v{};
+        v.fill(true);
+        return v;
+    }();
     std::vector<Annotation> items_;
     Annotation draft_;
     bool hasDraft_ = false;
@@ -221,6 +274,6 @@ private:
 /// Draw one annotation into a page rect already placed on screen.
 /// `pageRect` is where the page is, in the target's current coordinates.
 void drawAnnotation(folio::render::IPaintTarget& t, const Annotation& a,
-                    const Rect& pageRect, float alpha);
+                    const Rect& pageRect, float alpha, bool darkPaper = false);
 
 }  // namespace folio::ui

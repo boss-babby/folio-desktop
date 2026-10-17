@@ -445,7 +445,13 @@ std::mutex gRasterMu;
 std::map<std::uint64_t, RasterEntry> gRaster;
 std::uint64_t gRasterClock = 0;
 std::size_t gRasterBytes = 0;
-std::size_t gRasterBudget = 256u * 1024u * 1024u;
+// Keep the Skia-owned caches separate from PDFium's budget, but account for
+// both: they may contain copies of the same displayed page.
+#if defined(__ANDROID__)
+std::size_t gRasterBudget = 16u * 1024u * 1024u;
+#else
+std::size_t gRasterBudget = 64u * 1024u * 1024u;
+#endif
 std::size_t gRasterHits = 0, gRasterMisses = 0, gRasterEvictions = 0;
 
 // Evict least-recently-used until we fit. Called with gRasterMu held.
@@ -562,7 +568,11 @@ struct ImageEntry {
 std::map<std::uint64_t, ImageEntry> g_images;
 std::uint64_t g_imageClock = 0;
 std::size_t   g_imageBytes = 0;
-constexpr std::size_t kImageBudget = 256u * 1024u * 1024u;
+#if defined(__ANDROID__)
+constexpr std::size_t kImageBudget = 24u * 1024u * 1024u;
+#else
+constexpr std::size_t kImageBudget = 64u * 1024u * 1024u;
+#endif
 
 void evictImages() {
     while (g_imageBytes > kImageBudget && g_images.size() > 1) {
@@ -710,9 +720,16 @@ void SkiaPaintTarget::drawImageBGRA(const void* pixels, int width, int height,
 }
 
 void SkiaPaintTarget::invalidateRasterCache() {
-    std::lock_guard<std::mutex> lk(gRasterMu);
-    gRaster.clear();
-    gRasterBytes = 0;
+    {
+        std::lock_guard<std::mutex> lk(gRasterMu);
+        gRaster.clear();
+        gRasterBytes = 0;
+    }
+    // Also release Skia's copied PDF images when the document is closed or
+    // replaced; otherwise this global cache retains tens of MiB after the
+    // PDFium page source and its mapped input have been destroyed.
+    g_images.clear();
+    g_imageBytes = 0;
 }
 
 void SkiaPaintTarget::trimRasterCache(std::uint64_t maxAgeFrames) {

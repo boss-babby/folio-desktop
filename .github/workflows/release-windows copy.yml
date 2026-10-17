@@ -1,0 +1,74 @@
+name: Windows x64 (build, test, package)
+
+# Canonical template lives in github-workflows/ as requested. GitHub Actions
+# only discovers a COPY committed to .github/workflows/ on the remote repo.
+# No Windows YAML is authored in .github/ in this workspace.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-x64-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: MSVC x64 / Win32 GUI / PDFium / Skia / CTest / portable ZIP
+    runs-on: windows-2022  # VS 2022, MSVC and Windows SDK; never cross-compile on Linux
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Verify Windows toolchain
+        shell: pwsh
+        run: |
+          if ($env:RUNNER_OS -ne 'Windows') { throw 'A Windows runner is required' }
+          cmake --version
+          if ($LASTEXITCODE -ne 0) { throw 'CMake >= 3.28 is required' }
+          # tools/build-windows-clean.ps1 checks the actual VS generator,
+          # Win32 backend and dependency versions when configuring.
+
+      - name: Build, run full tests, smoke-check and package in runner TEMP
+        shell: pwsh
+        run: |
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass `
+            -File tools/build-windows-clean.ps1 `
+            -Compiler MSVC `
+            -OutputPath (Join-Path $env:GITHUB_WORKSPACE 'Folio-windows-x64.zip')
+          if ($LASTEXITCODE -ne 0) { throw 'Windows build, tests or package verification failed' }
+
+      - name: Upload verified Windows build
+        uses: actions/upload-artifact@v4
+        with:
+          name: Folio-windows-x64
+          path: Folio-windows-x64.zip
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Attach passing build to version release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: windows
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: Folio-windows-x64
+          path: release
+      - name: Publish release ZIP
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/Folio-windows-x64.zip
+          fail_on_unmatched_files: true
+          generate_release_notes: true

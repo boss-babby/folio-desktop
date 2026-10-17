@@ -4,17 +4,14 @@
 //
 // WHERE THIS SITS
 // ---------------
-// PageStage knows only IPageSource: page count, page size, "draw page N into
-// this rectangle". PlaceholderPageSource satisfies that with synthetic
-// shapes. This satisfies it with PDFium. That boundary is why the UI needed
-// no changes to show a real document - the stage's layout, zoom anchoring,
-// raster cache and annotation overlay all work in page coordinates and do
-// not care what fills them.
+// PageStage knows only IPageSource: thumbnails use drawPage, while the
+// main canvas supplies its actual visible rectangle to drawVisiblePage.
+// Placeholder sources delegate to drawPage; this source renders only the
+// intersecting 512-device-pixel PDFium tiles on its document worker.
 //
 // DRAWING SOMETHING WHILE THE ENGINE WORKS
 // ----------------------------------------
-// Rasterisation is asynchronous, so drawPage() frequently has no bitmap at
-// the size it was asked for. Rather than leave a hole it degrades in order:
+// Rasterisation is asynchronous. Thumbnails served by drawPage() degrade as:
 //
 //   1. exact-size raster               - the normal case, a plain blit
 //   2. any other raster for that page  - blitted scaled, so a zoom gesture
@@ -28,11 +25,9 @@
 //
 // CACHE KEYING
 // ------------
-// Keyed on page *and* pixel width, not page alone. The thumbnail rail and
-// the main stage draw the same pages at wildly different sizes in the same
-// frame; a page-only key would have them evict each other every frame, which
-// is the most expensive possible behaviour. Eviction is LRU against a byte
-// budget.
+// Thumbnails are keyed by (page, pixel width). Canvas tiles add tile X/Y to
+// the key; old-scale on-screen tiles bridge continuous zoom while fresh ones
+// arrive. An inactive tab keeps only its open document, never its pixels.
 
 #pragma once
 
@@ -42,9 +37,13 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
+#include <tuple>
+#include <functional>
 
 namespace folio::engine {
 
@@ -66,12 +65,12 @@ public:
         int page = -1;
         int depth = 0;
     };
-    /// The real bookmark tree, read once on open. Empty for the many PDFs
-    /// that ship without one - which the panel has to say out loud rather
-    /// than inventing headings to fill the space.
+    /// The real bookmark tree, loaded in the background after first paint.
+    /// Empty for the many PDFs without one; the panel must not invent headings.
     [[nodiscard]] const std::vector<OutlineEntry>& outline() const noexcept {
         return outline_;
     }
+    [[nodiscard]] unsigned outlineRevision() const noexcept { return lastOutlineRevision_; }
 
     [[nodiscard]] bool isOpen() const noexcept { return pageCount_ > 0; }
     [[nodiscard]] const std::string& error() const noexcept { return error_; }
@@ -83,9 +82,20 @@ public:
     void drawPage(folio::render::IPaintTarget& t, int index,
                   const folio::render::Rect& dest, float scale,
                   folio::ui::PageTheme theme) override;
+    void drawVisiblePage(folio::render::IPaintTarget& t, int index,
+                         const folio::render::Rect& dest,
+                         const folio::render::Rect& visible,
+                         float scale, folio::ui::PageTheme theme) override;
+    bool drawCachedRegion(folio::render::IPaintTarget& t, int index,
+                          const folio::render::Rect& dest,
+                          const folio::render::Rect& visible, float scale,
+                          folio::ui::PageTheme theme) override;
     [[nodiscard]] std::string describe() const override;
     bool tick() override;
     [[nodiscard]] bool pending() const override;
+    [[nodiscard]] unsigned geometryRevision() const override {
+        return worker_->geometryRevision();
+    }
     void setFocusPage(int page) override;
     [[nodiscard]] bool cachesOwnRasters() const override { return true; }
 
@@ -109,6 +119,13 @@ public:
     /// Queue text extraction for every page that lacks it. Search needs the
     /// whole document, not just what has been looked at.
     void requestAllText();
+    /// Release search-only text once its hits have been indexed by the UI.
+    void releaseText(int page);
+
+    /// Null until the document worker indexes that page on demand.
+    const std::vector<PdfAnnotationInfo>* annotationsForPage(int page);
+    void releaseAnnotations(int page) { annotations_.erase(page); requestedAnnotations_.erase(page); }
+    void suppressSourceAnnotations(PdfiumWorker::Suppressed indices);
 
     struct CacheStats {
         std::size_t pages = 0;
@@ -117,18 +134,56 @@ public:
         std::uint64_t misses = 0;
         std::uint64_t proxies = 0;  // frames served by a wrong-size bitmap
     };
+    bool requestExport(std::vector<AnnotSpec> marks, std::string output);
+    /// Returned once after the worker has saved (or failed).
+    [[nodiscard]] std::optional<PdfiumWorker::Result> takeExportResult();
+
     [[nodiscard]] CacheStats cacheStats() const noexcept { return stats_; }
+    [[nodiscard]] bool hasCachedPageProxy(int page) const noexcept {
+        auto it = cache_.lower_bound(key(page, 0));
+        return it != cache_.end() && static_cast<int>(it->first >> 32) == page;
+    }
 
     /// Drop rendered pages that are not near `page`. Called when the view
     /// moves; keeps resident memory bounded by what is actually on screen.
     void trimTo(int page, int radius);
+    /// One paint frame's on-screen tile set. Unused tile jobs are cancelled;
+    /// no timer is left running to do speculative background rendering.
+    void beginVisibleFrame();
+    void endVisibleFrame() override;
+    void setVisibleThumbnailRange(int first, int last) override;
+    /// One-shot idle pruning: retain only images touched by the last frame.
+    void trimIdle();
+    /// Inactive tab or minimise: drop *all* pixels/text, keep the document.
+    void suspendVisualCaches();
+    void setWakeCallback(std::function<void()> wake) { worker_->setWakeCallback(std::move(wake)); }
+    [[nodiscard]] bool busy() const { return worker_->busy(); }
 
 private:
+    std::unordered_map<int, std::vector<PdfAnnotationInfo>> annotations_;
+    std::unordered_set<int> requestedAnnotations_;
+    std::optional<PdfiumWorker::Result> exportResult_;
     struct Rendered {
         std::unique_ptr<folio::core::RasterTile> tile;
         int           pxW = 0, pxH = 0;
         std::uint64_t lastUsed = 0;
+        std::uint64_t lastFrame = 0;
     };
+    using TileId = std::tuple<int,int,int,int>; // page, device width, tx, ty
+    struct VisibleTile {
+        std::unique_ptr<folio::core::RasterTile> pixels;
+        folio::core::DeviceRect rect{};
+        std::uint64_t lastUsed = 0;
+        std::uint64_t lastFrame = 0;
+    };
+    [[nodiscard]] std::uint64_t tileImageKey(const TileId& k) const {
+        auto [page, width, x, y] = k;
+        std::uint64_t h = imageKey(page, width) ^ 0xD2B74407B1CE6E93ull;
+        h ^= static_cast<std::uint64_t>(x + 1) * 0x9E3779B97F4A7C15ull;
+        h ^= static_cast<std::uint64_t>(y + 1) * 0xC2B2AE3D27D4EB4Full;
+        return h;
+    }
+    void evictTilesTo(std::size_t budget);
 
     static std::uint64_t key(int page, int pxW) {
         return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(page)) << 32) |
@@ -149,11 +204,38 @@ private:
     std::unique_ptr<PdfiumWorker> worker_;
     int         pageCount_ = 0;
     std::vector<OutlineEntry> outline_;
+    unsigned lastOutlineRevision_ = 0;
+    unsigned lastGeometryRevision_ = 0;
     std::string path_;
     std::string error_;
 
     std::map<std::uint64_t, Rendered>                   cache_;
-    std::unordered_map<int, int>                        requested_;  // page -> pxW
+    std::map<TileId, VisibleTile>                       tileCache_;
+    std::unordered_set<std::uint64_t>                    requestedTiles_;
+    std::unordered_set<std::uint64_t>                    nextRequestedTiles_;
+    std::uint64_t                                       frame_ = 0;
+    std::size_t                                         tileBytes_ = 0;
+    static std::uint64_t tileRequestKey(const TileId& k) {
+        auto [page, width, x, y] = k;
+        return (static_cast<std::uint64_t>(static_cast<std::uint16_t>(page)) << 48) |
+               (static_cast<std::uint64_t>(static_cast<std::uint16_t>(width)) << 32) |
+               (static_cast<std::uint64_t>(static_cast<std::uint16_t>(y)) << 16) |
+                static_cast<std::uint16_t>(x);
+    }
+    std::unordered_set<std::uint64_t>                    requested_;  // page + width
+    std::unordered_map<int, int>                        failedWidth_; // retry lower res
+    std::unordered_map<int, int>                        previewWidth_; // low-res visible proxy
+    std::unordered_set<int>                             failedPreview_;
+    // One page either side, plus one ahead in the current scroll direction:
+    // <=240x320 each, after the foreground has produced its first pixels.
+    std::unordered_set<int>                             adjacentPreviewQueued_;
+    int                                                 scrollDirection_ = 1;
+    int                                                 focusPage_ = -1;
+    int                                                 thumbnailFirst_ = -1;
+    int                                                 thumbnailLast_ = -1;
+    [[nodiscard]] bool visibleThumbnail(int page, int width) const noexcept {
+        return width <= 256 && page >= thumbnailFirst_ && page <= thumbnailLast_;
+    }
     std::unordered_map<int, std::shared_ptr<const PageText>> text_;
     std::unordered_map<int, bool>                       textRequested_;
     std::unordered_map<int, std::vector<folio::ui::PageGlyph>> uiGlyphs_;

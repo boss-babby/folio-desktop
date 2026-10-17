@@ -22,6 +22,8 @@ struct NativeShellOptions {
     /// beside and no readable assets directory, so its entry point unpacks
     /// the fonts and passes the destination here.
     std::string assetDir;
+    /// Private per-user state root; Android supplies internalDataPath.
+    std::string stateDir;
 };
 
 /// Runs until the window closes. Returns a process exit code.

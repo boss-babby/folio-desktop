@@ -42,7 +42,8 @@ GrGLFuncPtr resolve(void* ctx, const char* name) {
 struct SkiaGpuTarget::Impl {
     platform::IGlContext* gl = nullptr;
     sk_sp<GrDirectContext> context;
-    sk_sp<SkSurface> surface;
+    sk_sp<SkSurface> surface;       // persistent GPU scene; survives swaps
+    sk_sp<SkSurface> windowSurface; // the discardable default framebuffer
     int w = 0, h = 0;
     int stencil = 8;
     int samples = 1;
@@ -73,6 +74,13 @@ bool SkiaGpuTarget::initialise(platform::IGlContext& gl, std::string* error) {
         if (error) *error = "GrDirectContexts::MakeGL failed (GL too old for Ganesh?)";
         return false;
     }
+    // Ganesh's GPU resources are a FOURTH pool alongside PDFium bitmaps,
+    // SkImage copies and the window surface. Set an explicit mobile limit.
+#if defined(__ANDROID__)
+    impl_->context->setResourceCacheLimit(32u * 1024u * 1024u);
+#else
+    impl_->context->setResourceCacheLimit(64u * 1024u * 1024u);
+#endif
 
     impl_->stencil = gl.stencilBits();
     impl_->samples = gl.sampleCount();
@@ -87,8 +95,10 @@ bool SkiaGpuTarget::resize(int widthPx, int heightPx, float) {
     impl_->w = widthPx;
     impl_->h = heightPx;
 
-    // Wrap the window's own framebuffer. Rendering to an offscreen target
-    // and blitting would cost a full-screen copy every frame for nothing.
+    // The default framebuffer is undefined after SwapBuffers on Windows.
+    // Keep a GPU scene surface across frames so a clipped UI repaint cannot
+    // expose uninitialised pixels or rerender the PDF canvas. Presenting the
+    // already-composited texture is cheaper than replaying the widget tree.
     GrGLFramebufferInfo fbInfo{};
     fbInfo.fFBOID = impl_->gl ? impl_->gl->defaultFramebuffer() : 0;
     fbInfo.fFormat = 0x8058;  // GL_RGBA8
@@ -97,16 +107,22 @@ bool SkiaGpuTarget::resize(int widthPx, int heightPx, float) {
         widthPx, heightPx, impl_->samples, impl_->stencil, fbInfo);
 
     SkSurfaceProps props(0, kRGB_H_SkPixelGeometry);
-    impl_->surface = SkSurfaces::WrapBackendRenderTarget(
+    impl_->target.reset();
+    impl_->surface.reset();
+    impl_->windowSurface = SkSurfaces::WrapBackendRenderTarget(
         impl_->context.get(), backend, kBottomLeft_GrSurfaceOrigin,
         kRGBA_8888_SkColorType, SkColorSpace::MakeSRGB(), &props);
-
+    const auto info = SkImageInfo::Make(widthPx, heightPx, kRGBA_8888_SkColorType,
+                                         kPremul_SkAlphaType, SkColorSpace::MakeSRGB());
+    if (impl_->windowSurface)
+        impl_->surface = SkSurfaces::RenderTarget(
+            impl_->context.get(), skgpu::Budgeted::kYes, info, 0,
+            kBottomLeft_GrSurfaceOrigin, &props);
     if (!impl_->surface) {
-        impl_->target.reset();
+        impl_->windowSurface.reset();
         return false;
     }
-    impl_->target =
-        std::make_unique<skia::SkiaPaintTarget>(impl_->surface->getCanvas());
+    impl_->target = std::make_unique<skia::SkiaPaintTarget>(impl_->surface->getCanvas());
     return true;
 }
 
@@ -117,14 +133,29 @@ IPaintTarget* SkiaGpuTarget::begin() {
 }
 
 void SkiaGpuTarget::end() {
-    if (!impl_->context || !impl_->surface) return;
-    // flushAndSubmit on the context, not the surface: in m144 the surface
-    // overload is gone and the context form is the supported spelling.
-    impl_->context->flushAndSubmit(impl_->surface.get(), GrSyncCpu::kNo);
+    if (!impl_->context || !impl_->surface || !impl_->windowSurface) return;
+    // Only the damaged widgets were repainted into `surface`; the PDF and
+    // other unchanged pixels remain there. Blit the complete GPU snapshot
+    // to the swap buffer, whose prior contents cannot be trusted after swap.
+    auto snapshot = impl_->surface->makeImageSnapshot();
+    if (!snapshot) return;
+    impl_->windowSurface->getCanvas()->drawImage(snapshot, 0.f, 0.f);
+    impl_->context->flushAndSubmit(impl_->windowSurface.get(), GrSyncCpu::kNo);
 }
 
 void SkiaGpuTarget::purgeResources() {
-    if (impl_->context) impl_->context->freeGpuResources();
+    // The retained scene itself is a full-window texture. Free it too,
+    // otherwise freeGpuResources cannot reclaim pixels still referenced by
+    // our SkSurface. resize() recreates it on the next visible frame.
+    impl_->target.reset();
+    impl_->surface.reset();
+    impl_->windowSurface.reset();
+#if !defined(__ANDROID__)
+    if (impl_->context && impl_->gl) {
+        impl_->gl->makeCurrent();
+        impl_->context->freeGpuResources();
+    }
+#endif
 }
 
 bool SkiaGpuTarget::valid() const noexcept {

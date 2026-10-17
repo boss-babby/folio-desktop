@@ -61,6 +61,12 @@ void OverlayHost::cancelTooltip(const Widget* owner) {
     tipAlpha_.animateTo(0.f, tokens::dur::tooltip, now());
 }
 
+void OverlayHost::dismissTooltip() {
+    tipOwner_ = nullptr;
+    tipText_.clear();
+    tipAlpha_.reset(0.f);
+}
+
 namespace {
 void growTo(Rect& acc, const Rect& r) {
     if (r.w <= 0.f) return;
@@ -73,6 +79,18 @@ void growTo(Rect& acc, const Rect& r) {
 }  // namespace
 
 void OverlayHost::paintTooltip(IPaintTarget& t, const PaintCtx& ctx) {
+    // A hovered widget can be hidden without a Leave event (screen change,
+    // rotation, a closed sheet). Also time out labels even if no pointer
+    // movement follows; an old sort tooltip must never float over a PDF.
+    if (tipOwner_) {
+        for (const Widget* w = tipOwner_; w; w = w->parent()) {
+            if (!w->visible || w->opacity <= .003f ||
+                ctx.now - tipArmed_ > 2.5) {
+                dismissTooltip();
+                break;
+            }
+        }
+    }
     if (tipOwner_ != nullptr) {
         const double waited = (ctx.now - tipArmed_) * 1000.0;
         if (waited >= tokens::delay::tooltipHover) {
@@ -200,7 +218,7 @@ bool OverlayHost::animating(double now) const {
         return true;
     }
     // An armed-but-not-yet-shown tooltip needs frames so the delay can expire.
-    if (tipOwner_ && tipAlpha_.target() == 0.f) return true;
+    if (tipOwner_ && (now - tipArmed_) < 2.55) return true;
     // An indeterminate bar animates forever while visible.
     if (progressVisible_ && progress_ < 0.f) return true;
     // A visible toast needs frames until its auto-dismiss fires.
@@ -245,7 +263,8 @@ void Popover::open(Point anchorWindow, double now) {
         if (y + frame.h > windowSize.h - 8.f) y = anchor_.y - frame.h - 8.f;
     }
     frame.x = x;
-    frame.y = y;
+    frame.y = std::clamp(y, 8.f,
+                         std::max(8.f, windowSize.h - frame.h - 8.f));
 
     // The reveal grows from the anchor itself, projected onto the card.
     //
@@ -257,8 +276,8 @@ void Popover::open(Point anchorWindow, double now) {
     // Clamping the anchor into local bounds needs no flag and is right for
     // every placement, including one that was clamped sideways to stay on
     // screen.
-    revealFrom_ = Point{std::clamp(anchor_.x - x, 0.f, frame.w),
-                        std::clamp(anchor_.y - y, 0.f, frame.h)};
+    revealFrom_ = Point{std::clamp(anchor_.x - frame.x, 0.f, frame.w),
+                        std::clamp(anchor_.y - frame.y, 0.f, frame.h)};
     clipsContent = true;
 
     // Placement diagnostic. Popovers are white cards on white pages, which
@@ -273,6 +292,16 @@ void Popover::open(Point anchorWindow, double now) {
                      frame.y, frame.w, frame.h, revealFrom_.x, revealFrom_.y,
                      preferAbove ? 1 : 0, frame.x + frame.w);
     }
+}
+
+void Popover::constrainToWindow() {
+    if (!visible) return;
+    frame.x = std::clamp(frame.x, 8.f,
+                         std::max(8.f, windowSize.w - frame.w - 8.f));
+    frame.y = std::clamp(frame.y, 8.f,
+                         std::max(8.f, windowSize.h - frame.h - 8.f));
+    revealFrom_ = Point{std::clamp(anchor_.x - frame.x, 0.f, frame.w),
+                        std::clamp(anchor_.y - frame.y, 0.f, frame.h)};
 }
 
 void Popover::close(double now) {

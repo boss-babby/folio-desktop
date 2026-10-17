@@ -19,10 +19,17 @@
 #include "components/PageStage.h"
 #include "components/Annotations.h"
 #include "screens/AppState.h"
+#if FOLIO_HAVE_PDFIUM_SOURCE
+#include "pdfium/PdfiumWorker.h"
+#endif
 
 #include <functional>
+#include <future>
 #include <memory>
+#include <unordered_set>
 #include <vector>
+
+namespace folio::engine { class PdfiumPageSource; }
 
 namespace folio::ui {
 
@@ -32,7 +39,7 @@ public:
     explicit ThumbnailList(AppState& s);
 
     std::function<void(int)> onPick;
-    void setPageCount(int n) { pages_ = n; }
+    void setPageCount(int n);
 
     /// The same page source the stage draws, so thumbnails and pages can
     /// never show different content.
@@ -59,6 +66,8 @@ class OutlineList : public ScrollView {
 public:
     explicit OutlineList(AppState& s);
     std::function<void(int)> onPick;
+    std::function<void(std::size_t)> onPickEntry;
+    void setHeader(std::string header, std::string empty) { header_ = std::move(header); empty_ = std::move(empty); }
     void setPageCount(int n) { pages_ = n; }
 
     /// One heading from the document's own /Outlines tree.
@@ -67,7 +76,7 @@ public:
         int page = -1;
         int depth = 0;
     };
-    void setEntries(std::vector<Entry> e) { entries_ = std::move(e); }
+    void setEntries(std::vector<Entry> e);
     [[nodiscard]] bool empty() const noexcept { return entries_.empty(); }
 
     void onPaint(IPaintTarget& t, const PaintCtx& ctx) override;
@@ -78,6 +87,8 @@ private:
     int pages_ = 12;
     int hover_ = -1;
     std::vector<Entry> entries_;
+    std::string header_ = "Outline";
+    std::string empty_ = "This document has no bookmarks.";
 };
 
 class ReaderScreen : public Widget {
@@ -85,6 +96,12 @@ public:
     explicit ReaderScreen(AppState& state);
 
     std::function<void()> onBackToWelcome;
+    std::function<void()> onDocumentChanged;
+    void trimIdleVisualCaches();
+    void releaseVisualCaches();
+    void setWorkerWakeCallback(std::function<void()> wake);
+    [[nodiscard]] bool hasDocumentWork() const;
+    std::function<void()> onWorkerWake;
     /// Hand selected text to the platform clipboard. The streaming shell has
     /// nowhere to put it, so it is left unset there.
     std::function<void(const std::string&)> onCopyText;
@@ -98,6 +115,11 @@ public:
     std::function<void(const std::string& suggestedName,
                        std::function<void(std::string)>)> onPickSavePath;
     std::function<void()> onQuit;
+    /// Host publishes a fully written, validated private PDF through SAF.
+    std::function<bool(const std::string&, const std::string&)> onExportPdf;
+    std::function<bool(const std::string&, const std::string&)> onSharePdf;
+    bool pollExport();
+    void exportFinished(int status, const std::string& message);
 
     void openDocument(const std::string& title, int pages, double now);
 
@@ -111,10 +133,19 @@ public:
     /// returns false if it cannot be parsed, so a bad file degrades to the
     /// old behaviour rather than an empty window.
     bool openFile(const std::string& path, double now);
+    /// Install a PDF already parsed on a background loader, without blocking
+    /// the window thread on PDFium's document open and metadata scan.
+    bool openPreparedFile(const std::string& path,
+                          std::shared_ptr<IPageSource> prepared, double now);
+    void setTextInputCallback(std::function<void(bool)> callback) {
+        stage_->onTextInputRequested = std::move(callback);
+    }
 
-    /// Write the in-memory annotations into the PDF itself and save.
-    /// Incremental by default, so the original revision survives in the file.
+    /// Desktop writes back incrementally with PoDoFo. Android asynchronously
+    /// stages an annotated PDF and exports a separate copy through SAF;
+    /// the imported original and in-memory marks remain intact.
     bool saveDocument();
+    bool shareDocument();
     /// Page tree edits. All of them save, then reopen so the reader shows
     /// the real file rather than an optimistic guess at what it now holds.
     bool applyPageOp(const std::string& op);
@@ -124,12 +155,23 @@ public:
     void onPaintOverlay(IPaintTarget& t, const PaintCtx& ctx) override;
     bool onKey(const KeyEvent& e) override;
     [[nodiscard]] bool animating(double now) const override;
+    /// Geometry/page content is moving; clipping to a chrome hover region
+    /// would leave stale pixels behind, so paint the whole retained scene.
+    [[nodiscard]] bool requiresFullFrame(double now) const;
 
     /// Called by the app before the router runs, so an outside click can
     /// dismiss an open popover.
     void handleOutsideClick(Point windowPoint, double now);
+    /// Reset the focus-controls idle deadline only for actual contact/key
+    /// activity. Hover must not keep a phone awake or repainting.
+    void noteFocusInteraction(const PointerEvent& e);
+    void syncFocusAutoHidePreference(); // called after recents/preferences load
 
     [[nodiscard]] PageStage* stage() const noexcept { return stage_; }
+    [[nodiscard]] std::string currentFilePath() const {
+        return activeDoc_ >= 0 && activeDoc_ < static_cast<int>(docs_.size())
+            ? docs_[static_cast<std::size_t>(activeDoc_)].path : std::string{};
+    }
 
 private:
     void buildTitleBar();
@@ -138,13 +180,23 @@ private:
     void buildPill();
     void buildPopovers();
     void rebuildToolButtons(double now);
+    void selectTool(Tool tool);
     void installPanelPainters();
     void setMode(Mode m);
     void toggleLeftPanel();
     void toggleRightPanel();
     void syncPageLabel();
+    void applyPageTheme(PageTheme theme);
 
+#if FOLIO_HAVE_PDFIUM_SOURCE
+    std::shared_ptr<folio::engine::PdfiumPageSource> exportSource_;
+    bool exportPending_ = false;
+    bool sharingExport_ = false;
+    std::string desktopExportPath_;
+    std::string desktopStagingPath_;
+#endif
     AppState& state_;
+    bool layoutWasAnimating_ = false;
 
     // title bar
     TabBar* tabs_ = nullptr;
@@ -153,10 +205,9 @@ private:
 
     // --- phone chrome ------------------------------------------------------
     // A tab strip needs width a phone does not have, so the title bar
-    // carries the current document name as a dropdown instead. The theme
-    // toggle takes over the corner the window controls vacate - there is
-    // no minimise/maximise/close on a phone, and that corner is otherwise
-    // dead space.
+    // carries the current document name as a dropdown instead. The former
+    // sun/moon button remains in the phone title bar; only the redundant
+    // command-bar Display shortcut is hidden on phones.
     Button* docBtn_ = nullptr;
     Popover* docPop_ = nullptr;
     std::vector<Button*> docItems_;
@@ -182,27 +233,67 @@ private:
     std::vector<Widget*> cmdItems_;   // in order, for layout
     Widget* toolHost_ = nullptr;
     std::vector<Button*> toolBtns_;
+    Button* toolOverflowBtn_ = nullptr;
+    Popover* toolOverflowPop_ = nullptr;
+    std::vector<Button*> toolOverflowItems_;
+    Popover* shapePop_ = nullptr;
+    std::vector<Button*> shapeItems_;
+    PageStage::EditTool drawingShape_ = PageStage::EditTool::Ink;
+    void openDrawingMenu(Button* anchor);
+    void chooseDrawingShape(PageStage::EditTool shape);
     Button* displayBtn_ = nullptr;
     Button* leftToggle_ = nullptr;
     Button* rightToggle_ = nullptr;
     Button* focusBtn_ = nullptr;
-    /// Shown only in focus mode. Hiding the chrome removed every visible
-    /// way back out, which left the keyboard as the sole escape - fine if
-    /// you know about it, a trap if you do not.
-    Button* focusExitBtn_ = nullptr;
+    Button* deleteAnnotBtn_ = nullptr;
+    Button* focusPanelBtn_ = nullptr;       // pinned in right-panel header, all modes
+    Button* undoPanelBtn_ = nullptr;        // same per-document UndoStack as desktop
+    Button* redoPanelBtn_ = nullptr;
+    Button* rotateLeftBtn_ = nullptr;
+    Button* rotateRightBtn_ = nullptr;
+    Button* focusAutoHideBtn_ = nullptr;    // inspector preference, all modes
+    Button* selectionMagnifierBtn_ = nullptr; // saved reader-display preference
+    Button* focusExitBtn_ = nullptr;        // icon-only, shown on demand
+    Widget* focusWakeZone_ = nullptr;       // invisible top-right phone escape
+    bool focusControlsVisible_ = false;
+    double focusHideAt_ = 0.0;
+    std::unordered_set<PointerId> focusTouches_; // never hide while a finger is down
     void setFocusMode(bool on);
+    void showFocusControls(bool on);
+    void toggleFocusControlsFromPage();
     Button* shareBtn_ = nullptr;
 
     // work area
     SidePanel* leftPanel_ = nullptr;
     SidePanel* rightPanel_ = nullptr;
+    ScrollView* inspectorScroll_ = nullptr;
+    Widget* inspectorContent_ = nullptr;
     ThumbnailList* thumbs_ = nullptr;
     OutlineList* outline_ = nullptr;
+    OutlineList* notes_ = nullptr;
+    std::vector<std::uint64_t> noteIds_;
+    std::vector<std::pair<int, int>> pdfNoteRefs_;
+    int notesScanCursor_ = 0;
+    std::vector<OutlineList::Entry> pdfNotesEntries_;
+    std::vector<std::pair<int, int>> pdfNotesRefs_;
+#if FOLIO_HAVE_PDFIUM_SOURCE
+    std::vector<folio::engine::PdfAnnotationInfo> pdfNotesInfo_;
+    std::uint64_t adoptSourceAnnotation(int page, const folio::engine::PdfAnnotationInfo& info);
+    void syncImportedSuppression();
+#endif
+    std::uint64_t notesRevision_ = ~std::uint64_t{0};
+    ScrollView* layersScroll_ = nullptr;
+    Widget* layersContent_ = nullptr;
+    std::vector<Button*> layerItems_;
+    void syncNotes();
+    unsigned lastOutlineRevision_ = 0;
     PageStage* stage_ = nullptr;
     std::shared_ptr<IPageSource> pageSource_;
 
     std::vector<PageStage::TextRun> searchHits_;
     int                             searchIndex_ = -1;
+    std::u32string                  searchNeedle_;
+    int                             searchCursor_ = 0;
     Label*                          findCount_ = nullptr;
     Button*                         findPrev_ = nullptr;
     Button*                         findNext_ = nullptr;
@@ -227,11 +318,20 @@ private:
     Button* nextBtn_ = nullptr;
     Button* zoomOutBtn_ = nullptr;
     Button* zoomInBtn_ = nullptr;
+    Button* zoomPctBtn_ = nullptr; // transparent hit target beneath painted percentage
     Button* fitWidthBtn_ = nullptr;
     Button* fitPageBtn_ = nullptr;
     // --- annotation editing -------------------------------------------
     AnnotationStore annots_;
     std::vector<Button*> annotColorSw_;
+    Label* commentLabel_ = nullptr;
+    TextField* commentField_ = nullptr;
+    Button* saveCommentBtn_ = nullptr;
+    std::uint64_t commentTarget_ = 0;
+    std::string commentOriginal_;
+    void commitComment();
+    [[nodiscard]] std::string sidecarPath(const std::string& pdfPath) const;
+    void persistAnnotations();
 
     // --- compact tool options, in the command bar ------------------------
     // Every option a tool has, at the end of the command bar, one icon
@@ -245,6 +345,7 @@ private:
     enum class OptTarget { Tool, Markup, Annotation };
     OptTarget optTarget_ = OptTarget::Tool;
 
+    float lastOptionLayoutWidth_ = -1.f;
     Button* toolOptColor_ = nullptr;     ///< current ink, as a chip
     Button* toolOptSize_ = nullptr;      ///< stroke weight / text size
     Button* toolOptOpacity_ = nullptr;   ///< opacity
@@ -262,6 +363,7 @@ private:
     /// Ink shared by the Highlight tool and text-selection markup, so the
     /// two cannot disagree about what colour a highlight is.
     int markupColorIdx_ = 0;
+    float markupOpacity_ = 1.f;
 
     std::uint64_t selectedAnnot_ = 0;
 
@@ -296,7 +398,7 @@ private:
     void applyOptWidth(int widthIndex);
     void applyOptOpacity(float v);
     void applyOptFont(int familyIndex);
-    void onAnnotPicked(std::uint64_t id);
+    void onAnnotPicked(std::uint64_t id, bool fromTouch);
 
     /// Apply `mutate` to the selected annotation *and every other line of
     /// the same markup*, as one undo entry. Returns false if nothing is
@@ -355,6 +457,8 @@ private:
     Popover* findPop_ = nullptr;
     TextField* findField_ = nullptr;
     Popover* displayPop_ = nullptr;
+    Popover* zoomPop_ = nullptr;
+    std::vector<Button*> zoomPresetItems_;
     WindowControls* winCtl_ = nullptr;
     Popover* selPop_ = nullptr;
     std::vector<Button*> selBtns_;
@@ -405,21 +509,38 @@ private:
     void commitPageField();
 
     // --- open documents ----------------------------------------------------
-    // One tab per open file. Switching re-reads the page source from disk
-    // (PDFium is cheap to re-open and holding N documents resident is not
-    // worth it for a reader), but the per-document state that cannot be
-    // recovered from the file - annotations and the page you were on - is
-    // stashed here and restored.
+    // Open PDF workers remain mapped for fast switches; only the visible
+    // document retains decoded visual tiles. The lightweight snapshot below
+    // restores the actual viewport/reader controls without retaining pixels.
     struct OpenDoc {
         std::string path;
         std::string title;
         std::vector<Annotation> annots;
+        std::shared_ptr<IPageSource> source;
+        PageStage::ViewState view{};
+        PageTheme pageTheme = PageTheme::Light;
+        std::uint64_t selectedAnnot = 0;
+        float thumbnailScroll = 0.f;
+        float outlineScroll = 0.f;
+        int leftTab = 0;
+        bool leftCollapsed = true;
+        bool rightCollapsed = true;
+        bool focusMode = false;
+        bool hasView = false;
         int page = 1;
+        int pages = 1;
     };
     std::vector<OpenDoc> docs_;
     int activeDoc_ = -1;
+    // Closing a busy document must not join its PDFium worker on the UI
+    // thread. Futures own retired sources until cleanup finishes; their
+    // destruction at application shutdown still waits for safe teardown.
+    std::vector<std::future<void>> retiringDocs_;
+    void retireClosedSource(std::shared_ptr<IPageSource> source);
+    void reapRetiredSources();
     /// Load a file into the view. Does not touch the tab strip or `docs_`.
-    bool loadPath(const std::string& path, double now);
+    bool loadPath(const std::string& path, double now,
+                  std::shared_ptr<IPageSource> prepared = {});
     /// Copy the live annotations and page number into `docs_[activeDoc_]`.
     void stashActiveDoc();
     void switchToDoc(int index, double now);

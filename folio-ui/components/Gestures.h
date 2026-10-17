@@ -74,7 +74,10 @@ inline constexpr double kLongPress = 0.5;
 /// Two taps closer together than this, within slop, are a double tap.
 inline constexpr double kDoubleTap = 0.3;
 /// Below this speed at release there is no fling, just a stop.
-inline constexpr float kFlingMin = 120.f;
+inline constexpr float kFlingMin = 160.f;
+/// A short Android finger flick should advance a viewport, not dozens of
+/// pages. Clamp the input velocity as well as the stage's final fling.
+inline constexpr float kFlingMax = 2600.f;
 /// Velocity smoothing. Lower trusts history more.
 inline constexpr float kVelocityAlpha = 0.35f;
 }  // namespace gesture
@@ -93,6 +96,11 @@ public:
     void clear() { pointers_.clear(); kind_ = GestureKind::None; }
 
     [[nodiscard]] std::size_t count() const noexcept { return pointers_.size(); }
+    [[nodiscard]] bool longPressPending() const noexcept {
+        return !longPressFired_ && pointers_.size() == 1 &&
+               !pointers_.front().moved &&
+               pointers_.front().type == PointerType::Touch;
+    }
     [[nodiscard]] GestureKind kind() const noexcept { return kind_; }
     [[nodiscard]] const std::vector<ActivePointer>& pointers() const noexcept {
         return pointers_;

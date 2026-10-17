@@ -1,0 +1,47 @@
+name: Windows ClangCL (clean workspace)
+
+# TEMPLATE: Windows SDK/MSVC environment is supplied by the runner, but
+# downloaded dependencies, the source working copy, build and staging all
+# live under TEMP. Copy to .github/workflows/ on the remote to activate.
+on:
+  workflow_dispatch:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-clang:
+    name: Build and test Windows x64 ClangCL
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Check compiler
+        shell: pwsh
+        run: |
+          clang-cl --version
+          if ($LASTEXITCODE -ne 0) { throw 'Missing clang-cl' }
+          ninja --version
+          if ($LASTEXITCODE -ne 0) { throw 'Missing Ninja' }
+
+      - name: Build, test and package in TEMP
+        shell: pwsh
+        run: |
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass `
+            -File tools/build-windows-clean.ps1 `
+            -Compiler ClangCL `
+            -OutputPath (Join-Path $env:GITHUB_WORKSPACE 'Folio-windows-clang-x64.zip')
+          if ($LASTEXITCODE -ne 0) { throw 'Windows ClangCL build, tests or package verification failed' }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Folio-windows-clang-x64
+          path: Folio-windows-clang-x64.zip
+          if-no-files-found: error
+          retention-days: 30

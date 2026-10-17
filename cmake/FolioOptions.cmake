@@ -26,6 +26,14 @@ endif()
 # --- build options ---------------------------------------------------------
 option(FOLIO_BUILD_UI     "Build the UI and shell"       ON)
 option(FOLIO_BUILD_TESTS  "Build tests"                  ON)
+# Windows/Android do not ship PoDoFo by default. An explicit ON on Windows
+# must resolve a library or configure will fail instead of silently dropping it.
+if(WIN32 OR ANDROID)
+    set(_folio_podofo_default OFF)
+else()
+    set(_folio_podofo_default ON)
+endif()
+option(FOLIO_WITH_PODOFO "Enable optional PoDoFo editing engine" ${_folio_podofo_default})
 option(FOLIO_BUILD_FUZZ   "Build libFuzzer targets"      OFF)
 
 # PDFium feature flags. XFA and V8 together add ~20-25 MB to the binary and a

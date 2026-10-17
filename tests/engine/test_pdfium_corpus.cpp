@@ -124,7 +124,7 @@ FOLIO_TEST_MAIN("pdfium corpus") {
         // Last page too: single-page assumptions in a page tree walk tend to
         // show up at the end, not the beginning.
         if (pages > 1) {
-            auto last = rast.renderFullPage(PageId{pages - 1}, 1.0f, 0,
+            auto last = rast.renderFullPage(PageId{static_cast<PageId>(pages - 1)}, 1.0f, 0,
                                             ColorScheme::Light);
             check(last != nullptr, "  last page renders");
             if (last) check(inkCoverage(*last) > 0.0005, "  last page is not blank");

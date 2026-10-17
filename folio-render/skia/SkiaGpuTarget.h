@@ -1,7 +1,7 @@
 // folio-render/skia/SkiaGpuTarget.h
 //
-// A Ganesh-backed paint target that draws straight into a window's default
-// framebuffer.
+// A Ganesh-backed persistent scene surface, presented into the window's
+// default framebuffer after partial or full painting.
 //
 // This is the only file that knows both Skia's GPU API and the fact that a
 // GL context exists. folio-platform hands out `makeCurrent` / `swapBuffers`
@@ -44,8 +44,8 @@ public:
     /// a software Folio is still a working Folio.
     bool initialise(platform::IGlContext& gl, std::string* error);
 
-    /// Point at a framebuffer of this size. Cheap when the size has not
-    /// changed; re-wraps the backend render target when it has.
+    /// Recreate the persistent GPU scene and window target on resize.
+    /// Unchanged dimensions retain the previous scene for partial repaint.
     bool resize(int widthPx, int heightPx, float dpr);
 
     /// The target to paint into this frame, or nullptr if unusable.

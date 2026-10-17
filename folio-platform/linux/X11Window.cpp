@@ -862,6 +862,19 @@ void X11Window::translate(const XEvent& ev) {
             }
             return;
 
+        case UnmapNotify:
+            e.type = Event::Type::Minimized;
+            queue_.push_back(std::move(e));
+            return;
+
+        case MapNotify:
+            e.type = Event::Type::Resize; // restoration, even at the same size
+            e.w = w_;
+            e.h = h_;
+            e.scale = scale_;
+            queue_.push_back(std::move(e));
+            return;
+
         case ConfigureNotify:
             if (ev.xconfigure.width != w_ || ev.xconfigure.height != h_) {
                 w_ = ev.xconfigure.width;

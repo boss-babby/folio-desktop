@@ -123,14 +123,16 @@ bool SegmentedControl::onPointer(const PointerEvent& e) {
         case PointerPhase::Move:
         case PointerPhase::Enter: {
             const int idx = indexAt(e.pos);
-            if (idx != hoverIndex_) {
+            const bool changed = idx != hoverIndex_;
+            if (changed) {
                 hoverIndex_ = idx;
-                if (idx >= 0 && !items_[static_cast<std::size_t>(idx)].tooltip.empty()) {
+                if (!e.isTouch() && idx >= 0 &&
+                    !items_[static_cast<std::size_t>(idx)].tooltip.empty()) {
                     OverlayHost::current().requestTooltip(
                         this, items_[static_cast<std::size_t>(idx)].tooltip, e.timestamp);
                 }
             }
-            return true;
+            return changed;
         }
         case PointerPhase::Leave:
             hoverIndex_ = -1;
@@ -215,6 +217,19 @@ void TextField::onFocusChanged(bool gained) {
 bool TextField::onPointer(const PointerEvent& e) {
     if (e.phase == PointerPhase::Down) {
         caret_ = text.size();
+        if (multiline && !visibleRows_.empty()) {
+            const EditRow* row = &visibleRows_.front();
+            for (const auto& candidate : visibleRows_)
+                if (e.pos.y >= candidate.y) row = &candidate;
+            if (!row->positions.empty()) {
+                const float x = e.pos.x - editLeft_;
+                std::size_t nearest = 0;
+                for (std::size_t i = 1; i < row->advances.size(); ++i)
+                    if (x >= (row->advances[i - 1] + row->advances[i]) * .5f)
+                        nearest = i;
+                caret_ = std::min(row->positions[nearest], text.size());
+            }
+        }
         caretReset_ = e.timestamp;
         return true;
     }
@@ -243,8 +258,12 @@ bool TextField::onKey(const KeyEvent& e) {
         case Key::Home:  caret_ = 0; break;
         case Key::End:   caret_ = text.size(); break;
         case Key::Enter:
-            if (onSubmit) onSubmit();
-            return true;
+            if (multiline) {
+                text.insert(caret_, "\n");
+                ++caret_;
+            } else if (onSubmit) onSubmit();
+            if (!multiline) return true;
+            break;
         case Key::Escape:
             return false;  // let the popover close
         default:
@@ -310,6 +329,72 @@ void TextField::onPaint(IPaintTarget& t, const PaintCtx& ctx) {
                                       ? 0.f
                                       : tokens::space::gap),
                        b.h};
+    if (multiline) {
+        // Keep each row's UTF-8 start so the caret, wrap viewport and touch
+        // positioning all refer to the same text, even for multiline notes.
+        const std::string& value = showPlaceholder ? placeholder : text;
+        std::vector<std::string> rows{std::string{}};
+        std::vector<std::size_t> starts{0};
+        for (std::size_t i = 0; i < value.size();) {
+            const std::size_t begin = i;
+            if (value[i] == '\n') {
+                rows.emplace_back();
+                starts.push_back(++i);
+                continue;
+            }
+            do { ++i; } while (i < value.size() &&
+                              (static_cast<unsigned char>(value[i]) & 0xc0u) == 0x80u);
+            const auto piece = value.substr(begin, i - begin);
+            if (!rows.back().empty() &&
+                t.measureText(rows.back() + piece, ts) > textBox.w) {
+                rows.emplace_back();
+                starts.push_back(begin);
+            }
+            rows.back() += piece;
+        }
+        const std::size_t cursor = std::min(caret_, text.size());
+        const std::size_t caretRow = showPlaceholder ? 0 :
+            static_cast<std::size_t>(std::upper_bound(starts.begin(), starts.end(),
+                                                       cursor) - starts.begin() - 1);
+        const float lineH = 21.f;
+        const std::size_t maxRows = static_cast<std::size_t>(
+            std::max(1.f, (b.h - 16.f) / lineH));
+        const std::size_t first = rows.size() > maxRows
+            ? (focused ? std::min(caretRow, rows.size() - maxRows)
+                       : rows.size() - maxRows) : 0;
+        visibleRows_.clear();
+        editLeft_ = x;
+        t.save();
+        t.clipRoundedRect(b.inset(3.f), Corners::all(4.f));
+        for (std::size_t i = first; i < rows.size() && i < first + maxRows; ++i) {
+            const float y = 8.f + static_cast<float>(i-first)*lineH;
+            t.drawTextInBox(rows[i], Rect{x, y, textBox.w, lineH}, ts,
+                            folio::render::TextAlign::Left);
+            // The cached glyph advances make a tap place the caret at a
+            // character boundary rather than always appending to the note.
+            EditRow run;
+            run.y = y;
+            run.positions.push_back(starts[i]);
+            run.advances.push_back(0.f);
+            for (std::size_t at = starts[i], end = at + rows[i].size(); at < end;) {
+                at = nextCodepoint(value, at);
+                run.positions.push_back(at);
+                run.advances.push_back(t.measureText(
+                    std::string_view(value).substr(starts[i], at - starts[i]), ts));
+            }
+            visibleRows_.push_back(std::move(run));
+        }
+        if (focused && std::fmod(ctx.now - caretReset_, 1.06) < .53 &&
+            caretRow >= first && caretRow < first + maxRows) {
+            const float cx = x + t.measureText(
+                std::string_view(text).substr(starts[caretRow],
+                                              cursor - starts[caretRow]), ts);
+            t.fillRect(Rect{cx, 8.f + static_cast<float>(caretRow-first)*lineH,
+                            1.4f, 18.f}, ctx.pal.accent);
+        }
+        t.restore();
+        return;
+    }
     t.drawTextInBox(showPlaceholder ? placeholder : text, textBox, ts, align);
 
     // Caret: 530 ms blink, restarted on every edit so it is solid while
@@ -407,8 +492,11 @@ bool Slider::onPointer(const PointerEvent& e) {
         case PointerPhase::Move:
             // Move only acts while captured, which the router guarantees by
             // only delivering Move to the capture target during a drag.
-            if (e.phase == PointerPhase::Down || pressed) setFromX(e.pos.x);
-            return true;
+            if (e.phase == PointerPhase::Down || pressed) {
+                setFromX(e.pos.x);
+                return true;
+            }
+            return false;
         case PointerPhase::Up:
             return true;
         default:

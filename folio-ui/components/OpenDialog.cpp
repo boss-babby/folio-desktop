@@ -172,8 +172,13 @@ OpenDialog::OpenDialog() {
 }
 
 Rect OpenDialog::cardRect() const {
-    return Rect{(frame.w - kCardW) * 0.5f, (frame.h - kCardH) * 0.5f - 10.f, kCardW,
-                kCardH};
+    // A desktop-sized fixed card pushed its Open button off a 360dp phone.
+    // Keep all actions and the list inside the actual viewport, including
+    // landscape where the available height is smaller than the design card.
+    const float w = std::max(0.f, std::min(kCardW, frame.w - 24.f));
+    const float h = std::max(0.f, std::min(kCardH, frame.h - 24.f));
+    return Rect{(frame.w - w) * 0.5f,
+                std::max(12.f, (frame.h - h) * 0.5f - 10.f), w, h};
 }
 
 void OpenDialog::open(double now) {
@@ -182,6 +187,7 @@ void OpenDialog::open(double now) {
     visible = true;
     selected_ = -1;
     scroll_ = 0.f;
+    touchHeld_ = touchDragged_ = false;
     mode_ = Mode::Open;
     openBtn_->label = "Open";
     if (nameField_) nameField_->visible = false;
@@ -291,14 +297,37 @@ bool OpenDialog::onPointer(const PointerEvent& e) {
     if (!open_) return false;
     const Rect c = cardRect();
     const Rect list{c.x + 12.f, c.y + kListTop, c.w - 24.f,
-                    c.h - kListTop - kFootH - 8.f -
-                        (nameField_ && nameField_->visible ? kNameH : 0.f)};
+                    std::max(0.f, c.h - kListTop - kFootH - 8.f -
+                        (nameField_ && nameField_->visible ? kNameH : 0.f))};
+    const float maxS =
+        std::max(0.f, static_cast<float>(entries_.size()) * kRowH - list.h);
 
     if (e.phase == PointerPhase::Wheel) {
-        const float maxS =
-            std::max(0.f, static_cast<float>(entries_.size()) * kRowH - list.h);
         scroll_ = std::clamp(scroll_ - e.wheelY, 0.f, maxS);
         return true;
+    }
+    if (e.isTouch()) {
+        if (e.phase == PointerPhase::Down && list.contains(e.pos.x, e.pos.y)) {
+            touchId_ = e.pointerId;
+            touchStartY_ = touchLastY_ = e.pos.y;
+            touchHeld_ = true;
+            touchDragged_ = false;
+        } else if (e.phase == PointerPhase::Cancel) {
+            touchHeld_ = touchDragged_ = false;
+            return true;
+        } else if (touchHeld_ && e.pointerId == touchId_) {
+            if (e.phase == PointerPhase::Move) {
+                if (std::fabs(e.pos.y - touchStartY_) > 10.f) touchDragged_ = true;
+                if (touchDragged_)
+                    scroll_ = std::clamp(scroll_ - (e.pos.y - touchLastY_), 0.f, maxS);
+                touchLastY_ = e.pos.y;
+                return true;
+            }
+            if (e.phase == PointerPhase::Up) {
+                touchHeld_ = false;
+                if (touchDragged_) { touchDragged_ = false; return true; }
+            }
+        }
     }
 
     const bool inList = list.contains(e.pos.x, e.pos.y);
@@ -377,8 +406,8 @@ void OpenDialog::onPaintOverlay(IPaintTarget& t, const PaintCtx& ctx) {
                1.f);
 
     const Rect list{cr.x + 12.f, cr.y + kListTop, cr.w - 24.f,
-                    cr.h - kListTop - kFootH - 8.f -
-                        (nameField_ && nameField_->visible ? kNameH : 0.f)};
+                    std::max(0.f, cr.h - kListTop - kFootH - 8.f -
+                        (nameField_ && nameField_->visible ? kNameH : 0.f))};
     t.save();
     t.clipRect(list, true);
     for (std::size_t i = 0; i < entries_.size(); ++i) {

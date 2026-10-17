@@ -2,19 +2,37 @@
 
 #if FOLIO_HAVE_PDFIUM_SOURCE
 #include "pdfium/PdfiumPageSource.h"
+#include <fpdf_annot.h>
 #endif
 #if FOLIO_HAVE_PODOFO_SOURCE
 #include "podofo/PodofoDocument.h"
 #endif
 
 #include "folio/ui/Icons.h"
+#if FOLIO_HAVE_PDFIUM_SOURCE
+#include "AnnotationSpec.h"
+#endif
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+#include <filesystem>
 
 namespace folio::ui {
+
+#if FOLIO_HAVE_PDFIUM_SOURCE
+namespace {
+std::filesystem::path nativePath(const std::string& utf8) {
+    return std::filesystem::path(std::u8string(utf8.begin(), utf8.end()));
+}
+std::string utf8Path(const std::filesystem::path& path) {
+    const auto u8 = path.u8string();
+    return std::string(u8.begin(), u8.end());
+}
+} // namespace
+#endif
 
 namespace {
 /// The ink palette. Shared by the side-panel swatches, the command-bar
@@ -86,9 +104,48 @@ constexpr float kThumbLabelH = 20.f;
 constexpr float kThumbCellH = kThumbPageH + kThumbLabelH;
 constexpr float kCmdH = tokens::size::commandBar;
 constexpr float kPillH = tokens::size::pill;
+constexpr double kFocusIdleSeconds = 3.0;
+
+// Only active while immersive controls are hidden on a phone. It occupies a
+// small top-corner touch area, so an armed annotation tool can still reveal
+// the exit control without drawing an accidental mark on the PDF. The rest
+// of the canvas remains available for pinch, scroll and drawing.
+class FocusWakeZone final : public Widget {
+public:
+    FocusWakeZone() { acceptsPointer = true; debugName = "Focus wake zone"; }
+    std::function<void()> onWake;
+    bool onPointer(const PointerEvent& e) override {
+        if (e.phase == PointerPhase::Up && onWake) onWake();
+        return e.phase == PointerPhase::Down || e.phase == PointerPhase::Up;
+    }
+};
 constexpr float kRowH = 34.f;
 
 }  // namespace
+
+// The inspector owns a real scroll viewport. Moving only its content child
+// avoids relaying out 24 colour buttons on every drag/fling frame.
+class InspectorScrollView final : public ScrollView {
+public:
+    void onPaint(IPaintTarget& t, const PaintCtx& ctx) override {
+        ScrollView::onPaint(t, ctx);
+        if (!children().empty()) children().front()->frame.y = -scrollY();
+    }
+    bool onPointer(const PointerEvent& e) override {
+        const bool handled = ScrollView::onPointer(e);
+        if (!children().empty()) children().front()->frame.y = -scrollY();
+        return handled;
+    }
+};
+
+class InspectorContent final : public Widget {
+public:
+    std::function<void(IPaintTarget&, const PaintCtx&)> drawOverlay;
+    InspectorContent() { acceptsPointer = false; }
+    void onPaintOverlay(IPaintTarget& t, const PaintCtx& ctx) override {
+        if (drawOverlay) drawOverlay(t, ctx);
+    }
+};
 
 // ---------------------------------------------------------------------------
 // ThumbnailList
@@ -96,6 +153,11 @@ constexpr float kRowH = 34.f;
 
 ThumbnailList::ThumbnailList(AppState& s) : state_(s) {
     debugName = "ThumbnailList";
+}
+
+void ThumbnailList::setPageCount(int n) {
+    pages_ = n;
+    contentHeight = static_cast<float>(rows()) * (kThumbCellH + kGridGapY) + 10.f;
 }
 
 Rect ThumbnailList::thumbRect(int i) const {
@@ -122,14 +184,20 @@ bool ThumbnailList::onPointer(const PointerEvent& e) {
     switch (e.phase) {
         case PointerPhase::Move:
         case PointerPhase::Enter: {
-            hover_ = -1;
+            int next = -1;
             for (int i = 0; i < pages_; ++i) {
                 const Rect r = thumbRect(i);
-                if (e.pos.y >= r.y && e.pos.y < r.bottom()) { hover_ = i; break; }
+                if (r.contains(e.pos.x, e.pos.y)) { next = i; break; }
             }
+            if (next == hover_) return false; // unchanged motion needs no frame
+            hover_ = next;
             return true;
         }
-        case PointerPhase::Leave: hover_ = -1; return true;
+        case PointerPhase::Leave: {
+            const bool changed = hover_ != -1;
+            hover_ = -1;
+            return changed;
+        }
         case PointerPhase::Up:
             if (hover_ >= 0 && onPick) onPick(hover_ + 1);
             return true;
@@ -142,6 +210,14 @@ bool ThumbnailList::onPointer(const PointerEvent& e) {
 void ThumbnailList::onPaint(IPaintTarget& t, const PaintCtx& ctx) {
     ScrollView::onPaint(t, ctx);
     contentHeight = static_cast<float>(rows()) * (kThumbCellH + kGridGapY) + 10.f;
+    if (source_) {
+        const float rowH = kThumbCellH + kGridGapY;
+        const int first = std::clamp(static_cast<int>(scrollY_ / rowH) * 2,
+                                     0, std::max(0, pages_ - 1));
+        const int last = std::min(pages_ - 1, first +
+            (static_cast<int>(std::ceil((frame.h + 80.f) / rowH)) + 1) * 2 - 1);
+        source_->setVisibleThumbnailRange(pages_ > 0 ? first : -1, last);
+    }
 
     const Color paper = (state_.theme.pageTheme() == PageTheme::Dark)
                             ? tokens::pageTheme_dark.paper
@@ -190,24 +266,38 @@ void ThumbnailList::onPaint(IPaintTarget& t, const PaintCtx& ctx) {
 
 OutlineList::OutlineList(AppState& s) : state_(s) { debugName = "OutlineList"; }
 
+void OutlineList::setEntries(std::vector<Entry> e) {
+    entries_ = std::move(e);
+    contentHeight = kPanelPad * 2.f +
+        static_cast<float>(std::max<std::size_t>(1, entries_.size())) * kRowH + 30.f;
+}
+
 bool OutlineList::onPointer(const PointerEvent& e) {
     if (ScrollView::onPointer(e)) return true;
     switch (e.phase) {
         case PointerPhase::Move:
-        case PointerPhase::Enter:
+        case PointerPhase::Enter: {
             // The 22 px matches the "Outline" header that onPaint reserves
             // above the first row. Leaving it out made every click land on
             // the row below the one under the cursor.
-            hover_ = static_cast<int>(
+            int next = static_cast<int>(
                 std::floor((e.pos.y + scrollY_ - kPanelPad - 22.f) / kRowH));
-            if (hover_ < 0 || hover_ >= static_cast<int>(entries_.size())) hover_ = -1;
+            if (next < 0 || next >= static_cast<int>(entries_.size())) next = -1;
+            if (next == hover_) return false;
+            hover_ = next;
             return true;
-        case PointerPhase::Leave: hover_ = -1; return true;
+        }
+        case PointerPhase::Leave: {
+            const bool changed = hover_ != -1;
+            hover_ = -1;
+            return changed;
+        }
         case PointerPhase::Up:
             // Report the entry's own destination page, not the row index.
-            if (hover_ >= 0 && hover_ < static_cast<int>(entries_.size()) && onPick) {
+            if (hover_ >= 0 && hover_ < static_cast<int>(entries_.size())) {
+                if (onPickEntry) onPickEntry(static_cast<std::size_t>(hover_));
                 const int p = entries_[static_cast<std::size_t>(hover_)].page;
-                if (p >= 0) onPick(p + 1);
+                if (p >= 0 && onPick) onPick(p + 1);
             }
             return true;
         case PointerPhase::Down: return true;
@@ -222,7 +312,7 @@ void OutlineList::onPaint(IPaintTarget& t, const PaintCtx& ctx) {
     const int n = static_cast<int>(entries_.size());
     contentHeight = kPanelPad * 2.f + static_cast<float>(std::max(1, n)) * kRowH + 30.f;
 
-    t.drawTextInBox("Outline", Rect{kPanelPad + 2.f, 4.f, frame.w - 20.f, 18.f},
+    t.drawTextInBox(header_, Rect{kPanelPad + 2.f, 4.f, frame.w - 20.f, 18.f},
                     styleFor(tokens::type_sectionHeader, ctx.pal.muted),
                     folio::render::TextAlign::Left);
 
@@ -230,7 +320,7 @@ void OutlineList::onPaint(IPaintTarget& t, const PaintCtx& ctx) {
     // use than the invented "Chapter 1 / Section 1.1" ladder that used to
     // stand here, which looked like data and was not.
     if (n == 0) {
-        t.drawTextInBox("This document has no bookmarks.",
+        t.drawTextInBox(empty_,
                         Rect{kPanelPad + 2.f, kPanelPad + 26.f,
                              frame.w - kPanelPad * 2.f, 20.f},
                         styleFor(tokens::type_body, ctx.pal.muted),
@@ -271,28 +361,54 @@ ReaderScreen::ReaderScreen(AppState& state) : state_(state) {
     buildTitleBar();
     buildCommandBar();
     buildWorkArea();
+    leftPanel_->setCollapsedImmediately(state_.leftPanelCollapsed);
+    rightPanel_->setCollapsedImmediately(state_.rightPanelCollapsed);
     buildPill();
     buildPopovers();
     buildToolOptions();
     stage_->setStore(&annots_);
+#if FOLIO_HAVE_PDFIUM_SOURCE
+    stage_->onImportedAnnotHit = [this](int page, Point at) -> std::uint64_t {
+        auto pdf = std::dynamic_pointer_cast<folio::engine::PdfiumPageSource>(pageSource_);
+        if (!pdf) return 0;
+        const auto* list = pdf->annotationsForPage(page);
+        if (!list) return 0; // metadata is requested lazily on the worker
+        for (auto it = list->rbegin(); it != list->rend(); ++it) {
+            if (!it->editable || at.x < it->l - .008f || at.x > it->r + .008f ||
+                at.y < it->t - .008f || at.y > it->b + .008f) continue;
+            return adoptSourceAnnotation(page, *it);
+        }
+        return 0;
+    };
+#endif
     stage_->onAnnotationsChanged = [this] { syncPageLabel(); };
     stage_->onAnnotationAdded = [this](const Annotation& a) {
         edits_.push(std::make_unique<AddAnnotCommand>(annots_, a));
+        persistAnnotations();
         syncUndoButtons();
     };
     stage_->onAnnotationDeleted = [this](const Annotation& a) {
         edits_.push(std::make_unique<RemoveAnnotCommand>(annots_, a));
+        persistAnnotations();
+        syncUndoButtons();
+    };
+    stage_->onAnnotationGroupDeleted = [this](std::vector<Annotation> copies) {
+        edits_.push(std::make_unique<RemoveManyCommand>(annots_, std::move(copies)));
+        persistAnnotations();
         syncUndoButtons();
     };
     stage_->onAnnotationMoved = [this](const Annotation& before,
                                        const Annotation& after) {
         edits_.push(std::make_unique<ModifyAnnotCommand>(annots_, before, after,
                                                          "move annotation"));
+        persistAnnotations();
         syncUndoButtons();
     };
     syncTool();
+    syncUndoButtons();
     modePop_->setOwner(modeBtn_);
     layoutPop_->setOwner(viewBtn_);
+    zoomPop_->setOwner(zoomPctBtn_);
     displayPop_->setOwner(displayBtn_);
     findPop_->setOwner(searchBtn_);
     installPanelPainters();
@@ -350,7 +466,9 @@ void ReaderScreen::buildPhoneChrome() {
     docPop_ = emplace<Popover>();
     docPop_->setOwner(docBtn_);
 
-    // --- theme toggle, in the corner the window controls vacate -----------
+    // Keep the always-reachable title-bar theme shortcut on phones. It is
+    // distinct from the Display control in the command bar, which is the
+    // redundant icon that must be removed on mobile.
     themeBtn_ = emplace<Button>("", "sun", ButtonStyle::Icon);
     themeBtn_->visible = false;
     themeBtn_->tooltip = "Day / night";
@@ -385,16 +503,20 @@ void ReaderScreen::layOutPhoneChrome(const LayoutMetrics& m, float W, float H,
                                      float chromeY, float tb) {
     const bool phone = m.panelsOverlay;
 
-    // The window controls are a desktop affordance. A phone has none, so
-    // that corner is free - and it is the natural home for the one global
-    // switch that is not document state.
-    if (winCtl_) winCtl_->visible = !phone;
+    // Keep the title-bar sun/moon on a phone; only the command-bar Display
+    // icon is redundant. Native window controls do not belong on Android.
+#if defined(__ANDROID__)
+    if (winCtl_) winCtl_->visible = false;
+#else
+    if (winCtl_) winCtl_->visible = true; // desktop chrome survives narrow windows
+#endif
+    const float titleTrailing = W - 12.f - (winCtl_->visible
+                                ? winCtl_->preferredWidth() : 0.f);
     if (themeBtn_) {
         themeBtn_->visible = phone;
-        themeBtn_->icon =
-            state_.theme.scheme() == ColorScheme::Dark ? "moon" : "sun";
-        const float s = 30.f;
-        themeBtn_->setFrame(W - 12.f - s, chromeY + (tb - s) * 0.5f, s, s);
+        if (phone) themeBtn_->setFrame(titleTrailing - 34.f,
+                                       chromeY + (tb - 34.f) * 0.5f,
+                                       34.f, 34.f);
     }
 
     // Tabs need width a phone has not got; the document name takes over,
@@ -403,10 +525,10 @@ void ReaderScreen::layOutPhoneChrome(const LayoutMetrics& m, float W, float H,
         docBtn_->visible = phone;
         if (phone) {
             const float x = chromeLead_ + 86.f + 34.f;
-            const float right = W - 12.f - 34.f;
+            const float right = titleTrailing - 34.f - 8.f;
             docBtn_->label = docTitle_.empty() ? "Untitled" : docTitle_;
             docBtn_->setFrame(x, chromeY + (tb - 30.f) * 0.5f,
-                              std::max(90.f, right - x), 30.f);
+                              std::max(0.f, right - x), 30.f);
         }
     }
 
@@ -418,7 +540,7 @@ void ReaderScreen::layOutPhoneChrome(const LayoutMetrics& m, float W, float H,
     // as slivers poking out past its edge. They come back as it retracts.
     const float raised = std::max(leftPanel_->sheetProgress(now()),
                                   rightPanel_->sheetProgress(now()));
-    const bool showFabs = phone && raised < 0.5f;
+    const bool showFabs = phone && !state_.focusMode && raised < 0.5f;
     if (pagesFab_) {
         pagesFab_->visible = showFabs;
         pagesFab_->setFrame(m.gutter, fy, fab, fab);
@@ -530,6 +652,13 @@ void ReaderScreen::buildCommandBar() {
 
     toolHost_ = cmdBar_->emplace<Widget>();
     toolHost_->acceptsPointer = false;
+    toolOverflowBtn_ = cmdBar_->emplace<Button>("", "more", ButtonStyle::Icon);
+    toolOverflowBtn_->tooltip = "More tools";
+    toolOverflowBtn_->visible = false;
+    toolOverflowBtn_->onClick = [this] {
+        if (toolOverflowPop_->isOpen()) toolOverflowPop_->close(now());
+        else openPopoverFor(toolOverflowPop_, toolOverflowBtn_, false);
+    };
     rebuildToolButtons(0.0);
 
     // Search lives in the command bar's right-hand cluster, next to the
@@ -564,40 +693,98 @@ void ReaderScreen::buildCommandBar() {
         setFocusMode(!state_.focusMode);
     };
 
-    // The way out of focus mode. A child of the screen rather than the
-    // command bar, because the command bar is the thing that slides away.
-    focusExitBtn_ = emplace<Button>("Exit focus", "minimise-view",
-                                    ButtonStyle::Card);
+    // Only a small icon, not an always-visible text pill. Focus mode can
+    // remove it together with the bottom bar after an idle delay.
+    focusExitBtn_ = emplace<Button>("", "minimise-view", ButtonStyle::Card);
     focusExitBtn_->tooltip = "Leave focus mode  (Esc)";
     focusExitBtn_->visible = false;
     focusExitBtn_->onClick = [this] { setFocusMode(false); };
 
+    auto* wake = emplace<FocusWakeZone>();
+    wake->visible = false;
+    wake->setZOrder(zlayer::floating + 1);
+    wake->onWake = [this] { showFocusControls(true); };
+    focusWakeZone_ = wake;
+
     shareBtn_ = cmdBar_->emplace<Button>("Share", "share", ButtonStyle::Primary);
-    shareBtn_->onClick = [this] {
-        OverlayHost::current().showToast("Share sheet would open here", now());
-    };
+    shareBtn_->onClick = [this] { shareDocument(); };
+}
+
+void ReaderScreen::openDrawingMenu(Button* anchor) {
+    if (!shapePop_ || !anchor) return;
+    if (shapePop_->isOpen()) { shapePop_->close(now()); return; }
+    openPopoverFor(shapePop_, anchor, false);
+}
+
+void ReaderScreen::chooseDrawingShape(PageStage::EditTool shape) {
+    drawingShape_ = shape;
+    if (shapePop_) shapePop_->close(now());
+    selectTool(state_.mode == Mode::Edit ? Tool::Shapes : Tool::Pen);
+    for (std::size_t i = 0; i < shapeItems_.size(); ++i) {
+        static constexpr PageStage::EditTool shapes[] = {
+            PageStage::EditTool::Ink, PageStage::EditTool::Box,
+            PageStage::EditTool::Ellipse, PageStage::EditTool::Line,
+            PageStage::EditTool::Arrow};
+        shapeItems_[i]->toggled = shapes[i] == shape;
+    }
+}
+
+void ReaderScreen::selectTool(Tool tool) {
+    state_.tool = tool;
+    const auto choices = toolsFor(state_.mode);
+    for (std::size_t i = 0; i < toolBtns_.size(); ++i)
+        toolBtns_[i]->toggled = choices[i] == tool;
+    for (std::size_t i = 0; i < toolOverflowItems_.size(); ++i)
+        toolOverflowItems_[i]->toggled = choices[i] == tool;
+    if (annotHdr_) annotHdr_->text = toolName(tool);
+    if (toolOverflowPop_) toolOverflowPop_->close(now());
+    applyToolColour();
+    syncTool();
+    layoutTree();
 }
 
 void ReaderScreen::rebuildToolButtons(double now) {
+    // A hovered tool may be about to be destroyed. The tooltip host keeps
+    // the owner's pointer; release it before removing the button subtree.
+    OverlayHost::current().dismissTooltip();
+    if (shapePop_) {
+        shapePop_->close(now);
+        shapePop_->setOwner(nullptr);
+    }
     toolBtns_.clear();
     toolHost_->removeAllChildren();
-    for (Tool tool : toolsFor(state_.mode)) {
+    if (toolOverflowPop_) {
+        toolOverflowPop_->close(now);
+        toolOverflowPop_->removeAllChildren();
+        toolOverflowItems_.clear();
+    }
+    const auto choices = toolsFor(state_.mode);
+    for (Tool tool : choices) {
         auto* b = toolHost_->emplace<Button>("", toolIcon(tool), ButtonStyle::Icon);
         b->tooltip = toolName(tool);
-        b->toggled = (tool == state_.tool);
-        b->onClick = [this, tool] {
-            state_.tool = tool;
-            for (std::size_t i = 0; i < toolBtns_.size(); ++i) {
-                toolBtns_[i]->toggled =
-                    (toolsFor(state_.mode)[i] == state_.tool);
-            }
-            if (annotHdr_) annotHdr_->text = toolName(tool);
-            applyToolColour();
-            syncTool();
+        b->toggled = tool == state_.tool;
+        b->onClick = [this, tool, b] {
+            if (tool == Tool::Pen || tool == Tool::Shapes) openDrawingMenu(b);
+            else selectTool(tool);
         };
         toolBtns_.push_back(b);
+        if (toolOverflowPop_) {
+            auto* row = toolOverflowPop_->emplace<Button>(toolName(tool),
+                                                          toolIcon(tool), ButtonStyle::ListItem);
+            row->toggled = tool == state_.tool;
+            row->onClick = [this, tool] {
+                if (tool == Tool::Pen || tool == Tool::Shapes) {
+                    toolOverflowPop_->close(this->now());
+                    openDrawingMenu(toolOverflowBtn_);
+                } else selectTool(tool);
+            };
+            toolOverflowItems_.push_back(row);
+        }
     }
-    (void)now;
+    if (toolOverflowPop_)
+        toolOverflowPop_->setFrame(toolOverflowPop_->frame.x,
+                                   toolOverflowPop_->frame.y, 182.f,
+                                   12.f + 40.f * static_cast<float>(choices.size()));
 }
 
 void ReaderScreen::buildWorkArea() {
@@ -613,7 +800,12 @@ void ReaderScreen::buildWorkArea() {
             {"Pages", "", ""}, {"Outline", "", ""}, {"Notes", "", ""},
             {"Layers", "", ""}},
         0);
-    leftTabs_->onChange = [this](int i) { state_.leftTab = i; };
+    leftTabs_->onChange = [this](int i) {
+        state_.leftTab = i;
+        // Thumbnails and outline are separate children. Changing just the
+        // model leaves the old child's visibility cached until a resize.
+        layoutTree();
+    };
 
     leftCollapse_ = leftPanel_->emplace<Button>("", "chevron-left", ButtonStyle::Icon);
     leftCollapse_->tooltip = "Hide panel";
@@ -626,6 +818,75 @@ void ReaderScreen::buildWorkArea() {
     // separate right-hand list.
     outline_ = leftPanel_->emplace<OutlineList>(state_);
     outline_->onPick = [this](int page) { stage_->goToPage(page, now()); };
+    notes_ = leftPanel_->emplace<OutlineList>(state_);
+    notes_->debugName = "NotesList";
+    notes_->setHeader("Notes & highlights", "No indexed notes or highlights yet.");
+    notes_->onPickEntry = [this](std::size_t i) {
+        if (i >= noteIds_.size()) return;
+        const auto id = noteIds_[i];
+        if (!id) {
+            const auto [page, index] = pdfNoteRefs_[i];
+#if FOLIO_HAVE_PDFIUM_SOURCE
+            auto found = std::find(pdfNotesRefs_.begin(), pdfNotesRefs_.end(),
+                                   std::pair{page, index});
+            if (found != pdfNotesRefs_.end()) {
+                const auto position = static_cast<std::size_t>(found - pdfNotesRefs_.begin());
+                if (position < pdfNotesInfo_.size() && pdfNotesInfo_[position].editable) {
+                    const auto adopted = adoptSourceAnnotation(page, pdfNotesInfo_[position]);
+                    if (adopted) {
+                        stage_->goToPage(page + 1, now());
+                        stage_->selectAnnot(adopted);
+                        onAnnotPicked(adopted, true);
+                        return;
+                    }
+                }
+            }
+#endif
+            stage_->goToPage(page + 1, now());
+            OverlayHost::current().showToast(
+                "This PDF annotation subtype is preserved but not editable", now());
+            return;
+        }
+        const auto* a = annots_.get(id);
+        if (!a) return;
+        stage_->goToPage(a->page + 1, now());
+        stage_->selectAnnot(id);
+        selectedAnnot_ = id;
+        updateRightPanelContext();
+        if (!annots_.kindVisible(a->kind)) {
+            annots_.setKindVisible(a->kind, true);
+            for (std::size_t j = 0; j < 12; ++j)
+                layerItems_[j]->toggled = annots_.kindVisible(static_cast<AnnotKind>(j));
+        }
+        layoutTree();
+    };
+    layersScroll_ = leftPanel_->emplace<ScrollView>();
+    layersContent_ = layersScroll_->emplace<Widget>();
+    static constexpr const char* kLayerNames[] = {
+        "Highlights", "Underlines", "Strikethroughs", "Ink", "Notes",
+        "Boxes", "Ellipses", "Text", "Stamps", "Signatures", "Lines", "Arrows"};
+    for (std::size_t i = 0; i < std::size(kLayerNames); ++i) {
+        auto* row = layersContent_->emplace<Button>(kLayerNames[i], "", ButtonStyle::ListItem);
+        row->tooltip = std::string("Show or hide Folio ") + kLayerNames[i];
+        row->toggled = true;
+        row->onClick = [this, row, i] {
+            const auto kind = static_cast<AnnotKind>(i);
+            row->toggled = !annots_.kindVisible(kind);
+            annots_.setKindVisible(kind, row->toggled);
+            if (!row->toggled && annots_.get(selectedAnnot_) &&
+                annots_.get(selectedAnnot_)->kind == kind) {
+                stage_->deselectAnnot();
+                selectedAnnot_ = 0;
+                updateRightPanelContext();
+            }
+        };
+        layerItems_.push_back(row);
+    }
+    auto* pdfLayers = layersContent_->emplace<Button>(
+        "PDF layers (read-only)", "layers", ButtonStyle::ListItem);
+    pdfLayers->subtitle = "PDFium cannot list or switch source PDF layers";
+    pdfLayers->enabled = false;
+    layerItems_.push_back(pdfLayers);
 
     for (const char* lbl : {"Rotate", "Insert", "Extract", "Delete"}) {
         auto* b = leftPanel_->emplace<Button>(lbl, "", ButtonStyle::Ghost);
@@ -649,6 +910,7 @@ void ReaderScreen::buildWorkArea() {
                 state_.leftTab = idx;
                 leftTabs_->setSelected(idx, now());
                 toggleLeftPanel();
+                layoutTree();
             };
             leftRail_.push_back(r);
             ++idx;
@@ -657,6 +919,7 @@ void ReaderScreen::buildWorkArea() {
 
     // ---- stage ------------------------------------------------------------
     stage_ = emplace<PageStage>();
+    stage_->setSelectionMagnifierEnabled(state_.selectionMagnifier);
     stage_->onPageChanged = [this](int p) {
         thumbs_->setCurrent(p, now());
         syncPageLabel();
@@ -664,6 +927,7 @@ void ReaderScreen::buildWorkArea() {
     stage_->onSelectionCommitted = [this](Point windowPos) {
         if (!selPop_) return;
         syncToolOptions();   // the command bar now targets the markup
+        layoutTree();       // reserve property widths before the next frame
         if (selColorBtn_)
             selColorBtn_->swatchColor =
                 kToolInks[static_cast<std::size_t>(
@@ -672,8 +936,52 @@ void ReaderScreen::buildWorkArea() {
         selPop_->open(windowPos, now());
     };
     stage_->onSelectionCleared = [this] { closeSelectionPopup(); };
-    stage_->onAnnotSelectionChanged = [this](std::uint64_t id) {
-        onAnnotPicked(id);
+    stage_->onCanvasTap = [this] { toggleFocusControlsFromPage(); };
+    stage_->thumbInk = [](int i) {
+        return kToolInks[static_cast<std::size_t>(std::clamp(i, 0, kInkCount - 1))];
+    };
+    stage_->onThumbChoice = [this](int tool, int option, int value) {
+        // The radial palette uses the same tool, swatch and stroke state as
+        // the ordinary toolbar; switching mode never turns Focus off.
+        if (tool == 0) {
+            if (state_.mode != Mode::Read) setMode(Mode::Read);
+            selectTool(Tool::Hand);
+            return;
+        }
+        if (state_.mode != Mode::Annotate) setMode(Mode::Annotate);
+        if (tool == 1) selectTool(Tool::Highlight);
+        else if (tool == 2) {
+            // A second-layer colour/weight/opacity change must not silently
+            // reset a previously chosen Arrow/Line/Shape to freehand. A new
+            // Pen pick still intentionally starts with the freehand tip.
+            if (option < 0 || (state_.tool != Tool::Pen &&
+                               state_.tool != Tool::Shapes))
+                chooseDrawingShape(PageStage::EditTool::Ink);
+        } else if (tool == 3) selectTool(Tool::Eraser);
+        else return;
+        if (option == 0 && value >= 0 && value < kInkCount) {
+            toolColor_[static_cast<std::size_t>(state_.tool)] = value;
+            if (state_.tool == Tool::Highlight) markupColorIdx_ = value;
+            applyToolColour();
+            syncTool();
+        } else if (option == 1 && value >= 0 && value < kWeightCount) {
+            if (annotWidthSeg_) annotWidthSeg_->setSelected(value, now());
+            syncTool();
+        } else if (option == 2 && value >= 0 && value < 4) {
+            const float alpha = static_cast<float>(value + 1) * .25f;
+            if (annotOpacity_) annotOpacity_->setValue(alpha);
+            if (state_.tool == Tool::Highlight) markupOpacity_ = alpha;
+            syncTool();
+        } else if (option == 3 && tool == 2 && value >= 0 && value < 5) {
+            static constexpr PageStage::EditTool shapes[] = {
+                PageStage::EditTool::Ink, PageStage::EditTool::Box,
+                PageStage::EditTool::Ellipse, PageStage::EditTool::Line,
+                PageStage::EditTool::Arrow};
+            chooseDrawingShape(shapes[value]);
+        }
+    };
+    stage_->onAnnotSelectionChanged = [this](std::uint64_t id, bool fromTouch) {
+        onAnnotPicked(id, fromTouch);
     };
     stage_->onPageActivated = [this](int page) {
         // "Open" the tile: single page, fitted, on the one that was hit.
@@ -688,21 +996,76 @@ void ReaderScreen::buildWorkArea() {
 
     // ---- right panel: Display ---------------------------------------------
     rightPanel_ = emplace<SidePanel>(SidePanel::Side::Right);
+    rightPanel_->clipsContent = true;
+    inspectorScroll_ = rightPanel_->emplace<InspectorScrollView>();
+    inspectorScroll_->showScrollbar = true;
+    inspectorContent_ = inspectorScroll_->emplace<InspectorContent>();
 
     rightCollapse_ = rightPanel_->emplace<Button>("", "chevron-right", ButtonStyle::Icon);
     rightCollapse_->tooltip = "Hide panel";
     rightCollapse_->onClick = [this] { toggleRightPanel(); };
 
+    deleteAnnotBtn_ = rightPanel_->emplace<Button>("", "trash", ButtonStyle::Icon);
+    deleteAnnotBtn_->tooltip = "Delete selected annotation";
+    deleteAnnotBtn_->visible = false;
+    deleteAnnotBtn_->onClick = [this] {
+        if (stage_->deleteSelectedAnnot())
+            OverlayHost::current().showToast("Annotation deleted · Undo available", now());
+    };
+
+    // Pinned above the scrolling inspector so Focus can be entered from
+    // Read, Annotate or Edit, even when tool options fill a long panel.
+    focusPanelBtn_ = rightPanel_->emplace<Button>("", "maximise-view",
+                                                  ButtonStyle::Icon);
+    focusPanelBtn_->tooltip = "Focus mode (right panel)";
+    focusPanelBtn_->onClick = [this] { setFocusMode(!state_.focusMode); };
+    undoPanelBtn_ = rightPanel_->emplace<Button>("", "undo", ButtonStyle::Icon);
+    undoPanelBtn_->tooltip = "Undo  (Ctrl+Z)";
+    undoPanelBtn_->onClick = [this] { doUndo(); };
+    redoPanelBtn_ = rightPanel_->emplace<Button>("", "redo", ButtonStyle::Icon);
+    redoPanelBtn_->tooltip = "Redo  (Ctrl+Shift+Z)";
+    redoPanelBtn_->onClick = [this] { doRedo(); };
+    rotateLeftBtn_ = rightPanel_->emplace<Button>("", "view-rotate-ccw", ButtonStyle::Icon);
+    rotateLeftBtn_->tooltip = "Rotate view left 90° (does not alter PDF)";
+    rotateLeftBtn_->onClick = [this] { stage_->rotate(-1, now()); };
+    rotateRightBtn_ = rightPanel_->emplace<Button>("", "view-rotate-cw", ButtonStyle::Icon);
+    rotateRightBtn_->tooltip = "Rotate view right 90° (does not alter PDF)";
+    rotateRightBtn_->onClick = [this] { stage_->rotate(1, now()); };
+    focusAutoHideBtn_ = inspectorContent_->emplace<Button>(
+        "Auto-hide focus controls", "", ButtonStyle::ListItem);
+    focusAutoHideBtn_->tooltip = "Hide focus controls after 3 seconds";
+    focusAutoHideBtn_->subtitle = "Tap top corner to reveal · Back exits";
+    focusAutoHideBtn_->toggled = state_.autoHideFocusControls;
+    focusAutoHideBtn_->onClick = [this] {
+        state_.autoHideFocusControls = !state_.autoHideFocusControls;
+        focusAutoHideBtn_->toggled = state_.autoHideFocusControls;
+        state_.saveRecents();
+        if (state_.focusMode && !state_.autoHideFocusControls)
+            showFocusControls(true);
+        else if (state_.focusMode && focusControlsVisible_)
+            focusHideAt_ = now() + kFocusIdleSeconds;
+    };
+
+    selectionMagnifierBtn_ = inspectorContent_->emplace<Button>(
+        "Selection & highlighter magnifier", "", ButtonStyle::ListItem);
+    selectionMagnifierBtn_->tooltip = "Magnify text selection and annotation highlighter";
+    selectionMagnifierBtn_->subtitle = "Select text or drag the Highlight tool";
+    selectionMagnifierBtn_->toggled = state_.selectionMagnifier;
+    selectionMagnifierBtn_->onClick = [this] {
+        state_.selectionMagnifier = !state_.selectionMagnifier;
+        selectionMagnifierBtn_->toggled = state_.selectionMagnifier;
+        stage_->setSelectionMagnifierEnabled(state_.selectionMagnifier);
+        state_.saveRecents();
+    };
+
     // Page-theme swatches. These are colour chips, not icons, so they are
     // painted by the panel overlay; the buttons exist for hit-testing and
     // the selection ring.
     for (int i = 0; i < 3; ++i) {
-        auto* b = rightPanel_->emplace<Button>("", "", ButtonStyle::Ghost);
+        auto* b = inspectorContent_->emplace<Button>("", "", ButtonStyle::Ghost);
         b->tooltip = (i == 0) ? "Light page" : (i == 1 ? "Sepia page" : "Dark page");
         b->onClick = [this, i] {
-            state_.theme.setPageTheme(static_cast<PageTheme>(i));
-            for (std::size_t k = 0; k < pageThemeSw_.size(); ++k)
-                pageThemeSw_[k]->toggled = (static_cast<int>(k) == i);
+            applyPageTheme(static_cast<PageTheme>(i));
         };
         b->toggled = (i == 0);
         pageThemeSw_.push_back(b);
@@ -719,7 +1082,7 @@ void ReaderScreen::buildWorkArea() {
         // colour choice"; these are the same 24 the popover shows, in the
         // same order, so the two never disagree about what index 11 is.
         for (int i = 0; i < kInkCount; ++i) {
-            auto* b = rightPanel_->emplace<Button>("", "", ButtonStyle::Ghost);
+            auto* b = inspectorContent_->emplace<Button>("", "", ButtonStyle::Ghost);
             b->tooltip = "Ink colour";
             b->toggled = (i == 0);
             // Routed through applyOptColor so the panel and the command
@@ -729,16 +1092,45 @@ void ReaderScreen::buildWorkArea() {
             annotColorSw_.push_back(b);
         }
     }
+    commentLabel_ = inspectorContent_->emplace<Label>(
+        "COMMENT", tokens::type_sectionHeader, TextRole::Muted);
+    commentField_ = inspectorContent_->emplace<TextField>("Write a note or comment…");
+    commentField_->multiline = true;
+    commentField_->onChanged = [this](const std::string& value) {
+        if (!commentTarget_ || value.size() > 131072) return;
+        for (std::uint64_t id : annots_.groupMembers(commentTarget_)) {
+            if (const Annotation* a = annots_.get(id)) {
+                Annotation changed = *a;
+                changed.comment = value;
+                annots_.replace(id, changed);
+            }
+        }
+        // Save to private Folio storage as it is composed: Android can
+        // suspend the app without ever sending a blur or "Done" event.
+        persistAnnotations();
+        const float targetH = std::clamp(
+            108.f + static_cast<float>(value.size() / 42) * 21.f,
+            108.f, 218.f);
+        if (std::fabs(targetH - commentField_->frame.h) > .5f)
+            layoutTree();
+    };
+    commentField_->onFocus = [this](bool gained) {
+        if (!gained) commitComment();
+    };
+    saveCommentBtn_ = inspectorContent_->emplace<Button>(
+        "Save comment", "check", ButtonStyle::ListItem);
+    saveCommentBtn_->tooltip = "Save annotation comment";
+    saveCommentBtn_->onClick = [this] { commitComment(); };
     // Six weights drawn at their real proportions, not three adjectives.
     // The display thickness is the page-unit weight on a gentle curve -
     // a literal mapping would make 10.f dwarf the row.
-    annotWidthSeg_ = rightPanel_->emplace<WidthStrip>(
+    annotWidthSeg_ = inspectorContent_->emplace<WidthStrip>(
         std::vector<float>{1.f, 2.f, 3.5f, 5.f, 7.5f, 11.f}, 2);
     annotWidthSeg_->onChange = [this](int i) {
         if (selectedAnnot_) applyOptWidth(i); else syncTool();
     };
 
-    textFontSeg_ = rightPanel_->emplace<SegmentedControl>(
+    textFontSeg_ = inspectorContent_->emplace<SegmentedControl>(
         std::vector<SegmentedControl::Item>{
             {"Sans", "", ""}, {"Serif", "", ""}, {"Mono", "", ""}},
         0);
@@ -746,18 +1138,18 @@ void ReaderScreen::buildWorkArea() {
 
     // Point sizes rather than S/M/L: this is a font picker, and everyone
     // already knows what 16 pt looks like.
-    textSizeSeg_ = rightPanel_->emplace<SegmentedControl>(
+    textSizeSeg_ = inspectorContent_->emplace<SegmentedControl>(
         std::vector<SegmentedControl::Item>{
             {"12", "", ""}, {"16", "", ""}, {"22", "", ""}, {"30", "", ""}},
         1);
     textSizeSeg_->onChange = [this](int) { syncTextStyle(); };
 
-    annotOpacity_ = rightPanel_->emplace<Slider>(0.15f, 1.f, 1.f);
+    annotOpacity_ = inspectorContent_->emplace<Slider>(0.15f, 1.f, 1.f);
     annotOpacity_->onChange = [this](float v) {
         if (selectedAnnot_) applyOptOpacity(v); else syncTool();
     };
 
-    layoutSegR_ = rightPanel_->emplace<SegmentedControl>(
+    layoutSegR_ = inspectorContent_->emplace<SegmentedControl>(
         std::vector<SegmentedControl::Item>{
             {"Scroll", "", ""}, {"Single", "", ""}, {"Two-up", "", ""}},
         0);
@@ -810,11 +1202,11 @@ void ReaderScreen::syncTool() {
     ET et = ET::None;
     switch (state_.tool) {
         case Tool::Highlight: et = ET::Highlight; break;
-        case Tool::Pen:       et = ET::Ink;       break;
+        case Tool::Pen:       et = drawingShape_; break;
         case Tool::Note:      et = ET::Note;      break;
         case Tool::Eraser:    et = ET::Eraser;    break;
         case Tool::Text:      et = ET::Text;      break;
-        case Tool::Shapes:    et = ET::Box;       break;
+        case Tool::Shapes:    et = drawingShape_; break;
         case Tool::Stamp:     et = ET::Stamp;     break;
         case Tool::Signature: et = ET::Signature; break;
         case Tool::Select:
@@ -861,7 +1253,8 @@ void ReaderScreen::updateRightPanelContext() {
     if (sel) {
         static constexpr const char* kKindNames[] = {
             "HIGHLIGHT", "UNDERLINE", "STRIKETHROUGH", "DRAWING", "NOTE",
-            "RECTANGLE", "ELLIPSE", "TEXT", "STAMP", "SIGNATURE"};
+            "RECTANGLE", "ELLIPSE", "TEXT", "STAMP", "SIGNATURE",
+            "LINE", "ARROW"};
         const auto k = static_cast<std::size_t>(sel->kind);
         annotHdr_->text = k < std::size(kKindNames) ? kKindNames[k]
                                                     : "ANNOTATION";
@@ -911,9 +1304,20 @@ void ReaderScreen::installPanelPainters() {
     };
 
     rightPanel_->drawOverlay = [this](IPaintTarget& t, const PaintCtx& ctx) {
+        if (rightCollapse_->visible && !stylingActive())
+            // Keep this caption below the pinned history/rotation row. At y=20
+            // it was painted straight through Undo/Redo on phone sheets.
+            t.drawTextInBox("DISPLAY", Rect{14.f, 56.f, rightPanel_->frame.w - 28.f, 16.f},
+                            styleFor(tokens::type_sectionHeader,
+                                     fade(ctx.pal.muted, rightPanel_->contentAlpha(ctx.now))),
+                            folio::render::TextAlign::Left);
+    };
+
+    static_cast<InspectorContent*>(inspectorContent_)->drawOverlay =
+        [this](IPaintTarget& t, const PaintCtx& ctx) {
         const float rBody = rightPanel_->contentAlpha(ctx.now);
         if (rBody <= 0.01f || !rightCollapse_->visible) return;
-        const float w = rightPanel_->frame.w;
+        const float w = inspectorContent_->frame.w;
         const auto head = [&](const char* s2, float y) {
             t.drawTextInBox(s2, Rect{14.f, y, w - 28.f, 16.f},
                             styleFor(tokens::type_sectionHeader,
@@ -950,8 +1354,7 @@ void ReaderScreen::installPanelPainters() {
                 }
             }
         } else {
-            head("DISPLAY", 20.f);
-            head("PAGE THEME", 62.f);
+            head("PAGE THEME", 2.f);
 
             static constexpr Color kChip[3] = {{0xFE, 0xFE, 0xFE, 0xFF},
                                                {0xF1, 0xE4, 0xC8, 0xFF},
@@ -989,12 +1392,11 @@ void ReaderScreen::setMode(Mode m) {
         modeItems_[i]->toggled = (static_cast<int>(m) == static_cast<int>(i));
     modePop_->close(now());
     modeBtn_->chevronOpen = false;
-    rebuildToolButtons(now());
-    // Each mode has its own tool set, so the active tool must come back to
-    // something that mode actually offers.
+    // Restore a valid tool BEFORE building its toggled buttons/menu.
     const auto tools = toolsFor(m);
     if (std::find(tools.begin(), tools.end(), state_.tool) == tools.end())
         state_.tool = tools.front();
+    rebuildToolButtons(now());
     if (annotHdr_) annotHdr_->text = toolName(state_.tool);
     applyToolColour();
     syncTool();
@@ -1053,6 +1455,15 @@ void ReaderScreen::buildPill() {
     zoomInBtn_->onClick = [this] {
         stage_->clearZoomFocus();
         stage_->setZoom(stage_->zoom() * 1.25f, now());
+    };
+
+    // The percentage is painted in onPaintOverlay, but its own pill child
+    // handles taps. Never take space from the numeric label on small phones.
+    zoomPctBtn_ = pill_->emplace<Button>("", "", ButtonStyle::Ghost);
+    zoomPctBtn_->tooltip = "Zoom presets, fit width or fit page";
+    zoomPctBtn_->onClick = [this] {
+        if (zoomPop_->isOpen()) zoomPop_->close(now());
+        else openPopoverFor(zoomPop_, zoomPctBtn_, true);
     };
 
     fitWidthBtn_ = pill_->emplace<Button>("", "fit-width", ButtonStyle::Icon);
@@ -1118,8 +1529,12 @@ void ReaderScreen::setLayoutMode(int index) {
 
 void ReaderScreen::closeOtherPopovers(const Popover* keep) {
     for (Popover* p : {toolColorPop_, toolSizePop_, toolOpacityPop_,
-                       toolFontPop_, modePop_, findPop_, layoutPop_,
-                       displayPop_, selPop_}) {
+                       toolFontPop_, modePop_, findPop_, layoutPop_, zoomPop_,
+                       displayPop_, selPop_, toolOverflowPop_, shapePop_}) {
+        // The selection palette and its colour picker form one interaction:
+        // opening a colour must not discard the selected-text actions.
+        if (p == selPop_ && keep == toolColorPop_ &&
+            optTarget_ == OptTarget::Markup && stage_->hasSelection()) continue;
         if (p && p != keep && p->isOpen()) p->close(now());
     }
     if (modePop_ != keep && modeBtn_) modeBtn_->chevronOpen = false;
@@ -1176,6 +1591,7 @@ bool ReaderScreen::modifySelectedGroup(
         after.push_back(mod);
     }
     if (before.empty()) return false;
+    persistAnnotations();
     edits_.push(std::make_unique<ModifyManyCommand>(annots_, std::move(before),
                                                     std::move(after), label));
     syncUndoButtons();
@@ -1257,7 +1673,10 @@ void ReaderScreen::applyOptOpacity(float v) {
         Annotation* a = selectedAnnotation();
         if (!a) return;
         modifySelectedGroup([v](Annotation& x) { x.opacity = v; }, "opacity");
+    } else if (optTarget_ == OptTarget::Markup) {
+        markupOpacity_ = v;
     } else {
+        if (state_.tool == Tool::Highlight) markupOpacity_ = v;
         if (annotOpacity_) annotOpacity_->setValue(v);
         syncTool();
     }
@@ -1400,23 +1819,31 @@ void ReaderScreen::syncToolOptions() {
         hasColour = true;
         hasOpacity = true;
         hasWeight = sel->kind == AnnotKind::Ink || sel->kind == AnnotKind::Box ||
-                    sel->kind == AnnotKind::Ellipse || isText;
+                    sel->kind == AnnotKind::Ellipse || sel->kind == AnnotKind::Line ||
+                    sel->kind == AnnotKind::Arrow || sel->kind == AnnotKind::Stamp ||
+                    sel->kind == AnnotKind::Signature || isText;
         hasFont = isText;
     } else if (stage_ && stage_->hasSelection()) {
         // Text is selected: the options act on the markup that is about to
         // be applied, which is the thing the user is looking at.
         optTarget_ = OptTarget::Markup;
         hasColour = true;
+        hasOpacity = true;
     } else {
         optTarget_ = OptTarget::Tool;
         const Tool t = state_.tool;
         isText = t == Tool::Text;
         hasColour = t == Tool::Pen || t == Tool::Highlight || t == Tool::Text ||
-                    t == Tool::Note || t == Tool::Shapes;
-        hasWeight = t == Tool::Pen || t == Tool::Shapes || t == Tool::Eraser ||
-                    isText;
+                    t == Tool::Note || t == Tool::Shapes || t == Tool::Stamp ||
+                    t == Tool::Signature;
+        // The freehand Highlight marker has a real width-controlled band and
+        // magnifier preview. Leaving it out disabled the top Thickness chip
+        // even while the same six weights worked in the inspector/thumb menu.
+        hasWeight = t == Tool::Pen || t == Tool::Highlight ||
+                    t == Tool::Shapes || t == Tool::Eraser ||
+                    t == Tool::Stamp || t == Tool::Signature || isText;
         hasOpacity = t == Tool::Pen || t == Tool::Highlight || t == Tool::Shapes ||
-                     t == Tool::Note;
+                     t == Tool::Note || t == Tool::Stamp || t == Tool::Signature || isText;
         hasFont = isText;
     }
 
@@ -1426,10 +1853,22 @@ void ReaderScreen::syncToolOptions() {
                      static_cast<int>(state_.tool), static_cast<int>(optTarget_),
                      hasColour, hasWeight, hasOpacity, hasFont);
     }
-    toolOptColor_->visible = hasColour;
-    toolOptSize_->visible = hasWeight;
-    toolOptOpacity_->visible = hasOpacity;
-    toolOptFont_->visible = hasFont;
+    // Three predictable option slots on phones, even for tools without a
+    // meaningful colour/weight/opacity (Select and Eraser). Inapplicable
+    // controls stay visibly disabled rather than silently changing another
+    // tool. Desktop retains only applicable controls plus the text font.
+    const bool compactSlots = LayoutMetrics::forViewport(frame.w, frame.h).panelsOverlay &&
+                              state_.mode != Mode::Read;
+    toolOptColor_->visible = hasColour || compactSlots;
+    toolOptSize_->visible = hasWeight || compactSlots;
+    toolOptOpacity_->visible = hasOpacity || compactSlots;
+    toolOptFont_->visible = hasFont && !compactSlots;
+    toolOptColor_->acceptsPointer = hasColour;
+    toolOptSize_->acceptsPointer = hasWeight;
+    toolOptOpacity_->acceptsPointer = hasOpacity;
+    toolOptColor_->opacity = hasColour ? 1.f : .36f;
+    toolOptSize_->opacity = hasWeight ? 1.f : .36f;
+    toolOptOpacity_->opacity = hasOpacity ? 1.f : .36f;
     toolOptSize_->tooltip = isText ? "Text size" : "Thickness";
     toolOptSize_->icon = isText ? "text-size" : "stroke-weight";
 
@@ -1439,6 +1878,8 @@ void ReaderScreen::syncToolOptions() {
     int sizeIdx = annotWidthSeg_ ? annotWidthSeg_->selected() : 1;
     int fontIdx = textFontSeg_ ? textFontSeg_->selected() : 0;
 
+    if (optTarget_ == OptTarget::Markup)
+        opacity = markupOpacity_;
     if (sel) {
         inkIdx = nearestInk(sel->color);
         opacity = sel->opacity;
@@ -1531,17 +1972,123 @@ void ReaderScreen::syncToolOptions() {
         toolFontPop_->close(now());
 }
 
-void ReaderScreen::onAnnotPicked(std::uint64_t id) {
+std::string ReaderScreen::sidecarPath(const std::string& pdfPath) const {
+    if (state_.recentStateFile.empty() || pdfPath.empty()) return {};
+    // Stable FNV-1a, not std::hash (whose output may change across builds).
+    std::uint64_t hash = 14695981039346656037ULL;
+    for (unsigned char c : pdfPath) { hash ^= c; hash *= 1099511628211ULL; }
+    char hex[32]{};
+    std::snprintf(hex, sizeof(hex), "%016llx",
+                  static_cast<unsigned long long>(hash));
+    return (std::filesystem::u8path(state_.recentStateFile).parent_path() /
+            (std::string("folio-annotations-") + hex + ".txt")).string();
+}
+
+#if FOLIO_HAVE_PDFIUM_SOURCE
+void ReaderScreen::syncImportedSuppression() {
+    auto pdf = std::dynamic_pointer_cast<folio::engine::PdfiumPageSource>(pageSource_);
+    if (!pdf) return;
+    folio::engine::PdfiumWorker::Suppressed indices;
+    for (const auto& a : annots_.all())
+        if (a.sourceIndex >= 0)
+            indices[a.page].emplace_back(a.sourceIndex, a.sourceSubtype);
+    pdf->suppressSourceAnnotations(std::move(indices));
+}
+
+std::uint64_t ReaderScreen::adoptSourceAnnotation(
+    int page, const folio::engine::PdfAnnotationInfo& info) {
+    if (!info.editable || info.r <= info.l || info.b <= info.t) return 0;
+    for (const auto& a : annots_.all())
+        if (a.page == page && a.sourceIndex == info.index)
+            return a.deleted ? 0 : a.id;
+    Annotation a;
+    a.page = page;
+    a.sourceIndex = info.index;
+    a.sourceSubtype = info.subtype;
+    a.sourceFingerprint = info.fingerprint;
+    a.box = {info.l, info.t, info.r - info.l, info.b - info.t};
+    a.color = {info.red, info.green, info.blue, info.alpha};
+    a.opacity = static_cast<float>(info.alpha) / 255.f;
+    a.comment = info.contents;
+    switch (info.subtype) {
+        case FPDF_ANNOT_HIGHLIGHT: a.kind = AnnotKind::Highlight; a.textLinked = true; break;
+        case FPDF_ANNOT_UNDERLINE: a.kind = AnnotKind::Underline; a.textLinked = true; break;
+        case FPDF_ANNOT_STRIKEOUT: a.kind = AnnotKind::Strikethrough; a.textLinked = true; break;
+        case FPDF_ANNOT_TEXT: a.kind = AnnotKind::Note; break;
+        case FPDF_ANNOT_SQUARE: a.kind = AnnotKind::Box; break;
+        case FPDF_ANNOT_CIRCLE: a.kind = AnnotKind::Ellipse; break;
+        default: return 0;
+    }
+    const auto id = annots_.add(std::move(a));
+    // Hide the original ONLY in this view document, never in the source file.
+    syncImportedSuppression();
+    persistAnnotations();
+    for (std::size_t i = 0; i < pdfNotesRefs_.size(); ++i) {
+        if (pdfNotesRefs_[i] != std::pair{page, info.index}) continue;
+        pdfNotesRefs_.erase(pdfNotesRefs_.begin() + static_cast<std::ptrdiff_t>(i));
+        pdfNotesEntries_.erase(pdfNotesEntries_.begin() + static_cast<std::ptrdiff_t>(i));
+        pdfNotesInfo_.erase(pdfNotesInfo_.begin() + static_cast<std::ptrdiff_t>(i));
+        break;
+    }
+    notesRevision_ = ~std::uint64_t{0};
+    if (onDocumentChanged) onDocumentChanged();
+    return id;
+}
+#endif
+
+void ReaderScreen::persistAnnotations() {
+    if (activeDoc_ < 0 || activeDoc_ >= static_cast<int>(docs_.size())) return;
+    const std::string& path = docs_[static_cast<std::size_t>(activeDoc_)].path;
+    const std::string file = sidecarPath(path);
+    if (!file.empty()) annots_.saveSidecar(file, path);
+}
+
+void ReaderScreen::commitComment() {
+    if (!commentField_ || !commentTarget_ ||
+        commentField_->text == commentOriginal_) return;
+    const auto ids = annots_.groupMembers(commentTarget_);
+    std::vector<Annotation> before, after;
+    for (std::uint64_t id : ids) {
+        if (const Annotation* current = annots_.get(id)) {
+            Annotation previous = *current;
+            previous.comment = commentOriginal_;
+            before.push_back(std::move(previous));
+            after.push_back(*current);
+        }
+    }
+    if (before.empty()) return;
+    edits_.push(std::make_unique<ModifyManyCommand>(
+        annots_, std::move(before), std::move(after), "edit comment"));
+    commentOriginal_ = commentField_->text;
+    syncUndoButtons();
+}
+
+void ReaderScreen::onAnnotPicked(std::uint64_t id, bool fromTouch) {
+    if (id != commentTarget_) {
+        commitComment();
+        commentTarget_ = id;
+        if (commentField_) {
+            if (const Annotation* a = id ? annots_.get(id) : nullptr)
+                commentField_->text = a->comment;
+            else commentField_->text.clear();
+            commentField_->setCaretToEnd();
+            commentOriginal_ = commentField_->text;
+        }
+    }
     selectedAnnot_ = id;
     updateRightPanelContext();
     syncToolOptions();
+    layoutTree(); // the selected mark collapses Hand/Select immediately
 
     // Picking an existing mark is an explicit "I want to change this", and
     // on a phone the options are a sheet away rather than visible in a
     // column. So the sheet comes up by itself here - but only here.
     // Raising it every time a tool is chosen would fight the user, since
     // choosing a tool is usually followed by drawing, not configuring.
-    if (sheetMode() && id != 0 && rightPanel_->collapsed()) {
+    // A finger may continue dragging the mark immediately after selecting
+    // it. Raising the inspector under that finger would hide the canvas and
+    // steal the drag; the inspector FAB remains available when wanted.
+    if (!fromTouch && sheetMode() && id != 0 && rightPanel_->collapsed()) {
         togglePhoneSheet(false);
     }
 }
@@ -1549,6 +2096,26 @@ void ReaderScreen::onAnnotPicked(std::uint64_t id) {
 void ReaderScreen::buildPopovers() {
     // --- mode menu ---------------------------------------------------------
     modePop_ = emplace<Popover>();
+    shapePop_ = emplace<Popover>();
+    shapePop_->setFrame(0.f, 0.f, 240.f, 58.f);
+    static constexpr PageStage::EditTool kShapeTools[] = {
+        PageStage::EditTool::Ink, PageStage::EditTool::Box,
+        PageStage::EditTool::Ellipse, PageStage::EditTool::Line,
+        PageStage::EditTool::Arrow};
+    static constexpr const char* kShapeIcons[] = {
+        "pen", "shape-rect", "shape-oval", "shape-line", "shape-arrow"};
+    static constexpr const char* kShapeNames[] = {
+        "Freehand", "Rectangle", "Circle / ellipse", "Straight line", "Arrow"};
+    for (int i = 0; i < 5; ++i) {
+        auto* item = shapePop_->emplace<Button>("", kShapeIcons[i], ButtonStyle::Icon);
+        item->tooltip = kShapeNames[i];
+        item->toggled = kShapeTools[i] == drawingShape_;
+        item->onClick = [this, i] { chooseDrawingShape(kShapeTools[i]); };
+        shapeItems_.push_back(item);
+    }
+    toolOverflowPop_ = emplace<Popover>();
+    toolOverflowPop_->setOwner(toolOverflowBtn_);
+    rebuildToolButtons(now());
     {
         static constexpr const char* kNames[] = {"Read", "Annotate", "Edit"};
         static constexpr const char* kIcons[] = {"eye", "highlighter", "cursor"};
@@ -1590,6 +2157,30 @@ void ReaderScreen::buildPopovers() {
         }
     }
 
+    // The stock Popover supplies the same anchor-clipped open and reverse
+    // close used elsewhere. On a phone the percentage itself is its owner.
+    zoomPop_ = emplace<Popover>();
+    zoomPop_->setFrame(0.f, 0.f, 226.f, 180.f);
+    for (int i = 0; i < 8; ++i) {
+        static constexpr const char* labels[] = {
+            "Fit width", "Fit page", "50%", "75%", "100%", "125%", "150%", "200%"};
+        static constexpr const char* icons[] = {
+            "fit-width", "fit-page", "", "", "", "", "", ""};
+        auto* b = zoomPop_->emplace<Button>(labels[i], icons[i], ButtonStyle::Ghost);
+        b->compact = true;
+        b->onClick = [this, i] {
+            stage_->clearZoomFocus();
+            if (i == 0) stage_->setZoomMode(ZoomMode::FitWidth, now());
+            else if (i == 1) stage_->setZoomMode(ZoomMode::FitPage, now());
+            else {
+                static constexpr float values[] = {.5f, .75f, 1.f, 1.25f, 1.5f, 2.f};
+                stage_->setZoom(values[i - 2], now());
+            }
+            zoomPop_->close(now());
+        };
+        zoomPresetItems_.push_back(b);
+    }
+
     findField_ = findPop_->emplace<TextField>("Find in document");
     findField_->leadingIcon = "search";
     findField_->onChanged = [this](const std::string& q) { runSearch(q); };
@@ -1610,10 +2201,7 @@ void ReaderScreen::buildPopovers() {
             {"Dark", "", "Inverted paper"}},
         0);
     pageThemeSeg_->onChange = [this](int i) {
-        static constexpr PageTheme kThemes[] = {PageTheme::Light, PageTheme::Sepia,
-                                                PageTheme::Dark};
-        state_.theme.setPageTheme(kThemes[static_cast<std::size_t>(i)]);
-        stage_->setPageTheme(state_.theme.pageTheme());
+        applyPageTheme(static_cast<PageTheme>(i));
     };
     // Two explicit buttons, not a sliding switch. A switch states "on/off"
     // for something with no natural off; Day and Night are two destinations,
@@ -1666,6 +2254,7 @@ void ReaderScreen::buildSelectionPopup() {
     selColorBtn_->compact = true;
     selColorBtn_->onClick = [this] {
         optTarget_ = OptTarget::Markup;
+        toolColorPop_->setZOrder(zlayer::popover + 1);
         openOptPopover(toolColorPop_, selColorBtn_);
     };
     selBtns_.push_back(selColorBtn_);
@@ -1685,6 +2274,8 @@ void ReaderScreen::buildSelectionPopup() {
 
 void ReaderScreen::closeSelectionPopup() {
     if (selPop_ && selPop_->isOpen()) selPop_->close(now());
+    if (toolColorPop_ && optTarget_ == OptTarget::Markup &&
+        toolColorPop_->isOpen()) toolColorPop_->close(now());
 }
 
 void ReaderScreen::applyTextMarkup(AnnotKind kind) {
@@ -1700,6 +2291,7 @@ void ReaderScreen::applyTextMarkup(AnnotKind kind) {
     for (const auto& [page, box] : quads) {
         Annotation a;
         a.kind = kind;
+        a.textLinked = true;
         a.page = page;
         a.box = box;
         // The ink the Highlight tool is set to, not a hard-coded yellow.
@@ -1708,7 +2300,7 @@ void ReaderScreen::applyTextMarkup(AnnotKind kind) {
         // Highlight, which is indefensible when both are called "highlight".
         a.color = kToolInks[static_cast<std::size_t>(
             std::clamp(markupColorIdx_, 0, kInkCount - 1))];
-        a.opacity = 1.f;
+        a.opacity = markupOpacity_;
         a.width = 2.f;
         a.id = annots_.add(a);
         added.push_back(a);
@@ -1727,6 +2319,7 @@ void ReaderScreen::applyTextMarkup(AnnotKind kind) {
     // take the whole paragraph back.
     edits_.push(std::make_unique<AddManyCommand>(annots_, std::move(added),
                                                  "markup"));
+    persistAnnotations();
     syncUndoButtons();
     const char* what = kind == AnnotKind::Highlight     ? "Highlighted"
                        : kind == AnnotKind::Underline   ? "Underlined"
@@ -1757,6 +2350,7 @@ void ReaderScreen::reloadAfterUndo(int toPage) {
     if (!pdf) return;
     const std::string path = pdf->path();
     annots_.clear();
+    persistAnnotations();
     if (openFile(path, now()))
         stage_->goToPage(std::clamp(toPage, 1, std::max(1, pageCount_)), now());
 #else
@@ -1770,6 +2364,7 @@ void ReaderScreen::doUndo() {
         return;
     }
     dropDanglingSelection();
+    persistAnnotations();
     syncUndoButtons();
     OverlayHost::current().showToast("Undo", now());
 }
@@ -1780,6 +2375,7 @@ void ReaderScreen::doRedo() {
         return;
     }
     dropDanglingSelection();
+    persistAnnotations();
     syncUndoButtons();
     OverlayHost::current().showToast("Redo", now());
 }
@@ -1793,12 +2389,15 @@ void ReaderScreen::syncUndoButtons() {
         if (b->tooltip.rfind("Undo", 0) == 0) b->enabled = edits_.canUndo();
         else if (b->tooltip.rfind("Redo", 0) == 0) b->enabled = edits_.canRedo();
     }
+    if (undoPanelBtn_) undoPanelBtn_->enabled = edits_.canUndo();
+    if (redoPanelBtn_) redoPanelBtn_->enabled = edits_.canRedo();
 }
 
 void ReaderScreen::syncSchemeButtons() {
     const bool dark = state_.theme.scheme() == ColorScheme::Dark;
     if (dayBtn_) dayBtn_->toggled = !dark;
     if (nightBtn_) nightBtn_->toggled = dark;
+    if (themeBtn_) themeBtn_->icon = dark ? "moon" : "sun";
 }
 
 void ReaderScreen::chooseScheme(ColorScheme s, Widget* from) {
@@ -1812,6 +2411,7 @@ void ReaderScreen::chooseScheme(ColorScheme s, Widget* from) {
 
 void ReaderScreen::openDocument(const std::string& title, int pages, double now) {
     docTitle_ = title;
+    if (docBtn_) docBtn_->label = docTitle_;
     pageCount_ = std::max(1, pages);
     if (tabs_->count() == 0) {
         tabs_->addTab(title, now);
@@ -1821,6 +2421,10 @@ void ReaderScreen::openDocument(const std::string& title, int pages, double now)
     auto src = std::make_shared<PlaceholderPageSource>(pageCount_);
     thumbs_->setSource(src.get());
     pageSource_ = src;                       // keep it alive for the thumbnails
+#if FOLIO_HAVE_PDFIUM_SOURCE
+    if (auto pdf = std::dynamic_pointer_cast<folio::engine::PdfiumPageSource>(src))
+        pdf->setWakeCallback(onWorkerWake);
+#endif
     stage_->setSource(std::move(src), now);
     // Open fit-to-width, not at a fixed 1.25x. The prototype's 125% was a
     // fixed-size mock; a real reader has to cope with A4, Letter and the
@@ -1837,7 +2441,7 @@ void ReaderScreen::openDocument(const std::string& title, int pages, double now)
     syncUndoButtons();
 }
 
-#if FOLIO_HAVE_PODOFO_SOURCE
+#if FOLIO_HAVE_PODOFO_SOURCE || FOLIO_HAVE_PDFIUM_SOURCE
 namespace {
 /// Translate the UI's annotation into the engine's write-side description.
 /// The two structs are deliberately separate: folio-ui must not depend on
@@ -1849,13 +2453,21 @@ folio::engine::AnnotSpec toSpec(const Annotation& a) {
         case AnnotKind::Highlight:     s.kind = K::Highlight; break;
         case AnnotKind::Underline:     s.kind = K::Underline; break;
         case AnnotKind::Strikethrough: s.kind = K::StrikeOut; break;
-        case AnnotKind::Ink:           s.kind = K::Ink;       break;
+        case AnnotKind::Ink:
+        case AnnotKind::Signature:     s.kind = K::Ink;       break;
         case AnnotKind::Note:      s.kind = K::Note;      break;
         case AnnotKind::Text:      s.kind = K::FreeText;  break;
+        case AnnotKind::Stamp:     s.kind = K::Stamp;     break;
         case AnnotKind::Box:       s.kind = K::Box;       break;
+        case AnnotKind::Line:
+        case AnnotKind::Arrow:     s.kind = K::Ink;       break;
         default:                   s.kind = K::Ellipse;   break;
     }
     s.page = a.page;
+    s.sourceIndex = a.sourceIndex;
+    s.sourceSubtype = a.sourceSubtype;
+    s.sourceFingerprint = a.sourceFingerprint;
+    s.deleted = a.deleted;
     s.l = a.box.x;
     s.t = a.box.y;
     s.r = a.box.x + a.box.w;
@@ -1868,12 +2480,19 @@ folio::engine::AnnotSpec toSpec(const Annotation& a) {
     // document looks.
     s.opacity = a.kind == AnnotKind::Highlight ? a.opacity * kHighlightAlpha
                                                : a.opacity;
+    s.contents = a.comment;
+    if (a.kind == AnnotKind::Text || a.kind == AnnotKind::Stamp) {
+        s.label = a.kind == AnnotKind::Stamp && a.text.empty() ? "APPROVED" : a.text;
+        // Store the complete label as /Contents too: a long/wrapped label
+        // cannot be silently lost if the visible stamp bounds clip glyphs.
+        if (!s.label.empty())
+            s.contents = s.label + (a.comment.empty() ? "" : "\n" + a.comment);
+    }
     // Free text carries its string, and the glyph height the overlay used,
     // so the exported appearance matches what was on screen. The overlay
     // sizes at 74% of the box height; a nominal 792pt page turns that
     // fraction into points.
     if (a.kind == AnnotKind::Text) {
-        s.contents = a.text;
         s.fontSize = (a.fontSize > 0.f ? a.fontSize : a.box.h * 0.74f) * 792.f;
         // The base-14 families every PDF viewer must provide, so free text
         // survives export without embedding anything.
@@ -1887,23 +2506,225 @@ folio::engine::AnnotSpec toSpec(const Annotation& a) {
     // 612pt page makes the two agree at the size the user drew at.
     s.width = std::max(0.5f, a.width * 0.612f);
     for (const auto& p : a.points) s.points.push_back({p.x, p.y});
-    if (!a.points.empty()) {
-        float lo_x = a.points[0].x, hi_x = lo_x, lo_y = a.points[0].y, hi_y = lo_y;
-        for (const auto& p : a.points) {
-            lo_x = std::min(lo_x, p.x); hi_x = std::max(hi_x, p.x);
-            lo_y = std::min(lo_y, p.y); hi_y = std::max(hi_y, p.y);
+    if (a.kind == AnnotKind::Arrow && a.points.size() >= 2) {
+        const auto start = a.points.front(), end = a.points.back();
+        const float dx = end.x - start.x, dy = end.y - start.y;
+        const float length = std::hypot(dx, dy);
+        if (length > 1e-4f) {
+            const float tip = .014f, wing = .007f;
+            const float ux = dx / length, uy = dy / length;
+            s.points.push_back({end.x - ux * tip - uy * wing,
+                                end.y - uy * tip + ux * wing});
+            s.points.push_back({end.x, end.y});
+            s.points.push_back({end.x - ux * tip + uy * wing,
+                                end.y - uy * tip - ux * wing});
         }
-        const float pad = 0.01f;
-        s.l = lo_x - pad; s.r = hi_x + pad;
-        s.t = lo_y - pad; s.b = hi_y + pad;
+    }
+    if (!s.points.empty()) {
+        float lo_x = s.points[0][0], hi_x = lo_x;
+        float lo_y = s.points[0][1], hi_y = lo_y;
+        for (const auto& p : s.points) {
+            lo_x = std::min(lo_x, p[0]); hi_x = std::max(hi_x, p[0]);
+            lo_y = std::min(lo_y, p[1]); hi_y = std::max(hi_y, p[1]);
+        }
+        const float pad = 0.008f;
+        s.l = std::max(0.f, lo_x - pad);
+        s.r = std::min(1.f, hi_x + pad);
+        s.t = std::max(0.f, lo_y - pad);
+        s.b = std::min(1.f, hi_y + pad);
     }
     return s;
 }
 }  // namespace
 #endif
 
+bool ReaderScreen::pollExport() {
+#if FOLIO_HAVE_PDFIUM_SOURCE
+    bool searchChanged = false;
+    auto* searchPdf = dynamic_cast<folio::engine::PdfiumPageSource*>(pageSource_.get());
+    if (searchPdf) {
+        searchChanged = searchPdf->tick();
+        searchPdf->annotationsForPage(std::max(0, stage_->currentPage() - 1));
+        if (lastOutlineRevision_ != searchPdf->outlineRevision()) {
+            lastOutlineRevision_ = searchPdf->outlineRevision();
+            std::vector<OutlineList::Entry> toc;
+            for (const auto& b : searchPdf->outline())
+                toc.push_back(OutlineList::Entry{b.title, b.page, b.depth});
+            outline_->setEntries(std::move(toc));
+            searchChanged = true;
+        }
+    }
+    if (searchPdf && !searchNeedle_.empty() &&
+        searchCursor_ < searchPdf->pageCount()) {
+        // Keep at most one extraction queued. Process a few already resident
+        // pages per frame, then let visible raster jobs run first.
+        for (int budget = 0; budget < 4 && searchCursor_ < searchPdf->pageCount();
+             ++budget) {
+            auto text = searchPdf->pageText(searchCursor_);
+            if (!text) break;
+            const int page = searchCursor_;
+            std::size_t at = 0;
+            while ((at = text->folded.find(searchNeedle_, at)) != std::u32string::npos) {
+                searchHits_.push_back(PageStage::TextRun{
+                    page, static_cast<int>(at), static_cast<int>(searchNeedle_.size())});
+                at += searchNeedle_.size();
+            }
+            text.reset();
+            searchPdf->releaseText(page);
+            ++searchCursor_;
+            searchChanged = true;
+        }
+        if (searchChanged) {
+            if (searchIndex_ < 0 && !searchHits_.empty()) searchIndex_ = 0;
+            stage_->setSearchHits(searchHits_, searchIndex_);
+            syncFindLabel();
+        }
+    }
+    if (searchPdf && notes_ && notes_->visible && notesScanCursor_ < pageCount_) {
+        // One PDF page per worker wake; never scan all metadata before first
+        // paint and never index when Notes is hidden or the app is idle.
+        if (const auto* list = searchPdf->annotationsForPage(notesScanCursor_)) {
+            const auto beforeNotes = pdfNotesRefs_.size();
+            for (const auto& info : *list) {
+                const bool highlight = info.subtype == FPDF_ANNOT_HIGHLIGHT;
+                const bool sticky = info.subtype == FPDF_ANNOT_TEXT;
+                if ((!highlight && !sticky && info.contents.empty()) ||
+                    pdfNotesRefs_.size() >= 20000) continue;
+                const std::string type = highlight ? "PDF highlight" :
+                    sticky ? "PDF note" : "PDF annotation";
+                std::string title = type +
+                    (info.editable ? " · Tap to edit" : " · Preserved");
+                if (!info.contents.empty()) title += " · " + info.contents.substr(0, 80);
+                pdfNotesEntries_.push_back({std::move(title), notesScanCursor_, 0});
+                pdfNotesRefs_.push_back({notesScanCursor_, info.index});
+                pdfNotesInfo_.push_back(info);
+            }
+            if (pdfNotesRefs_.size() != beforeNotes &&
+                (beforeNotes == 0 || pdfNotesRefs_.size() / 64 != beforeNotes / 64 ||
+                 notesScanCursor_ + 1 == pageCount_)) {
+                notesRevision_ = ~std::uint64_t{0};
+                searchChanged = true;
+            }
+            if (notesScanCursor_ != stage_->currentPage() - 1)
+                searchPdf->releaseAnnotations(notesScanCursor_);
+            ++notesScanCursor_;
+            if (notesScanCursor_ == pageCount_) {
+                notesRevision_ = ~std::uint64_t{0};
+                searchChanged = true;
+            } else {
+                searchPdf->annotationsForPage(notesScanCursor_);
+            }
+        }
+    }
+    if (!exportSource_) return searchChanged;
+    exportSource_->tick();
+    auto result = exportSource_->takeExportResult();
+    if (!result) return searchChanged;
+    auto completedSource = std::move(exportSource_);
+#if defined(__ANDROID__)
+    if (!result->error.empty() || result->exportPath.empty()) {
+        exportPending_ = false;
+        OverlayHost::current().showToast("Export failed: " + result->error, now());
+    } else if (!(sharingExport_ ? onSharePdf : onExportPdf) ||
+               !(sharingExport_ ? onSharePdf : onExportPdf)(result->exportPath,
+                                                            "Folio-annotated.pdf")) {
+        std::error_code ec;
+        std::filesystem::remove(nativePath(result->exportPath), ec);
+        exportPending_ = false;
+        OverlayHost::current().showToast("Export failed: Android share/picker unavailable", now());
+    }
+    // Share copies the staging file asynchronously; keep this export busy
+    // until Java has finished copying, so a second Save cannot replace it.
+    if (!exportPending_) sharingExport_ = false;
+#else
+    std::error_code ec;
+    if (!result->error.empty() || result->exportPath.empty()) {
+        std::filesystem::remove(nativePath(desktopStagingPath_), ec);
+        OverlayHost::current().showToast("Save As failed: " + result->error, now());
+    } else if (std::filesystem::exists(nativePath(desktopExportPath_), ec) || ec) {
+        std::filesystem::remove(nativePath(result->exportPath), ec);
+        OverlayHost::current().showToast("Save As failed: destination already exists", now());
+    } else {
+        std::filesystem::rename(nativePath(result->exportPath),
+                                nativePath(desktopExportPath_), ec);
+        if (ec) {
+            std::error_code ignored;
+            std::filesystem::remove(nativePath(result->exportPath), ignored);
+            OverlayHost::current().showToast("Save As failed: " + ec.message(), now());
+        } else {
+            OverlayHost::current().showToast("Saved PDF copy; original remains open", now());
+        }
+    }
+    desktopExportPath_.clear();
+    desktopStagingPath_.clear();
+    exportPending_ = false;
+#endif
+    retireClosedSource(std::move(completedSource));
+    return true;
+#else
+    return false;
+#endif
+}
+
+void ReaderScreen::exportFinished(int status, const std::string& message) {
+#if defined(__ANDROID__) && FOLIO_HAVE_PDFIUM_SOURCE
+    if (!exportPending_) return;
+    const bool wasShare = sharingExport_;
+    exportPending_ = false;
+    sharingExport_ = false;
+    if (status > 0)
+        OverlayHost::current().showToast(
+            wasShare ? "Android share sheet opened; original remains open"
+                     : "PDF exported; original remains open", now());
+    else if (status < 0)
+        OverlayHost::current().showToast("Export failed: " + message, now());
+    else
+        OverlayHost::current().showToast("Export cancelled; edits remain here", now());
+#else
+    (void)status; (void)message;
+#endif
+}
+
+bool ReaderScreen::shareDocument() {
+#if defined(__ANDROID__) && FOLIO_HAVE_PDFIUM_SOURCE
+    if (exportPending_) return false;
+    sharingExport_ = true;
+    if (saveDocument()) return true;
+    sharingExport_ = false;
+    return false;
+#else
+    OverlayHost::current().showToast("Use Save As to share a PDF copy", now());
+    return false;
+#endif
+}
+
 bool ReaderScreen::saveDocument() {
-#if FOLIO_HAVE_PODOFO_SOURCE && FOLIO_HAVE_PDFIUM_SOURCE
+    commitComment();
+#if defined(__ANDROID__) && FOLIO_HAVE_PDFIUM_SOURCE
+    if (exportPending_) {
+        OverlayHost::current().showToast("Export already in progress", now());
+        return false;
+    }
+    auto pdf = std::dynamic_pointer_cast<folio::engine::PdfiumPageSource>(pageSource_);
+    if (!pdf || !pdf->isOpen()) {
+        OverlayHost::current().showToast("Open a PDF before exporting", now());
+        return false;
+    }
+    std::vector<folio::engine::AnnotSpec> specs;
+    specs.reserve(annots_.count());
+    for (const auto& a : annots_.all()) specs.push_back(toSpec(a));
+    // The imported PDF is kept in private durable storage. Never modify it or the provider's
+    // source URI; only a successful ACTION_CREATE_DOCUMENT publishes bytes.
+    const std::string staged = pdf->path() + ".folio-export.pdf";
+    if (!pdf->requestExport(std::move(specs), staged)) {
+        OverlayHost::current().showToast("Could not queue PDF export", now());
+        return false;
+    }
+    exportSource_ = std::move(pdf);
+    exportPending_ = true;
+    OverlayHost::current().showToast("Preparing PDF for export...", now());
+    return true;
+#elif FOLIO_HAVE_PODOFO_SOURCE && FOLIO_HAVE_PDFIUM_SOURCE
     auto* pdf = dynamic_cast<folio::engine::PdfiumPageSource*>(pageSource_.get());
     if (!pdf || !pdf->isOpen()) {
         OverlayHost::current().showToast("Nothing to save", now());
@@ -1926,11 +2747,11 @@ bool ReaderScreen::saveDocument() {
         return false;
     }
 
-    // Reopen so what is on screen is what is in the file. The annotations
-    // are now baked into the page, so the in-memory overlay has to go or
-    // every mark would be drawn twice.
+    // Native PDF now owns the marks; remove Folio's private overlays to
+    // avoid drawing them twice on reopen.
     const int page = stage_->currentPage();
     annots_.clear();
+    persistAnnotations();
     if (openFile(path, now())) stage_->goToPage(page, now());
 
     OverlayHost::current().showToast(
@@ -1938,8 +2759,57 @@ bool ReaderScreen::saveDocument() {
             (specs.size() == 1 ? "" : "s"),
         now());
     return true;
+#elif FOLIO_HAVE_PDFIUM_SOURCE
+    if (exportPending_) {
+        OverlayHost::current().showToast("Save As already in progress", now());
+        return false;
+    }
+    auto pdf = std::dynamic_pointer_cast<folio::engine::PdfiumPageSource>(pageSource_);
+    if (!pdf || !pdf->isOpen() || !onPickSavePath) {
+        OverlayHost::current().showToast("Open a PDF before saving a copy", now());
+        return false;
+    }
+    std::vector<folio::engine::AnnotSpec> specs;
+    specs.reserve(annots_.count());
+    for (const auto& a : annots_.all()) specs.push_back(toSpec(a));
+    const std::string source = pdf->path();
+    auto suggested = utf8Path(nativePath(source).filename());
+    if (suggested.size() >= 4 && suggested.substr(suggested.size() - 4) == ".pdf")
+        suggested.resize(suggested.size() - 4);
+    suggested += "-annotated.pdf";
+    onPickSavePath(suggested, [this, pdf, specs = std::move(specs)](std::string out) mutable {
+        if (out.empty()) return; // dialog cancelled; leave edits alone
+        std::filesystem::path destination = nativePath(out);
+        if (destination.extension().empty()) destination += ".pdf";
+        if (destination.extension() != ".pdf") {
+            OverlayHost::current().showToast("Save As requires a .pdf filename", now());
+            return;
+        }
+        std::error_code ec;
+        if (std::filesystem::exists(destination, ec) || ec) {
+            OverlayHost::current().showToast(
+                "Choose a new filename; Save As never overwrites an existing PDF", now());
+            return;
+        }
+        // Generate a private staging file beside the output so the final
+        // rename is fast and does not copy the entire PDF on the UI thread.
+        auto staging = destination;
+        staging += ".folio-" + std::to_string(
+            std::chrono::steady_clock::now().time_since_epoch().count()) + ".part";
+        if (std::filesystem::exists(staging, ec) || ec ||
+            !pdf->requestExport(std::move(specs), utf8Path(staging))) {
+            OverlayHost::current().showToast("Could not queue PDF Save As", now());
+            return;
+        }
+        desktopExportPath_ = utf8Path(destination);
+        desktopStagingPath_ = utf8Path(staging);
+        exportSource_ = pdf;
+        exportPending_ = true;
+        OverlayHost::current().showToast("Preparing PDF copy...", now());
+    });
+    return true;
 #else
-    OverlayHost::current().showToast("Built without PoDoFo", now());
+    OverlayHost::current().showToast("Built without a PDF writer", now());
     return false;
 #endif
 }
@@ -2040,6 +2910,7 @@ bool ReaderScreen::applyPageOp(const std::string& op) {
     }
 
     annots_.clear();
+    persistAnnotations();
     if (openFile(path, now()))
         stage_->goToPage(std::min(page + 1, pageCount_), now());
 
@@ -2062,16 +2933,27 @@ bool ReaderScreen::applyPageOp(const std::string& op) {
 #endif
 }
 
-bool ReaderScreen::loadPath(const std::string& path, double now) {
+bool ReaderScreen::loadPath(const std::string& path, double now,
+                            std::shared_ptr<IPageSource> prepared) {
+    closeSelectionPopup();
+    searchNeedle_.clear();
+    searchHits_.clear();
+    searchIndex_ = -1;
+    searchCursor_ = 0;
 #if FOLIO_HAVE_PDFIUM_SOURCE
-    auto src = std::make_shared<folio::engine::PdfiumPageSource>();
-    if (!src->open(path)) {
-        OverlayHost::current().showToast("Could not open: " + src->error(), now);
+    auto src = prepared
+        ? std::dynamic_pointer_cast<folio::engine::PdfiumPageSource>(prepared)
+        : std::make_shared<folio::engine::PdfiumPageSource>();
+    if (!src || (!prepared && !src->open(path))) {
+        OverlayHost::current().showToast(
+            "Could not open: " + (src ? src->error() : std::string("invalid PDF source")), now);
         return false;
     }
     const auto slash = path.find_last_of("/\\");
     docTitle_ = slash == std::string::npos ? path : path.substr(slash + 1);
+    if (docBtn_) docBtn_->label = docTitle_;
     pageCount_ = src->pageCount();
+    lastOutlineRevision_ = src->outlineRevision();
     thumbs_->setPageCount(pageCount_);
     outline_->setPageCount(pageCount_);
     {
@@ -2082,9 +2964,33 @@ bool ReaderScreen::loadPath(const std::string& path, double now) {
     }
     thumbs_->setSource(src.get());
     pageSource_ = src;
+#if FOLIO_HAVE_PDFIUM_SOURCE
+    if (auto pdf = std::dynamic_pointer_cast<folio::engine::PdfiumPageSource>(src))
+        pdf->setWakeCallback(onWorkerWake);
+#endif
     stage_->setSource(src, now);
+    stage_->setPageTheme(state_.theme.pageTheme());
     stage_->setZoomMode(ZoomMode::FitWidth, now);
+    stage_->snapZoomToTarget(now); // visible page requests at final scale on frame one
+    notesScanCursor_ = 0;
+    pdfNotesEntries_.clear();
+    pdfNotesRefs_.clear();
+#if FOLIO_HAVE_PDFIUM_SOURCE
+    pdfNotesInfo_.clear();
+#endif
+    notesRevision_ = ~std::uint64_t{0};
     annots_.clear();
+    annots_.resetVisibility();
+    for (std::size_t i = 0; i < 12; ++i) layerItems_[i]->toggled = true;
+    annots_.loadSidecar(sidecarPath(path), path);
+#if FOLIO_HAVE_PDFIUM_SOURCE
+    syncImportedSuppression();
+    src->annotationsForPage(0); // first visible page; later pages on demand
+#endif
+    selectedAnnot_ = 0;
+    commentTarget_ = 0;
+    if (commentField_) { commentField_->text.clear(); commentOriginal_.clear(); }
+    updateRightPanelContext();
     syncPageLabel();
     return true;
 #else
@@ -2094,11 +3000,104 @@ bool ReaderScreen::loadPath(const std::string& path, double now) {
 #endif
 }
 
+void ReaderScreen::reapRetiredSources() {
+    using namespace std::chrono_literals;
+    for (auto it = retiringDocs_.begin(); it != retiringDocs_.end();) {
+        if (it->wait_for(0ms) == std::future_status::ready) {
+            it->get();
+            it = retiringDocs_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void ReaderScreen::retireClosedSource(std::shared_ptr<IPageSource> source) {
+#if FOLIO_HAVE_PDFIUM_SOURCE
+    if (!source || source == pageSource_ ||
+        (exportSource_ && source == exportSource_)) return;
+    for (const auto& doc : docs_)
+        if (doc.source == source) return;
+    auto pdf = std::dynamic_pointer_cast<folio::engine::PdfiumPageSource>(source);
+    if (!pdf) return;
+    // An old worker must not post to a window after the document has closed.
+    // A callback already copied by an in-flight job remains safe: these
+    // futures are joined before the native window is destroyed.
+    pdf->setWakeCallback({});
+    source.reset(); // ensure the last reference is dropped on the retire thread
+    reapRetiredSources();
+    retiringDocs_.push_back(std::async(std::launch::async,
+        [pdf = std::move(pdf)]() mutable { pdf.reset(); }));
+#else
+    (void)source;
+#endif
+}
+
 void ReaderScreen::stashActiveDoc() {
     if (activeDoc_ < 0 || activeDoc_ >= static_cast<int>(docs_.size())) return;
     OpenDoc& d = docs_[static_cast<std::size_t>(activeDoc_)];
+    stage_->commitText();
+    commitComment();
+    persistAnnotations();
     d.annots = annots_.all();
+    d.source = pageSource_;
+    d.view = stage_->captureViewState(now());
+    d.hasView = true;
+    d.pageTheme = state_.theme.pageTheme();
+    d.selectedAnnot = stage_->selectedAnnot();
+    d.thumbnailScroll = thumbs_->scrollY();
+    d.outlineScroll = outline_->scrollY();
+    d.leftTab = state_.leftTab;
+    d.leftCollapsed = state_.leftPanelCollapsed;
+    d.rightCollapsed = state_.rightPanelCollapsed;
+    d.focusMode = state_.focusMode;
+#if FOLIO_HAVE_PDFIUM_SOURCE
+    // Keep the mapped document/worker for instant tab switches, not every
+    // tab's decoded 4K page bitmaps and GPU image keys.
+    if (auto pdf = std::dynamic_pointer_cast<folio::engine::PdfiumPageSource>(d.source))
+        pdf->suspendVisualCaches();
+    if (onDocumentChanged) onDocumentChanged();
+#endif
     d.page = stage_->currentPage();
+    d.pages = pageCount_;
+    state_.rememberDocument(d.path, d.pages, d.page);
+}
+
+void ReaderScreen::setWorkerWakeCallback(std::function<void()> wake) {
+    onWorkerWake = std::move(wake);
+#if FOLIO_HAVE_PDFIUM_SOURCE
+    for (auto& d : docs_)
+        if (auto pdf = std::dynamic_pointer_cast<folio::engine::PdfiumPageSource>(d.source))
+            pdf->setWakeCallback(onWorkerWake);
+    if (auto pdf = std::dynamic_pointer_cast<folio::engine::PdfiumPageSource>(pageSource_))
+        pdf->setWakeCallback(onWorkerWake);
+#endif
+}
+
+bool ReaderScreen::hasDocumentWork() const {
+#if FOLIO_HAVE_PDFIUM_SOURCE
+    if (auto pdf = std::dynamic_pointer_cast<folio::engine::PdfiumPageSource>(pageSource_))
+        return pdf->busy();
+#endif
+    return false;
+}
+
+void ReaderScreen::trimIdleVisualCaches() {
+#if FOLIO_HAVE_PDFIUM_SOURCE
+    if (auto pdf = std::dynamic_pointer_cast<folio::engine::PdfiumPageSource>(pageSource_))
+        pdf->trimIdle();
+#endif
+}
+
+void ReaderScreen::releaseVisualCaches() {
+#if FOLIO_HAVE_PDFIUM_SOURCE
+    for (auto& doc : docs_)
+        if (auto pdf = std::dynamic_pointer_cast<folio::engine::PdfiumPageSource>(doc.source))
+            pdf->suspendVisualCaches();
+    if (auto pdf = std::dynamic_pointer_cast<folio::engine::PdfiumPageSource>(pageSource_))
+        pdf->suspendVisualCaches();
+#endif
+    if (onDocumentChanged) onDocumentChanged();
 }
 
 void ReaderScreen::switchToDoc(int index, double now) {
@@ -2106,12 +3105,46 @@ void ReaderScreen::switchToDoc(int index, double now) {
     if (index == activeDoc_) return;
     stashActiveDoc();
     const OpenDoc& d = docs_[static_cast<std::size_t>(index)];
-    if (!loadPath(d.path, now)) return;
+    if (!loadPath(d.path, now, d.source)) return;
     activeDoc_ = index;
     // addExisting, not add: the ids have to survive a switch or any undo
     // entry still referring to them would resolve to nothing.
+    annots_.clear();
     for (const Annotation& a : d.annots) annots_.addExisting(a);
-    stage_->goToPage(d.page, now);
+    if (d.hasView) {
+        applyPageTheme(d.pageTheme);
+        state_.leftTab = d.leftTab;
+        leftTabs_->setSelected(d.leftTab, now);
+        state_.leftPanelCollapsed = d.leftCollapsed;
+        state_.rightPanelCollapsed = d.rightCollapsed;
+        leftPanel_->setCollapsedImmediately(d.leftCollapsed);
+        rightPanel_->setCollapsedImmediately(d.rightCollapsed);
+        state_.focusMode = d.focusMode;
+        focusControlsVisible_ = d.focusMode;
+        focusTouches_.clear();
+        focusHideAt_ = d.focusMode ? now + kFocusIdleSeconds : 0.0;
+        focusT_.reset(d.focusMode ? 1.f : 0.f);
+        if (focusBtn_) {
+            focusBtn_->toggled = d.focusMode;
+            focusBtn_->icon = d.focusMode ? "minimise-view" : "maximise-view";
+        }
+        if (focusExitBtn_) focusExitBtn_->visible = d.focusMode;
+    stage_->setFocusScrollbarsVisible(!d.focusMode || focusControlsVisible_);
+        syncPhoneFabs();
+        layoutTree(); // establish the destination viewport BEFORE restoring scroll
+        stage_->restoreViewState(d.view, now);
+        thumbs_->restoreScrollY(d.thumbnailScroll);
+        outline_->restoreScrollY(d.outlineScroll);
+        selectedAnnot_ = annots_.get(d.selectedAnnot) ? d.selectedAnnot : 0;
+        stage_->selectAnnot(selectedAnnot_);
+        updateRightPanelContext();
+        syncToolOptions();
+        // Restoring a page/layout cannot be a soft jump: publish the focus
+        // immediately so PDFium prioritises this tab's visible preview.
+    } else {
+        stage_->goToPage(d.page, now);
+    }
+    state_.rememberDocument(d.path, pageCount_, stage_->currentPage());
     // Undo history is per document and page-op undo writes bytes back to a
     // stored path, so carrying it across a switch could rewrite the wrong
     // file. Clearing is the conservative choice.
@@ -2125,9 +3158,17 @@ void ReaderScreen::closeDoc(int index, double now) {
     if (index < 0 || index >= static_cast<int>(docs_.size())) return;
     const bool wasActive = (index == activeDoc_);
     if (wasActive) stashActiveDoc();
+    const OpenDoc& closing = docs_[static_cast<std::size_t>(index)];
+    state_.rememberDocument(closing.path, closing.pages, closing.page);
+    auto closedSource = closing.source;
     docs_.erase(docs_.begin() + index);
     if (docs_.empty()) {
         activeDoc_ = -1;
+        thumbs_->setSource(nullptr);
+        stage_->setSource(nullptr, now);
+        pageSource_.reset();
+        annots_.clear();
+        retireClosedSource(std::move(closedSource));
         if (onBackToWelcome) onBackToWelcome();
         return;
     }
@@ -2137,9 +3178,16 @@ void ReaderScreen::closeDoc(int index, double now) {
         activeDoc_ = -1;            // force switchToDoc to do the work
         switchToDoc(next, now);
     }
+    retireClosedSource(std::move(closedSource));
 }
 
 bool ReaderScreen::openFile(const std::string& path, double now) {
+    return openPreparedFile(path, {}, now);
+}
+
+bool ReaderScreen::openPreparedFile(const std::string& path,
+                                    std::shared_ptr<IPageSource> prepared,
+                                    double now) {
     // Already open: switch rather than open a second copy.
     for (int i = 0; i < static_cast<int>(docs_.size()); ++i) {
         if (docs_[static_cast<std::size_t>(i)].path == path) {
@@ -2148,10 +3196,12 @@ bool ReaderScreen::openFile(const std::string& path, double now) {
         }
     }
     stashActiveDoc();
-    if (!loadPath(path, now)) return false;
+    if (!loadPath(path, now, std::move(prepared))) return false;
     OpenDoc d;
     d.path = path;
     d.title = docTitle_;
+    d.source = pageSource_;
+    d.pages = pageCount_;
     docs_.push_back(std::move(d));
     activeDoc_ = static_cast<int>(docs_.size()) - 1;
     tabs_->addTab(docTitle_, now);
@@ -2186,36 +3236,20 @@ std::u32string foldUtf8(const std::string& s) {
 void ReaderScreen::runSearch(const std::string& q) {
     searchHits_.clear();
     searchIndex_ = -1;
+    searchCursor_ = 0;
+    searchNeedle_.clear();
     if (!stage_) return;
-    if (q.size() < 2) {               // one letter matches everything
-        stage_->clearSearchHits();
-        syncFindLabel();
-        return;
-    }
+    stage_->clearSearchHits();
+    if (q.size() < 2) { syncFindLabel(); return; }
 
 #if FOLIO_HAVE_PDFIUM_SOURCE
     auto* pdf = dynamic_cast<folio::engine::PdfiumPageSource*>(pageSource_.get());
-    if (!pdf) { stage_->clearSearchHits(); syncFindLabel(); return; }
-
-    // Search needs the whole document, not just the pages looked at so far.
-    pdf->requestAllText();
-
-    const std::u32string needle = foldUtf8(q);
-    for (int p = 0; p < pdf->pageCount(); ++p) {
-        auto text = pdf->pageText(p);
-        if (!text || text->folded.empty()) continue;
-        std::size_t at = 0;
-        while ((at = text->folded.find(needle, at)) != std::u32string::npos) {
-            searchHits_.push_back(PageStage::TextRun{
-                p, static_cast<int>(at), static_cast<int>(needle.size())});
-            at += needle.size();
-        }
+    if (pdf && pdf->pageCount() > 0) {
+        searchNeedle_ = foldUtf8(q);
+        // Queue only one page, not an unbounded copy of the text of a huge
+        // document. pollExport() indexes completed pages incrementally.
+        (void)pdf->pageText(0);
     }
-    if (!searchHits_.empty()) searchIndex_ = 0;
-    stage_->setSearchHits(searchHits_, searchIndex_);
-    if (searchIndex_ >= 0) scrollToHit(searchIndex_);
-#else
-    stage_->clearSearchHits();
 #endif
     syncFindLabel();
 }
@@ -2238,9 +3272,10 @@ void ReaderScreen::scrollToHit(int i) {
 void ReaderScreen::syncFindLabel() {
     if (!findCount_) return;
     if (searchHits_.empty()) {
-        findCount_->text = findField_ && findField_->text.size() >= 2
-                               ? std::string("No results")
-                               : std::string();
+        findCount_->text = !searchNeedle_.empty() && searchCursor_ < pageCount_
+                               ? std::string("Searching…")
+                               : findField_ && findField_->text.size() >= 2
+                                   ? std::string("No results") : std::string();
     } else {
         findCount_->text = std::to_string(searchIndex_ + 1) + " of " +
                            std::to_string(searchHits_.size());
@@ -2268,15 +3303,31 @@ void ReaderScreen::commitPageField() {
     syncPageLabel();
 }
 
+void ReaderScreen::applyPageTheme(PageTheme theme) {
+    state_.theme.setPageTheme(theme);
+    stage_->setPageTheme(theme); // the inspector previously changed only the chip
+    const int chosen = static_cast<int>(theme);
+    for (std::size_t i = 0; i < pageThemeSw_.size(); ++i)
+        pageThemeSw_[i]->toggled = static_cast<int>(i) == chosen;
+    if (pageThemeSeg_ && pageThemeSeg_->selected() != chosen)
+        pageThemeSeg_->setSelected(chosen, now());
+}
+
 void ReaderScreen::syncPageLabel() {
-    pageLabel_ = std::to_string(stage_->currentPage()) + " / " + std::to_string(pageCount_);
+    const bool compact = breakpointFor(frame.w) == Breakpoint::Compact;
+    pageLabel_ = std::to_string(stage_->currentPage()) +
+                 (compact ? "/" : " / ") + std::to_string(pageCount_);
     // While the field has focus the user is mid-edit; overwriting their
     // keystrokes with the current page would be maddening.
     if (pageField_ && !pageField_->focused) pageField_->text = pageLabel_;
 }
 
 void ReaderScreen::handleOutsideClick(Point windowPoint, double now) {
+    // The thumb palette is painted by PageStage, but a press on command-bar
+    // chrome or a side panel never routes through PageStage::onPointer.
+    stage_->dismissThumbIfOutside(windowPoint, now);
     findPop_->dismissIfOutside(windowPoint, now);
+    zoomPop_->dismissIfOutside(windowPoint, now);
     if (layoutPop_->isOpen()) {
         layoutPop_->dismissIfOutside(windowPoint, now);
         if (!layoutPop_->isOpen()) viewBtn_->chevronOpen = false;
@@ -2286,6 +3337,8 @@ void ReaderScreen::handleOutsideClick(Point windowPoint, double now) {
         if (!modePop_->isOpen()) modeBtn_->chevronOpen = false;
     }
     displayPop_->dismissIfOutside(windowPoint, now);
+    if (shapePop_) shapePop_->dismissIfOutside(windowPoint, now);
+    if (toolOverflowPop_) toolOverflowPop_->dismissIfOutside(windowPoint, now);
     if (docPop_ && docPop_->isOpen()) {
         docPop_->dismissIfOutside(windowPoint, now);
         if (!docPop_->isOpen() && docBtn_) docBtn_->chevronOpen = false;
@@ -2313,14 +3366,30 @@ void ReaderScreen::handleOutsideClick(Point windowPoint, double now) {
             syncPhoneFabs();
         }
     }
-    // The selection popup is deliberately NOT dismissed here: the click that
-    // starts a new selection already clears the old one through
-    // onSelectionCleared, and dismissing on any outside click would close it
-    // on the very press that is about to re-open it.
+    // Treat selection actions and their colour picker as one popup. Tapping
+    // inside either keeps the selection actions visible; tapping elsewhere
+    // dismisses both. A press on the page also clears the selection via the
+    // stage's ordinary pointer handling.
+    auto within = [windowPoint](const Widget* w) {
+        const Point o = w->toWindow({0.f, 0.f});
+        return windowPoint.x >= o.x && windowPoint.x < o.x + w->frame.w &&
+               windowPoint.y >= o.y && windowPoint.y < o.y + w->frame.h;
+    };
+    if (selPop_ && selPop_->isOpen()) {
+        const bool onSelection = within(selPop_);
+        const bool onColour = toolColorPop_->isOpen() && within(toolColorPop_);
+        if (!onSelection && !onColour) closeSelectionPopup();
+        else if (onSelection && toolColorPop_->isOpen() && !onColour)
+            toolColorPop_->close(now);
+    } else if (toolColorPop_ && toolColorPop_->isOpen()) {
+        toolColorPop_->dismissIfOutside(windowPoint, now);
+    }
 }
 
 bool ReaderScreen::onKey(const KeyEvent& e) {
     if (!e.pressed) return false;
+    if (state_.focusMode && focusControlsVisible_)
+        focusHideAt_ = now() + kFocusIdleSeconds;
     const bool ctrl = (e.modifiers & ModCtrl) != 0;
 
     // A live free-text annotation owns the keyboard. It deliberately hands
@@ -2375,6 +3444,7 @@ bool ReaderScreen::onKey(const KeyEvent& e) {
     }
     if (e.key == Key::Escape && stage_ && stage_->hasSelection()) {
         stage_->clearSelection();
+        closeSelectionPopup();
         return true;
     }
     if (ctrl && (e.key == Key::Plus)) { stage_->setZoom(stage_->zoom() * 1.25f, now()); return true; }
@@ -2385,12 +3455,26 @@ bool ReaderScreen::onKey(const KeyEvent& e) {
         return true;
     }
     if (e.key == Key::Escape) {
-        if (findPop_->isOpen())    { findPop_->close(0.0); return true; }
-        if (displayPop_->isOpen()) { displayPop_->close(0.0); return true; }
+        if (findPop_->isOpen())    { findPop_->close(now()); return true; }
+        if (displayPop_->isOpen()) { displayPop_->close(now()); return true; }
+        if (zoomPop_->isOpen()) { zoomPop_->close(now()); return true; }
+        if (docPop_ && docPop_->isOpen()) { docPop_->close(now()); return true; }
+        if (layoutPop_->isOpen()) { layoutPop_->close(now()); return true; }
+        if (modePop_->isOpen()) { modePop_->close(now()); return true; }
         if (state_.focusMode) {
             setFocusMode(false);
             return true;
         }
+        if (sheetMode() && (!leftPanel_->collapsed() || !rightPanel_->collapsed())) {
+            state_.leftPanelCollapsed = state_.rightPanelCollapsed = true;
+            leftPanel_->setCollapsed(true, now());
+            rightPanel_->setCollapsed(true, now());
+            syncPhoneFabs();
+            return true;
+        }
+#if defined(__ANDROID__)
+        if (onBackToWelcome) { onBackToWelcome(); return true; }
+#endif
     }
     return stage_->onKey(e);
 }
@@ -2465,7 +3549,11 @@ void ReaderScreen::onLayout() {
     // Size class first: everything below is a consequence of it. The
     // panels are told their width here rather than reading a token, which
     // is what lets the same tree lay out on a phone and a desktop.
-    const LayoutMetrics m = LayoutMetrics::forWidth(W);
+    const LayoutMetrics m = LayoutMetrics::forViewport(W, H);
+    if (W != lastOptionLayoutWidth_) {
+        lastOptionLayoutWidth_ = W;
+        syncToolOptions();
+    }
     if (m.bp != lastBreakpoint_) {
         lastBreakpoint_ = m.bp;
         onBreakpointChanged(m);
@@ -2496,8 +3584,8 @@ void ReaderScreen::onLayout() {
     // laid out in the space they leave. On macOS that edge is the leading
     // one, so the wordmark and tabs slide right instead.
     winCtl_->setFrame(0.f, chromeY, W, tb);
-    const float ctlW = winCtl_->preferredWidth();
-    const bool ctlLeft = winCtl_->controlsOnLeft();
+    const float ctlW = winCtl_->visible ? winCtl_->preferredWidth() : 0.f;
+    const bool ctlLeft = winCtl_->visible && winCtl_->controlsOnLeft();
     chromeLead_ = ctlLeft ? ctlW : 0.f;
     const float trail = ctlLeft ? 12.f : ctlW;
 
@@ -2519,11 +3607,19 @@ void ReaderScreen::onLayout() {
     backBtn_->setFrame(homeX, chromeY + (tb - 28.f) * 0.5f, 28.f, 28.f);
     layOutPhoneChrome(m, W, H, chromeY, tb);
 
-    // Focus mode hides the chrome, so its escape hatch floats over the
-    // canvas instead, sliding in as the chrome slides out.
+    // One compact exit icon replaces the persistent text pill. When the
+    // reader hides it, the same top corner becomes an invisible 44dp wake
+    // zone for a phone (Back/Escape also always exits Focus).
     if (focusExitBtn_) {
-        const float ew = 132.f, eh = 34.f;
-        focusExitBtn_->setFrame(W - g - ew, lerp(-eh - 8.f, g, f), ew, eh);
+        const float sz = 44.f;
+        focusExitBtn_->setFrame(W - g - sz, lerp(-sz - 8.f, g, f), sz, sz);
+        focusExitBtn_->visible = state_.focusMode && focusControlsVisible_;
+        focusExitBtn_->label.clear();
+    }
+    if (focusWakeZone_) {
+        focusWakeZone_->setFrame(W - g - 44.f, g, 44.f, 44.f);
+        focusWakeZone_->visible = m.panelsOverlay && state_.focusMode &&
+                                  !focusControlsVisible_;
     }
 
     // --- command bar -------------------------------------------------------
@@ -2545,56 +3641,91 @@ void ReaderScreen::onLayout() {
         modeBtn_->setFrame(x, iy, kModeW, ih);
         x += kModeW + (m.compactChrome ? 8.f : 12.f);
 
-        // Layout tiles: the floating pill's layout popup is the same set.
-        for (Widget* w : cmdItems_) {
+        // A phone only keeps Open PDF in Read mode; the Annotate/Edit tool
+        // strip needs that slot. The document menu/library still offers Open
+        // in those modes. Desktop keeps its normal full file-action row.
+        for (std::size_t i = 0; i < cmdItems_.size(); ++i) {
+            Widget* w = cmdItems_[i];
             w->setFrame(x, iy, ih, ih);
-            w->visible = !m.compactChrome;
-            if (!m.compactChrome) x += ih + 2.f;
+            w->visible = !m.compactChrome || i == 1 || (i == 0 && state_.mode == Mode::Read);
+            if (w->visible) x += ih + 2.f;
         }
         if (!m.compactChrome) x += 10.f;
 
-        const float toolW = static_cast<float>(toolBtns_.size()) * (ih + 2.f);
-        toolHost_->setFrame(x, iy, toolW, ih);
-        for (std::size_t i = 0; i < toolBtns_.size(); ++i) {
-            toolBtns_[i]->setFrame(static_cast<float>(i) * (ih + 2.f), 0.f, ih, ih);
-        }
-
-        // Right-aligned group.
+        // One authoritative allocation pass: every button consumes space
+        // from the right only if it leaves the left mode/actions and one
+        // tool-dropdown slot untouched. Selected marks always put Hand and
+        // Select in that dropdown instead of trying to keep two competing
+        // tool strips beside the annotation property controls.
+        const float step = ih + 2.f;
+        const float reserve = toolBtns_.empty() ? 0.f : step + 6.f;
         float rx = cmdBar_->frame.w - pad;
         const float shareW = m.compactChrome ? ih : 94.f;
-        // Phone: the collapsed panel rails are themselves the toggles, the
-        // pill carries layout, and the right drawer carries the theme - so
-        // these five can go without stranding anything.
-        shareBtn_->visible = !tiny;
-        focusBtn_->visible = !tiny;
-        rightToggle_->visible = !tiny;
-        leftToggle_->visible = !tiny;
-        displayBtn_->visible = !tiny;
+        rx -= shareW;
+        shareBtn_->setFrame(rx, iy, shareW, ih);
+        shareBtn_->visible = true;
+
+        const bool showFocus = !m.compactChrome || state_.mode == Mode::Read;
+        const bool showDisplay = !m.panelsOverlay;
+        rightToggle_->visible = leftToggle_->visible = !tiny;
+        displayBtn_->visible = showDisplay;
         if (!tiny) {
-            rx -= shareW; shareBtn_->setFrame(rx, iy, shareW, ih);
-            rx -= ih + 6.f; focusBtn_->setFrame(rx, iy, ih, ih);
+            if (showFocus && rx - ih - 6.f >= x + reserve) {
+                rx -= ih + 6.f;
+                focusBtn_->setFrame(rx, iy, ih, ih);
+                focusBtn_->visible = true;
+            } else focusBtn_->visible = false;
             rx -= ih + 2.f; rightToggle_->setFrame(rx, iy, ih, ih);
             rx -= ih + 2.f; leftToggle_->setFrame(rx, iy, ih, ih);
-            rx -= ih + 8.f; displayBtn_->setFrame(rx, iy, ih, ih);
+            if (showDisplay && rx - ih - 8.f >= x + reserve) {
+                rx -= ih + 8.f; displayBtn_->setFrame(rx, iy, ih, ih);
+            } else displayBtn_->visible = false;
+        } else {
+            if (showFocus && rx - ih - 4.f >= x + reserve + ih + 2.f) {
+                rx -= ih + 4.f;
+                focusBtn_->setFrame(rx, iy, ih, ih);
+                focusBtn_->visible = true;
+            } else focusBtn_->visible = false;
         }
-        rx -= ih + 2.f; searchBtn_->setFrame(rx, iy, ih, ih);
+        const bool wantsSearch = !(m.panelsOverlay && state_.mode != Mode::Read);
+        searchBtn_->visible = wantsSearch && rx - ih - 2.f >= x + reserve;
+        if (!searchBtn_->visible && findPop_->isOpen()) findPop_->close(now());
+        if (searchBtn_->visible) {
+            rx -= ih + 2.f;
+            searchBtn_->setFrame(rx, iy, ih, ih);
+        }
 
-        // Tool options, at the end of the bar next to the view controls.
-        // They only exist while a tool that has options is active, so the
-        // bar is empty here in Read mode rather than permanently reserving
-        // the space.
-        if (toolOptColor_ && toolOptColor_->visible) {
-            rx -= ih + 8.f; toolOptColor_->setFrame(rx, iy, ih, ih);
+        // An option that cannot fit remains in the inspector sheet. No
+        // negative-width tool host, painted overlap or invisible hit target.
+        auto placeOption = [&](Button* b, float gap) {
+            if (!b || !b->visible) return;
+            if (rx - ih - gap < x + reserve) {
+                b->visible = false;
+                return;
+            }
+            rx -= ih + gap;
+            b->setFrame(rx, iy, ih, ih);
+        };
+        placeOption(toolOptColor_, 8.f);
+        placeOption(toolOptSize_, 2.f);
+        placeOption(toolOptFont_, 2.f);
+        placeOption(toolOptOpacity_, 2.f);
+
+        const std::size_t total = toolBtns_.size();
+        const bool editingMark = selectedAnnot_ && annots_.get(selectedAnnot_);
+        const float available = std::max(0.f, rx - 6.f - x);
+        std::size_t shown = editingMark ? 0 :
+            std::min(total, static_cast<std::size_t>(available / step));
+        if (shown < total && shown > 0) --shown; // the dropdown owns a slot
+        toolHost_->setFrame(x, iy, static_cast<float>(shown) * step, ih);
+        for (std::size_t i = 0; i < total; ++i) {
+            toolBtns_[i]->setFrame(static_cast<float>(i) * step, 0.f, ih, ih);
+            toolBtns_[i]->visible = i < shown;
         }
-        if (toolOptSize_ && toolOptSize_->visible) {
-            rx -= ih + 2.f; toolOptSize_->setFrame(rx, iy, ih, ih);
-        }
-        if (toolOptFont_ && toolOptFont_->visible) {
-            rx -= ih + 2.f; toolOptFont_->setFrame(rx, iy, ih, ih);
-        }
-        if (toolOptOpacity_ && toolOptOpacity_->visible) {
-            rx -= ih + 2.f; toolOptOpacity_->setFrame(rx, iy, ih, ih);
-        }
+        toolOverflowBtn_->visible = shown < total && available >= step;
+        if (toolOverflowBtn_->visible)
+            toolOverflowBtn_->setFrame(x + static_cast<float>(shown) * step,
+                                       iy, ih, ih);
     }
 
     // --- work area ---------------------------------------------------------
@@ -2620,8 +3751,15 @@ void ReaderScreen::onLayout() {
     // Sheet heights. Pages/outline is a browsing task and wants room;
     // the inspector is a short list of controls and should leave as much
     // of the page visible as it can.
-    const float lSheetH = std::min(workH, H * 0.60f);
-    const float rSheetH = std::min(workH, H * 0.46f);
+    const float lSheetH = H < 560.f ? std::max(0.f, H - 58.f)
+                                   : std::min(workH, H * 0.70f);
+    const float rSheetH = H < 560.f ? std::max(0.f, H - 58.f)
+                                   : std::min(workH, H * 0.52f);
+    // The sheet's actual height, not the column's animated work height,
+    // bounds its scroll panes and bottom actions. Keep the Android gesture
+    // navigation strip free without clipping the final row.
+    const float sheetBottomReserve = sheet ? 22.f : 0.f;
+    const float leftBodyH = sheet ? lSheetH : lhF;
 
     // ---- left panel internals (prototype .pf / .pane geometry) -----------
     if (sheet) {
@@ -2654,20 +3792,38 @@ void ReaderScreen::onLayout() {
         // .pane : top 102, bottom 14. The action row sits at its foot.
         const float paneY = 102.f;
         const float actH = 30.f;
-        const float paneH = std::max(0.f, lhF - paneY - kPad - actH - 8.f);
+        const float paneH = std::max(0.f, leftBodyH - sheetBottomReserve -
+                                     paneY - kPad - actH - 8.f);
         thumbs_->setFrame(kPad, paneY, std::max(0.f, innerW), paneH);
         thumbs_->visible = leftTabs_->visible && state_.leftTab == 0;
         thumbs_->opacity = lBody;
+        if (!thumbs_->visible && pageSource_)
+            pageSource_->setVisibleThumbnailRange(-1, -1);
 
         outline_->setFrame(kPad, paneY, std::max(0.f, innerW),
-                           std::max(0.f, lhF - paneY - kPad));
+                           std::max(0.f, leftBodyH - sheetBottomReserve - paneY - kPad));
         outline_->visible = leftTabs_->visible && state_.leftTab == 1;
         outline_->opacity = lBody;
+        notes_->setFrame(kPad, paneY, std::max(0.f, innerW),
+                         std::max(0.f, leftBodyH - sheetBottomReserve - paneY - kPad));
+        notes_->visible = leftTabs_->visible && state_.leftTab == 2;
+        notes_->opacity = lBody;
+        layersScroll_->setFrame(kPad, paneY, std::max(0.f, innerW),
+                                std::max(0.f, leftBodyH - sheetBottomReserve - paneY - kPad));
+        layersScroll_->visible = leftTabs_->visible && state_.leftTab == 3;
+        layersScroll_->opacity = lBody;
+        const float layerH = 50.f + static_cast<float>(layerItems_.size()) * 43.f;
+        layersScroll_->contentHeight = layerH;
+        layersContent_->setFrame(0.f, 0.f, std::max(0.f, innerW), layerH);
+        for (std::size_t i = 0; i < layerItems_.size(); ++i)
+            layerItems_[i]->setFrame(2.f, 36.f + static_cast<float>(i) * 43.f,
+                                    std::max(0.f, innerW - 8.f), 39.f);
 
         const float aw = innerW / 4.f;
         for (std::size_t i = 0; i < pageActions_.size(); ++i) {
             pageActions_[i]->setFrame(kPad + aw * static_cast<float>(i),
-                                      lhF - kPad - actH, aw, actH);
+                                      leftBodyH - sheetBottomReserve - kPad - actH,
+                                      aw, actH);
             pageActions_[i]->visible = thumbs_->visible;
             pageActions_[i]->opacity = lBody;
         }
@@ -2695,18 +3851,47 @@ void ReaderScreen::onLayout() {
         const float rBody = rightPanel_->contentAlpha(now());
         rightCollapse_->setFrame(rwF - kPad - kRowH, kPad, kRowH, kRowH);
         rightCollapse_->visible = rBody > 0.01f && innerW > 40.f;
-        rightCollapse_->opacity = rBody;
+        rightCollapse_->opacity = 1.f;
+        focusPanelBtn_->setFrame(rwF - kPad - kRowH * 2.f - 6.f,
+                                  kPad, kRowH, kRowH);
+        focusPanelBtn_->visible = rightCollapse_->visible;
+        focusPanelBtn_->opacity = rBody;
+        focusPanelBtn_->toggled = state_.focusMode;
+        undoPanelBtn_->setFrame(kPad, kPad - 3.f, 34.f, 34.f);
+        redoPanelBtn_->setFrame(kPad + 38.f, kPad - 3.f, 34.f, 34.f);
+        undoPanelBtn_->visible = redoPanelBtn_->visible = rightCollapse_->visible;
+        undoPanelBtn_->opacity = redoPanelBtn_->opacity = rBody;
+        // Straight quarter-turn arrows are deliberately distinct from the
+        // curved Undo/Redo pair; these change only the viewport orientation.
+        rotateLeftBtn_->setFrame(kPad + 79.f, kPad - 3.f, 34.f, 34.f);
+        rotateRightBtn_->setFrame(kPad + 117.f, kPad - 3.f, 34.f, 34.f);
+        rotateLeftBtn_->visible = rotateRightBtn_->visible = rightCollapse_->visible;
+        rotateLeftBtn_->opacity = rotateRightBtn_->opacity = rBody;
 
         const bool authoring = stylingActive();
         const bool bodyVisible = rightCollapse_->visible;
 
         // Two stacks occupy the same space: tool properties while an
         // annotation tool is active, page-display options otherwise.
-        float y = 60.f + 22.f;
+        float y = 22.f;
 
-        annotHdr_->setFrame(kPad, 36.f, std::max(0.f, innerW), 16.f);
+        annotHdr_->setFrame(kPad, 36.f, std::max(0.f, innerW - 38.f), 16.f);
+        // Below the Focus/collapse row; never put Delete over either icon.
+        deleteAnnotBtn_->setFrame(std::max(0.f, rwF - kPad - 34.f),
+                                  46.f, 34.f, 34.f);
+        deleteAnnotBtn_->visible = selectedAnnot_ != 0 &&
+                                   annots_.get(selectedAnnot_) && bodyVisible;
+        deleteAnnotBtn_->opacity = rBody;
         annotHdr_->visible = authoring && bodyVisible;
         annotHdr_->opacity = rBody;
+
+        const float inspectorTop = deleteAnnotBtn_->visible ? 86.f : 60.f;
+        const float panelH = sheet ? rSheetH : rhF;
+        inspectorScroll_->setFrame(0.f, inspectorTop,
+                                   std::max(rwF, rightPanel_->expandedWidth()),
+                                   std::max(0.f, panelH - inspectorTop - kPad - sheetBottomReserve));
+        inspectorScroll_->visible = bodyVisible;
+        inspectorScroll_->opacity = rBody;
 
         // Four rows of six, sized from the panel rather than pinned at
         // 32px - the panel is narrower at Medium and wider as a phone
@@ -2717,6 +3902,18 @@ void ReaderScreen::onLayout() {
                       static_cast<float>(kInkCols));
         const int inkRows = (static_cast<int>(annotColorSw_.size()) + kInkCols - 1) /
                             kInkCols;
+        const bool commentable = selectedAnnot_ && annots_.get(selectedAnnot_) &&
+                                 !annots_.get(selectedAnnot_)->deleted;
+        commentLabel_->visible = commentField_->visible =
+            saveCommentBtn_->visible = commentable && bodyVisible;
+        commentLabel_->setFrame(kPad, y, innerW, 18.f);
+        const float commentH = std::clamp(
+            108.f + static_cast<float>(commentField_->text.size() / 42) * 21.f,
+            108.f, 218.f);
+        commentField_->setFrame(kPad, y + 22.f, std::max(0.f, innerW), commentH);
+        saveCommentBtn_->setFrame(kPad, y + 26.f + commentH,
+                                   std::max(0.f, innerW), 34.f);
+        if (commentable) y += commentH + 80.f;
         for (std::size_t i = 0; i < annotColorSw_.size(); ++i) {
             const int col = static_cast<int>(i) % kInkCols;
             const int row = static_cast<int>(i) / kInkCols;
@@ -2724,7 +3921,7 @@ void ReaderScreen::onLayout() {
                 kPad + static_cast<float>(col) * (swSize + swGap),
                 y + static_cast<float>(row) * (swSize + swGap), swSize, swSize);
             annotColorSw_[i]->visible = authoring && bodyVisible;
-            annotColorSw_[i]->opacity = rBody;
+            annotColorSw_[i]->opacity = 1.f;
         }
         const float inkH =
             static_cast<float>(inkRows) * (swSize + swGap) - swGap;
@@ -2732,36 +3929,54 @@ void ReaderScreen::onLayout() {
         const float widthY = y + inkH + 20.f + 22.f;
         annotWidthSeg_->setFrame(kPad, widthY, std::max(0.f, innerW), 32.f);
         annotWidthSeg_->visible = authoring && !textTool && bodyVisible;
-        annotWidthSeg_->opacity = rBody;
+        annotWidthSeg_->opacity = 1.f;
 
         // FONT and SIZE take the WIDTH slot, then push OPACITY down.
         textFontSeg_->setFrame(kPad, widthY, std::max(0.f, innerW), 32.f);
         textFontSeg_->visible = textTool && bodyVisible;
-        textFontSeg_->opacity = rBody;
+        textFontSeg_->opacity = 1.f;
         const float sizeY = widthY + 32.f + 20.f + 22.f;
         textSizeSeg_->setFrame(kPad, sizeY, std::max(0.f, innerW), 32.f);
         textSizeSeg_->visible = textTool && bodyVisible;
-        textSizeSeg_->opacity = rBody;
+        textSizeSeg_->opacity = 1.f;
 
         const float opacY = (textTool ? sizeY : widthY) + 32.f + 20.f + 22.f;
         annotOpacity_->setFrame(kPad, opacY, std::max(0.f, innerW), 22.f);
         annotOpacity_->visible = authoring && bodyVisible;
-        annotOpacity_->opacity = rBody;
+        annotOpacity_->opacity = 1.f;
 
         // .rp starts at top 60. "Page theme" header, then 44px swatches.
         const float swY = y;
         for (std::size_t i = 0; i < pageThemeSw_.size(); ++i) {
             pageThemeSw_[i]->setFrame(kPad + static_cast<float>(i) * 54.f, swY, 44.f, 44.f);
             pageThemeSw_[i]->visible = !authoring && bodyVisible;
-            pageThemeSw_[i]->opacity = rBody;
+            pageThemeSw_[i]->opacity = 1.f;
         }
 
         const float laySegY = authoring ? opacY + 22.f + 20.f + 22.f
                                         : swY + 44.f + 20.f + 22.f;
         layoutSegR_->setFrame(kPad, laySegY, std::max(0.f, innerW), 34.f);
         layoutSegR_->visible = rightCollapse_->visible;
-        layoutSegR_->opacity = rBody;
+        layoutSegR_->opacity = 1.f;
 
+        const float autoHideY = laySegY + 34.f + (authoring ? 22.f : 44.f);
+        focusAutoHideBtn_->setFrame(kPad, autoHideY,
+                                     std::max(0.f, innerW), 42.f);
+        focusAutoHideBtn_->visible = bodyVisible;
+        focusAutoHideBtn_->opacity = 1.f;
+
+        selectionMagnifierBtn_->setFrame(kPad, autoHideY + 49.f,
+                                         std::max(0.f, innerW), 42.f);
+        selectionMagnifierBtn_->visible = bodyVisible;
+        selectionMagnifierBtn_->opacity = 1.f;
+
+        // These are content coordinates, not screen coordinates. Both the
+        // touch-scrollable viewport and wheel use the same clamped range.
+        inspectorScroll_->contentHeight = autoHideY + 49.f + 42.f + 20.f;
+        inspectorScroll_->setScrollY(inspectorScroll_->scrollY());
+        inspectorContent_->setFrame(0.f, -inspectorScroll_->scrollY(),
+                                    inspectorScroll_->frame.w,
+                                    inspectorScroll_->contentHeight);
 
         for (std::size_t i = 0; i < rightRail_.size(); ++i) {
             rightRail_[i]->setFrame(rwF - 41.f, 7.f + static_cast<float>(i) * 38.f,
@@ -2787,7 +4002,7 @@ void ReaderScreen::onLayout() {
         // between a pill that fits in 390px and one that runs off-screen.
         const bool tinyPill = m.bp == Breakpoint::Compact;
         const float edge = tinyPill ? 8.f : 14.f;
-        const float pageLblW = tinyPill ? 46.f : 54.f;
+        const float pageLblW = tinyPill ? 58.f : 54.f;
         const float zoomLblW = tinyPill ? 44.f : 48.f;
         const float viewW = tinyPill ? ih : 132.f;
         float w = edge;
@@ -2815,6 +4030,7 @@ void ReaderScreen::onLayout() {
         x += pageLblW + (tinyPill ? 6.f : 12.f);
         zoomOutBtn_->setFrame(x, iy, ih, ih); x += ih + 2.f;
         zoomLabelRect_ = Rect{px + x, py, zoomLblW, kPillH};
+        zoomPctBtn_->setFrame(x, iy, zoomLblW, ih);
         x += zoomLblW;
         zoomInBtn_->setFrame(x, iy, ih, ih); x += ih + 2.f;
         fitWidthBtn_->visible = !tinyPill;
@@ -2835,7 +4051,8 @@ void ReaderScreen::onLayout() {
         const bool drawerOpen =
             m.panelsOverlay &&
             (!state_.leftPanelCollapsed || !state_.rightPanelCollapsed);
-        pill_->visible = !drawerOpen;
+        pill_->visible = !drawerOpen &&
+                         (!state_.focusMode || focusControlsVisible_);
     }
 
     // --- popover contents --------------------------------------------------
@@ -2844,6 +4061,12 @@ void ReaderScreen::onLayout() {
         for (std::size_t i = 0; i < modeItems_.size(); ++i)
             modeItems_[i]->setFrame(6.f, 6.f + static_cast<float>(i) * rowH,
                                     modePop_->frame.w - 12.f, rowH);
+        for (std::size_t i = 0; i < toolOverflowItems_.size(); ++i)
+            toolOverflowItems_[i]->setFrame(6.f, 6.f + static_cast<float>(i) * 40.f,
+                                           toolOverflowPop_->frame.w - 12.f, 40.f);
+        for (std::size_t i = 0; i < shapeItems_.size(); ++i)
+            shapeItems_[i]->setFrame(6.f + static_cast<float>(i) * 46.f,
+                                    7.f, 42.f, 42.f);
         const float lrH = 42.f;
         for (std::size_t i = 0; i < layoutItems_.size(); ++i)
             layoutItems_[i]->setFrame(6.f, 6.f + static_cast<float>(i) * lrH,
@@ -2932,6 +4155,11 @@ void ReaderScreen::onLayout() {
         }
     }
     {
+        for (std::size_t i = 0; i < zoomPresetItems_.size(); ++i)
+            zoomPresetItems_[i]->setFrame(6.f + (i % 2) * 107.f,
+                                          6.f + (i / 2) * 42.f, 107.f, 42.f);
+    }
+    {
         const float pad = tokens::space::pad;
         const float iw = displayPop_->frame.w - pad * 2.f;
         float y = pad + 20.f;
@@ -2945,26 +4173,142 @@ void ReaderScreen::onLayout() {
     }
 }
 
+void ReaderScreen::syncFocusAutoHidePreference() {
+    if (focusAutoHideBtn_)
+        focusAutoHideBtn_->toggled = state_.autoHideFocusControls;
+    if (selectionMagnifierBtn_)
+        selectionMagnifierBtn_->toggled = state_.selectionMagnifier;
+    if (stage_) stage_->setSelectionMagnifierEnabled(state_.selectionMagnifier);
+}
+
+void ReaderScreen::noteFocusInteraction(const PointerEvent& e) {
+    if (!state_.focusMode) return;
+    if (e.isTouch()) {
+        if (e.phase == PointerPhase::Down) focusTouches_.insert(e.pointerId);
+        else if (e.phase == PointerPhase::Cancel) focusTouches_.clear();
+        else if (e.phase == PointerPhase::Up) focusTouches_.erase(e.pointerId);
+        // Do not treat hover/enter as activity: a resting page is idle.
+        if (e.phase != PointerPhase::Down && e.phase != PointerPhase::Move &&
+            e.phase != PointerPhase::Up && e.phase != PointerPhase::Cancel) return;
+    } else if (e.phase != PointerPhase::Down && e.phase != PointerPhase::Up &&
+               e.phase != PointerPhase::Wheel) {
+        return;
+    }
+    if (focusControlsVisible_) focusHideAt_ = e.timestamp + kFocusIdleSeconds;
+}
+
+void ReaderScreen::showFocusControls(bool show) {
+    if (!state_.focusMode) return;
+    focusControlsVisible_ = show;
+    if (show) focusHideAt_ = now() + kFocusIdleSeconds;
+    if (focusExitBtn_) focusExitBtn_->visible = show;
+    stage_->setFocusScrollbarsVisible(show);
+    layoutTree();
+}
+
+void ReaderScreen::toggleFocusControlsFromPage() {
+    if (!state_.focusMode) return;
+    // In editing modes a tap can select a mark: do not hide the controls as
+    // a side effect. When hidden, a plain tap still reveals a way out.
+    if (state_.mode != Mode::Read && focusControlsVisible_) return;
+    showFocusControls(!focusControlsVisible_);
+}
+
 void ReaderScreen::setFocusMode(bool on) {
     state_.focusMode = on;
+    focusControlsVisible_ = on;
+    focusTouches_.clear();
+    focusHideAt_ = on ? now() + kFocusIdleSeconds : 0.0;
+    if (on && sheetMode()) {
+        state_.leftPanelCollapsed = state_.rightPanelCollapsed = true;
+        leftPanel_->setCollapsed(true, now());
+        rightPanel_->setCollapsed(true, now());
+        syncPhoneFabs();
+    }
     if (focusBtn_) {
         focusBtn_->toggled = on;
         focusBtn_->icon = on ? "minimise-view" : "maximise-view";
     }
+    if (focusPanelBtn_) focusPanelBtn_->toggled = on;
     if (focusExitBtn_) focusExitBtn_->visible = on;
+    stage_->setFocusScrollbarsVisible(!on || focusControlsVisible_);
     layoutTree();
 }
 
-bool ReaderScreen::animating(double now) const { return focusT_.active(now); }
+bool ReaderScreen::animating(double now) const {
+    return focusT_.active(now) ||
+           (state_.focusMode && state_.autoHideFocusControls &&
+            focusControlsVisible_ && focusTouches_.empty() &&
+            now >= focusHideAt_);
+}
+
+bool ReaderScreen::requiresFullFrame(double now) const {
+    return layoutWasAnimating_ || focusT_.active(now) ||
+           leftPanel_->animating(now) || rightPanel_->animating(now) ||
+           tabs_->animating(now) ||
+           (stage_->animating(now) && !stage_->thumbOverlayOnly(now));
+}
+
+void ReaderScreen::syncNotes() {
+    if (!notes_ || notesRevision_ == annots_.revision()) return;
+    notesRevision_ = annots_.revision();
+    static constexpr const char* kNames[] = {
+        "Highlight", "Underline", "Strikeout", "Ink", "Note", "Box",
+        "Ellipse", "Text", "Stamp", "Signature", "Line", "Arrow"};
+    std::vector<OutlineList::Entry> rows;
+    noteIds_.clear();
+    pdfNoteRefs_.clear();
+    std::unordered_set<std::uint64_t> seenGroups;
+    for (const auto& a : annots_.all()) {
+        if (a.deleted || (a.kind != AnnotKind::Highlight && a.kind != AnnotKind::Note &&
+            a.comment.empty() && a.kind != AnnotKind::Text)) continue;
+        // A multiline highlight is one note, not one row per glyph line.
+        if (a.group && !seenGroups.insert(a.group).second) continue;
+        std::string title = kNames[static_cast<std::size_t>(a.kind)];
+        const std::string& body = a.comment.empty() ? a.text : a.comment;
+        if (!body.empty()) title += " · " + body.substr(0, 80);
+        rows.push_back({std::move(title), a.page, 0});
+        noteIds_.push_back(a.id);
+        pdfNoteRefs_.push_back({-1, -1});
+    }
+    rows.insert(rows.end(), pdfNotesEntries_.begin(), pdfNotesEntries_.end());
+    for (std::size_t i = 0; i < pdfNotesRefs_.size(); ++i) {
+        noteIds_.push_back(0);
+        pdfNoteRefs_.push_back(pdfNotesRefs_[i]);
+    }
+    notes_->setEntries(std::move(rows));
+}
 
 void ReaderScreen::onPaint(IPaintTarget& t, const PaintCtx& ctx) {
     auto* self = const_cast<ReaderScreen*>(this);
-    
-    self->focusT_.animateTo(state_.focusMode ? 1.f : 0.f, tokens::dur::focusMode, ctx.now);
-    self->onLayout();   // chrome position depends on the focus animation
-    self->syncPageLabel();
+    if (notes_ && notes_->visible) self->syncNotes();
 
-    t.clear(ctx.pal.bg);
+    if (state_.focusMode && state_.autoHideFocusControls &&
+        focusControlsVisible_ && focusTouches_.empty() &&
+        ctx.now >= focusHideAt_) {
+        self->focusControlsVisible_ = false;
+        self->focusExitBtn_->visible = false;
+        self->stage_->setFocusScrollbarsVisible(false);
+        self->layoutTree(); // one frame on deadline, not a 3-second idle loop
+    }
+    self->focusT_.animateTo(state_.focusMode ? 1.f : 0.f, tokens::dur::focusMode, ctx.now);
+    // Layout is already invalidated by resize/tool changes. Recompute the
+    // entire inspector grid only while geometry actually animates; doing it
+    // on every page-scroll frame made opening the phone sheet noticeably lag.
+    const bool moving = focusT_.active(ctx.now) || leftPanel_->animating(ctx.now) ||
+                        rightPanel_->animating(ctx.now);
+    if (moving || layoutWasAnimating_) self->onLayout();
+    self->layoutWasAnimating_ = moving;
+
+#if FOLIO_HAVE_PDFIUM_SOURCE
+    if (!ctx.chromeOnly)
+        if (auto pdf = std::dynamic_pointer_cast<folio::engine::PdfiumPageSource>(pageSource_))
+            pdf->beginVisibleFrame();
+#endif
+    // SkCanvas::clear ignores the clip. On a retained partial chrome frame,
+    // clearing here would erase the cached PDF despite the damage rectangle.
+    if (!ctx.damage.empty()) t.fillRect(localBounds(), ctx.pal.bg);
+    else t.clear(ctx.pal.bg);
 
     const float f = focusT_.value(ctx.now);
     const float chromeA = 1.f - f;

@@ -3,7 +3,11 @@
 #include "include/core/SkFont.h"
 #include "include/core/SkFontMgr.h"
 #include "include/core/SkPath.h"
+#if defined(_WIN32)
+#include "include/ports/SkTypeface_win.h"
+#else
 #include "include/ports/SkFontMgr_empty.h"
+#endif
 #include <fpdf_edit.h>
 #include <hb.h>
 #include <hb-ot.h>
@@ -47,7 +51,15 @@ struct ShapedFont {
 };
 
 ShapedFont chooseFont(const std::string& dir, const std::string& text) {
+    // The pinned Windows Skia prebuilt omits SkFontMgr_New_Custom_Empty.
+    // DirectWrite is included and can still parse our explicitly supplied
+    // bundled font bytes; do not silently substitute a system font here.
+#if defined(_WIN32)
+    auto manager = SkFontMgr_New_DirectWrite();
+#else
     auto manager = SkFontMgr_New_Custom_Empty();
+#endif
+    if (!manager) return {};
     std::vector<std::filesystem::path> candidates;
     std::error_code ec;
     const auto root = std::filesystem::path(std::u8string(dir.begin(), dir.end()));

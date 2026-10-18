@@ -69,6 +69,23 @@ try {
         }
     }
 
+    # CMake regenerates Tokens.h from the JSON in this staged checkout.
+    # An Actions checkout containing the new PageStage.cpp but an older
+    # design-tokens.json silently overwrites the correct header and only
+    # reports C2039 after the entire dependency/bootstrap and C++ build.
+    $pageStage = Join-Path $source 'folio-ui\components\PageStage.cpp'
+    $tokensJson = Join-Path $source 'design-tokens.json'
+    $tokensHeader = Join-Path $source 'folio-ui\include\folio\ui\Tokens.h'
+    if ((Select-String -LiteralPath $pageStage -Pattern 'tokens::dur::desktopZoom' -SimpleMatch -Quiet)) {
+        $durations = (Get-Content -LiteralPath $tokensJson -Raw | ConvertFrom-Json).motion.duration
+        if (-not $durations.PSObject.Properties['desktopZoom'] -or
+            -not (Select-String -LiteralPath $tokensHeader -Pattern 'int desktopZoom' -SimpleMatch -Quiet)) {
+            throw ('Incomplete source revision: PageStage.cpp uses tokens::dur::desktopZoom, ' +
+                   'but the staged design-tokens.json and regenerated Tokens.h must BOTH define it. ' +
+                   'Commit/sync all three files from the same source revision before rerunning Windows CI.')
+        }
+    }
+
     $env:FOLIO_DEPS_DIR = $deps
     Invoke-Checked 'powershell.exe' @('-NoProfile', '-ExecutionPolicy', 'Bypass',
         '-File', (Join-Path $source 'tools\bootstrap-deps.ps1'))

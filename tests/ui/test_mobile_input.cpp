@@ -34,6 +34,13 @@ struct LongLayoutPages final : IPageSource {
     }
     void drawPage(IPaintTarget&, int, const Rect&, float, PageTheme) override {}
 };
+struct PreviewProbe final : IPageSource {
+    bool ready = false;
+    int pageCount() const override { return 2; }
+    PageSizePt pageSize(int) const override { return {612.f, 792.f}; }
+    void drawPage(IPaintTarget&, int, const Rect&, float, PageTheme) override {}
+    [[nodiscard]] bool visibleFrameComplete() const noexcept override { return ready; }
+};
 struct GridProbe final : IPageSource {
     struct Paint { int page; Rect dest; float scale; };
     std::vector<Paint> paints;
@@ -106,6 +113,7 @@ struct GesturePaint final : IPaintTarget {
     std::vector<Rect> revealClips;
     std::vector<Rect> panelClips;
     std::vector<std::string> paintEvents;
+    int viewportImages = 0, invalidatedImages = 0;
     struct Transform { float x = 0.f, y = 0.f, sx = 1.f, sy = 1.f; } transform;
     std::vector<Transform> stack;
     std::vector<Point> iconCentres;
@@ -160,7 +168,8 @@ struct GesturePaint final : IPaintTarget {
     bool drawCached(std::uint64_t, const Rect&, int, int,
                     const std::function<void(IPaintTarget&)>&) override { return false; }
     void drawImageBGRA(const void*, int, int, std::size_t, const Rect&,
-                       std::uint64_t, ImageFit, ImageTint) override {}
+                       std::uint64_t, ImageFit, ImageTint) override { ++viewportImages; }
+    void invalidateImage(std::uint64_t) override { ++invalidatedImages; }
     void invalidateRasterCache() override {}
     RasterCacheStats rasterCacheStats() const override { return {}; }
     int width() const override { return 390; }
@@ -497,6 +506,32 @@ FOLIO_TEST_MAIN("mobile input and layouts") {
     modes.onPaint(gridPaint, {tokens::kLight, 2.3, 1.f});
     check(modes.currentPage() == 18,
           "round-trip through all layouts keeps selected page and skips entrance replay");
+
+    section("returning tab shows a bounded actual-viewport snapshot until pixels are ready");
+    auto proxySource = std::make_shared<PreviewProbe>();
+    PageStage proxyStage;
+    proxyStage.setFrame(0, 0, 390, 640);
+    proxyStage.setSource(proxySource, 0);
+    auto priorViewport = std::make_shared<ViewportPreview>();
+    priorViewport->width = 8;
+    priorViewport->height = 8;
+    priorViewport->bgra.assign(8u * 8u * 4u, 255);
+    priorViewport->imageKey = 0xE17A000000000012ull;
+    proxyStage.setSwitchPreview(priorViewport);
+    GesturePaint previewPaint;
+    proxyStage.onPaint(previewPaint, {tokens::kLight, 1., 1.f});
+    check(previewPaint.viewportImages == 1 && previewPaint.invalidatedImages == 0,
+          "previously displayed viewport covers missing PDF tiles instead of white");
+    proxySource->ready = true;
+    proxyStage.onPaint(previewPaint, {tokens::kLight, 2., 1.f});
+    check(previewPaint.viewportImages == 1 && previewPaint.invalidatedImages == 1,
+          "sharp visible frame atomically replaces and frees the viewport proxy");
+    proxySource->ready = false;
+    proxyStage.setSwitchPreview(priorViewport);
+    proxyStage.onPaint(previewPaint, {tokens::kLight, 3., 1.f});
+    proxyStage.onPaint(previewPaint, {tokens::kLight, 14., 1.f});
+    check(previewPaint.viewportImages == 2 && previewPaint.invalidatedImages == 2,
+          "a failed render cannot leave a frozen old viewport over the reader forever");
 
     section("tab view-state snapshot restores exact zoom, page and XY position");
     PageStage savedStage;

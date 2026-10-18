@@ -162,7 +162,8 @@ public:
     // In-memory view suppression. The source PDF remains untouched; Save As
     // removes only matching originals and writes the edited Folio overlays.
     using Suppressed = std::map<int, std::vector<std::pair<int, int>>>;
-    void setSuppressed(Suppressed indices);
+    /// Returns true only when the suppressed imported marks actually change.
+    bool setSuppressed(Suppressed indices);
 
     /// Queue a private copy on the sole PDFium thread. One export at a time.
     bool requestExport(std::string source, std::string target,

@@ -97,6 +97,9 @@ public:
 
     std::function<void()> onBackToWelcome;
     std::function<void()> onDocumentChanged;
+    /// Host captures the already presented reader viewport once on tab exit.
+    /// Headless hosts leave it empty and use the existing PDF page proxy.
+    std::function<std::shared_ptr<const ViewportPreview>(Rect)> onCaptureViewport;
     void trimIdleVisualCaches();
     void releaseVisualCaches();
     void setWorkerWakeCallback(std::function<void()> wake);
@@ -522,6 +525,7 @@ private:
         std::string title;
         std::vector<Annotation> annots;
         std::shared_ptr<IPageSource> source;
+        std::shared_ptr<const ViewportPreview> preview;
         PageStage::ViewState view{};
         PageTheme pageTheme = PageTheme::Light;
         std::uint64_t selectedAnnot = 0;

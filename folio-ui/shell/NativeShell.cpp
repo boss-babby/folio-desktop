@@ -329,6 +329,69 @@ int runNativeShell(const NativeShellOptions& opts) {
     host.copyText = [](const std::string& s) { plat::clipboard().setText(s); };
     host.pasteText = [] { return plat::clipboard().text(); };
     host.setTitle = [&](const std::string& t) { window->setTitle(t); };
+    host.captureViewport = [&](Rect view) -> std::shared_ptr<const ViewportPreview> {
+        // The retained scene is the only accurate record of *all* visible
+        // pages, margins, annotations and scroll position. Capture only the
+        // stage rectangle when switching, never a whole PDF/page/window.
+        if (useGpu ? !gpu.valid() : !raster) return {};
+        const int x0 = std::clamp(static_cast<int>(std::floor(view.x * dpr)), 0, pxW);
+        const int y0 = std::clamp(static_cast<int>(std::floor(view.y * dpr)) + safeTopPx,
+                                  0, pxH);
+        const int x1 = std::clamp(static_cast<int>(std::ceil(view.right() * dpr)), 0, pxW);
+        const int y1 = std::clamp(static_cast<int>(std::ceil(view.bottom() * dpr)) + safeTopPx,
+                                  0, pxH);
+        const int w = x1 - x0, h = y1 - y0;
+        if (w <= 0 || h <= 0) return {};
+        // <=384x576 BGRA (~0.85 MiB) per inactive PDF. The GPU first scales
+        // into a tiny render target, then reads back ONLY those pixels. The
+        // software path samples its already-resident scene without a copy.
+        const float factor = std::min({1.f, 384.f / w, 576.f / h});
+        auto preview = std::make_shared<ViewportPreview>();
+        preview->width = std::max(1, static_cast<int>(std::lround(w * factor)));
+        preview->height = std::max(1, static_cast<int>(std::lround(h * factor)));
+        preview->bgra.resize(static_cast<std::size_t>(preview->width) *
+                             preview->height * 4u);
+        if (useGpu) {
+            if (!gpu.readScenePreview(x0, y0, w, h, preview->width,
+                                      preview->height, preview->bgra.data(),
+                                      static_cast<std::size_t>(preview->width) * 4u))
+                return {};
+        } else {
+            SkPixmap pm;
+            if (!raster->peekPixels(&pm) ||
+                pm.colorType() != kBGRA_8888_SkColorType) return {};
+            const auto* raw = static_cast<const std::uint8_t*>(pm.addr());
+            for (int y = 0; y < preview->height; ++y) {
+                const float sy = (y + .5f) * h / preview->height - .5f;
+                const int ya = std::clamp(static_cast<int>(std::floor(sy)), 0, h - 1);
+                const int yb = std::min(ya + 1, h - 1);
+                const float wy = std::clamp(sy - static_cast<float>(ya), 0.f, 1.f);
+                for (int x = 0; x < preview->width; ++x) {
+                    const float sx = (x + .5f) * w / preview->width - .5f;
+                    const int xa = std::clamp(static_cast<int>(std::floor(sx)), 0, w - 1);
+                    const int xb = std::min(xa + 1, w - 1);
+                    const float wx = std::clamp(sx - static_cast<float>(xa), 0.f, 1.f);
+                    const auto a = (static_cast<std::size_t>(y0 + ya) * pm.rowBytes() +
+                                    static_cast<std::size_t>(x0 + xa) * 4u);
+                    const auto b = (static_cast<std::size_t>(y0 + ya) * pm.rowBytes() +
+                                    static_cast<std::size_t>(x0 + xb) * 4u);
+                    const auto c = (static_cast<std::size_t>(y0 + yb) * pm.rowBytes() +
+                                    static_cast<std::size_t>(x0 + xa) * 4u);
+                    const auto d = (static_cast<std::size_t>(y0 + yb) * pm.rowBytes() +
+                                    static_cast<std::size_t>(x0 + xb) * 4u);
+                    auto* dst = preview->bgra.data() +
+                                (static_cast<std::size_t>(y) * preview->width + x) * 4u;
+                    for (int k = 0; k < 4; ++k)
+                        dst[k] = static_cast<std::uint8_t>(std::lround(
+                            (1.f - wy) * ((1.f - wx) * raw[a + k] + wx * raw[b + k]) +
+                            wy * ((1.f - wx) * raw[c + k] + wx * raw[d + k])));
+                }
+            }
+        }
+        static std::uint64_t serial = 0;
+        preview->imageKey = 0xE17A000000000000ull | (++serial & 0xFFFFFFFFull);
+        return preview;
+    };
 #if defined(__ANDROID__)
     host.showKeyboard = [](bool visible) { plat::showAndroidKeyboard(visible); };
     host.exportPdf = [](const std::string& staged, const std::string& name) {

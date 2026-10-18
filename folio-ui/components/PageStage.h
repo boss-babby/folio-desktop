@@ -71,6 +71,11 @@ public:
                                   float, PageTheme) { return false; }
     /// Publish the new viewport's wanted set after all pages have drawn.
     virtual void endVisibleFrame() {}
+    /// Reset/inspect readiness of exactly the canvas pages painted this frame.
+    /// A returned tab can show its bounded viewport snapshot until no visible
+    /// page is blank; thumbnails must not affect this result.
+    virtual void beginCanvasFrame() {}
+    [[nodiscard]] virtual bool visibleFrameComplete() const noexcept { return true; }
     /// Human-readable, for the status bar.
     [[nodiscard]] virtual std::string describe() const { return "document"; }
 
@@ -135,6 +140,14 @@ private:
 
 enum class LayoutMode : std::uint8_t { Single, TwoUp, Continuous, Grid };
 
+/// One downsampled snapshot of the actual visible reader canvas at tab exit.
+/// It is NOT a whole PDF page or an additional PDFium document/raster cache.
+struct ViewportPreview {
+    int width = 0, height = 0;
+    std::vector<std::uint8_t> bgra;
+    std::uint64_t imageKey = 0;
+};
+
 /// Zoom presets the UI exposes, plus free zoom between them.
 enum class ZoomMode : std::uint8_t { Free, FitWidth, FitPage };
 
@@ -148,6 +161,10 @@ public:
 
     void setSource(std::shared_ptr<IPageSource> src, double now);
     [[nodiscard]] IPageSource* source() const noexcept { return source_.get(); }
+    void setSwitchPreview(std::shared_ptr<const ViewportPreview> preview) {
+        switchPreview_ = std::move(preview);
+        switchPreviewStarted_ = -1.0;
+    }
 
     // --- view state ---------------------------------------------------------
     void setLayout(LayoutMode m, double now);
@@ -393,6 +410,8 @@ public:
     void updateCurrentFromScroll();
 
     std::shared_ptr<IPageSource> source_;
+    std::shared_ptr<const ViewportPreview> switchPreview_;
+    double switchPreviewStarted_ = -1.0;
     unsigned lastGeometryRevision_ = 0;
     std::vector<Placed> placed_;
     bool pendingAnnotClear_ = false;

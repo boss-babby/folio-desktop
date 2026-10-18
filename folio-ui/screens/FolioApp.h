@@ -86,6 +86,8 @@ public:
         std::function<void(const std::string&)> copyText;
         std::function<std::string()> pasteText;
         std::function<void(const std::string&)> setTitle;
+        /// Read back only the currently visible PDF viewport on tab exit.
+        std::function<std::shared_ptr<const ViewportPreview>(Rect)> captureViewport;
         std::function<void(bool)> showKeyboard;
         std::function<bool(const std::string&, const std::string&)> exportPdf;
         std::function<bool(const std::string&, const std::string&)> sharePdf;

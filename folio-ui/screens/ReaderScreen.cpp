@@ -3066,6 +3066,12 @@ void ReaderScreen::stashActiveDoc() {
     d.annots = annots_.all();
     d.source = pageSource_;
     d.view = stage_->captureViewState(now());
+    d.preview.reset();
+    if (visible && opacity >= .99f && onCaptureViewport) {
+        const Point origin = stage_->toWindow({0.f, 0.f});
+        d.preview = onCaptureViewport(
+            Rect{origin.x, origin.y, stage_->frame.w, stage_->frame.h});
+    }
     d.hasView = true;
     d.pageTheme = state_.theme.pageTheme();
     d.selectedAnnot = stage_->selectedAnnot();
@@ -3079,7 +3085,11 @@ void ReaderScreen::stashActiveDoc() {
     // Keep the mapped document/worker for instant tab switches, not every
     // tab's decoded 4K page bitmaps and GPU image keys.
     if (auto pdf = std::dynamic_pointer_cast<folio::engine::PdfiumPageSource>(d.source)) {
-        pdf->parkVisualCaches(stage_->currentPage() - 1);
+        // The exact visible viewport snapshot replaces both full-page tiles
+        // and the old page-wide proxy. Without a native scene (headless or
+        // backgrounded) keep the existing bounded page preview instead.
+        if (d.preview) pdf->suspendVisualCaches();
+        else pdf->parkVisualCaches(stage_->currentPage() - 1);
         // Never let an unbounded tab count turn into an unbounded warm cache.
         warmVisuals_.erase(std::remove_if(warmVisuals_.begin(), warmVisuals_.end(),
             [&](const auto& w) { auto p = w.lock(); return !p || p == d.source; }),
@@ -3132,6 +3142,7 @@ void ReaderScreen::releaseVisualCaches() {
     // Every background tab becomes cold; none consumes a full tile grid.
     for (auto& doc : docs_) {
         if (doc.source == pageSource_) continue;
+        doc.preview.reset(); // background/minimise is an explicit memory release
         if (auto pdf = std::dynamic_pointer_cast<folio::engine::PdfiumPageSource>(doc.source))
             pdf->suspendVisualCaches();
     }
@@ -3146,7 +3157,7 @@ void ReaderScreen::switchToDoc(int index, double now) {
     if (index < 0 || index >= static_cast<int>(docs_.size())) return;
     if (index == activeDoc_) return;
     stashActiveDoc();
-    const OpenDoc& d = docs_[static_cast<std::size_t>(index)];
+    OpenDoc& d = docs_[static_cast<std::size_t>(index)];
     if (!loadPath(d.path, now, d.source)) return;
     activeDoc_ = index;
     warmVisuals_.erase(std::remove_if(warmVisuals_.begin(), warmVisuals_.end(),
@@ -3156,6 +3167,12 @@ void ReaderScreen::switchToDoc(int index, double now) {
     // entry still referring to them would resolve to nothing.
     annots_.clear();
     for (const Annotation& a : d.annots) annots_.addExisting(a);
+#if FOLIO_HAVE_PDFIUM_SOURCE
+    // The in-memory tab snapshot is authoritative if the sidecar changed
+    // while this document was away. This is a no-op for the normal switch;
+    // only an actual imported-mark change invalidates the viewport raster.
+    syncImportedSuppression();
+#endif
     if (d.hasView) {
         applyPageTheme(d.pageTheme);
         state_.leftTab = d.leftTab;
@@ -3178,6 +3195,7 @@ void ReaderScreen::switchToDoc(int index, double now) {
         syncPhoneFabs();
         layoutTree(); // establish the destination viewport BEFORE restoring scroll
         stage_->restoreViewState(d.view, now);
+        stage_->setSwitchPreview(std::move(d.preview));
         thumbs_->restoreScrollY(d.thumbnailScroll);
         outline_->restoreScrollY(d.outlineScroll);
         selectedAnnot_ = annots_.get(d.selectedAnnot) ? d.selectedAnnot : 0;

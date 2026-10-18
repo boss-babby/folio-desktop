@@ -270,10 +270,10 @@ void PdfiumWorker::suspendVisualWork() {
         it = it->kind == Kind::Export ? std::next(it) : done_.erase(it);
 }
 
-void PdfiumWorker::setSuppressed(Suppressed indices) {
+bool PdfiumWorker::setSuppressed(Suppressed indices) {
     {
         std::lock_guard<std::mutex> lk(m_);
-        if (suppressed_ == indices) return;
+        if (suppressed_ == indices) return false;
         suppressed_ = std::move(indices);
         ++suppressionRevision_;
         ++visualEpoch_;
@@ -282,6 +282,7 @@ void PdfiumWorker::setSuppressed(Suppressed indices) {
             it = it->kind == Kind::Export ? std::next(it) : done_.erase(it);
     }
     cv_.notify_all();
+    return true;
 }
 
 void PdfiumWorker::requestAnnotations(int page) {

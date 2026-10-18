@@ -238,6 +238,7 @@ void PageStage::setSource(std::shared_ptr<IPageSource> src, double now) {
     selAnnot_ = 0;
     if (store_) store_->cancelDraft();
     source_ = std::move(src);
+    switchPreview_.reset();
     lastGeometryRevision_ = source_ ? source_->geometryRevision() : 0;
     current_ = 0;
     scrollX_ = scrollY_ = 0.f;
@@ -350,6 +351,7 @@ void PageStage::applyZoomAnchor() {
 }
 
 void PageStage::setZoom(float z, double now) {
+    switchPreview_.reset();
     if (thumbLayer_ != ThumbLayer::Closed) closeThumb(now);
     captureZoomAnchor();
     zoomMode_ = ZoomMode::Free;
@@ -366,6 +368,7 @@ void PageStage::setZoom(float z, double now) {
 }
 
 void PageStage::setZoomMode(ZoomMode m, double now) {
+    switchPreview_.reset();
     if (thumbLayer_ != ThumbLayer::Closed) closeThumb(now);
     captureZoomAnchor();
     zoomMode_ = m;
@@ -435,6 +438,7 @@ void PageStage::restoreViewState(const ViewState& v, double now) {
 
 void PageStage::setLayout(LayoutMode m, double now) {
     if (m == layout_) return;
+    switchPreview_.reset(); // saved pixels belong to the old viewport geometry
     // Scroll coordinates belong to a particular layout. Reusing the old
     // absolute Y after Single -> Continuous/Grid lands at page one; reusing
     // X after Single -> TwoUp can put the chosen right-hand page offscreen.
@@ -472,6 +476,7 @@ void PageStage::setLayout(LayoutMode m, double now) {
 }
 
 void PageStage::rotate(int delta, double now) {
+    switchPreview_.reset();
     rotation_ = ((rotation_ + delta) % 4 + 4) % 4;
     // Animate the visual angle continuously so a 270->0 step turns the short
     // way rather than spinning three quarters backwards.
@@ -486,6 +491,7 @@ void PageStage::goToPage(int oneBased, double now) {
     const int n = source_->pageCount();
     const int idx = std::clamp(oneBased - 1, 0, std::max(0, n - 1));
     if (idx == current_ && !placed_.empty()) return;
+    switchPreview_.reset();
     current_ = idx;
     relayout(now);
     for (const Placed& p : placed_) {
@@ -2953,6 +2959,9 @@ bool PageStage::handleTouch(const PointerEvent& e) {
 }
 
 bool PageStage::onPointer(const PointerEvent& e) {
+    if (e.phase == PointerPhase::Wheel ||
+        (e.phase == PointerPhase::Move && touch_.count() > 0))
+        switchPreview_.reset(); // user has left the saved viewport
     // Give a finger on the wider touch target exclusive ownership of the
     // bar until it lifts; don't feed its motion to the pan/selection tracker.
     if (e.isTouch() && highlightMagnifierActive_ &&
@@ -3272,6 +3281,11 @@ bool PageStage::onPointer(const PointerEvent& e) {
 
 bool PageStage::onKey(const KeyEvent& e) {
     if (!e.pressed) return false;
+    if (e.key == Key::PageDown || e.key == Key::PageUp ||
+        e.key == Key::Space || e.key == Key::Up || e.key == Key::Down ||
+        e.key == Key::Left || e.key == Key::Right ||
+        e.key == Key::Home || e.key == Key::End)
+        switchPreview_.reset();
     switch (e.key) {
         case Key::PageDown: case Key::Space: nextPage(0.0); return true;
         case Key::PageUp:                    prevPage(0.0); return true;
@@ -3560,6 +3574,7 @@ void PageStage::onPaint(IPaintTarget& t, const PaintCtx& ctx) {
         source_->setVisibleGridRange(-1, -1, -1, -1, 0, 0);
     }
 
+    source_->beginCanvasFrame(); // sidebar thumbnails must not decide snapshot readiness
     const float rot = rotationAnim_.value(ctx.now);
     const Color paper = paperOf(pageTheme_);
 
@@ -3825,6 +3840,31 @@ void PageStage::onPaint(IPaintTarget& t, const PaintCtx& ctx) {
     paintTextCaret(t, ctx);
 
     t.restore();
+
+    // A tab's bounded snapshot is the previously presented *viewport*, not
+    // an off-screen page or a speculative PDF render. Keep it above unfinished
+    // paper/tiles, then replace it in one frame once all visible PDF pixels
+    // have landed; no white flash or checkerboard during a fast tab return.
+    if (switchPreview_) {
+        if (switchPreviewStarted_ < 0.0) self->switchPreviewStarted_ = ctx.now;
+        // A broken/unrenderable PDF must not leave a frozen old screenshot
+        // over its error/partial pixels forever. Ordinary loads swap when
+        // exact visible pixels are ready; this is only a failure escape.
+        if (source_->visibleFrameComplete() ||
+            ctx.now - switchPreviewStarted_ > 10.0) {
+            t.invalidateImage(switchPreview_->imageKey);
+            self->switchPreview_.reset();
+        } else if (switchPreview_->width > 0 && switchPreview_->height > 0 &&
+                   switchPreview_->bgra.size() >=
+                       static_cast<std::size_t>(switchPreview_->width) *
+                       static_cast<std::size_t>(switchPreview_->height) * 4u) {
+            t.drawImageBGRA(switchPreview_->bgra.data(), switchPreview_->width,
+                            switchPreview_->height,
+                            static_cast<std::size_t>(switchPreview_->width) * 4u,
+                            b, switchPreview_->imageKey,
+                            IPaintTarget::ImageFit::Transient);
+        }
+    }
 
     paintScrollbars(t, ctx);
     paintSelectionMagnifier(t, ctx, rasterScale_ * ctx.dpr, loupePage, loupeLines);

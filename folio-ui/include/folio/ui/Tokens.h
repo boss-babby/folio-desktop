@@ -207,7 +207,6 @@ inline constexpr int tabOpen = 350;
 inline constexpr int toolLabelGrow = 350;
 inline constexpr int pageRotate = 500;
 inline constexpr int pageWidth = 400;
-inline constexpr int desktopZoom = 150;
 inline constexpr int annotPlace = 400;
 inline constexpr int popoverReveal = 460;
 inline constexpr int screenSwap = 220;

@@ -109,7 +109,9 @@ const std::vector<PdfAnnotationInfo>* PdfiumPageSource::annotationsForPage(int p
 }
 
 void PdfiumPageSource::suppressSourceAnnotations(PdfiumWorker::Suppressed indices) {
-    worker_->setSuppressed(std::move(indices));
+    // Tab activation reloads the same sidecar. A no-op suppression update
+    // must not erase the parked preview and force a white-page re-render.
+    if (!worker_->setSuppressed(std::move(indices))) return;
     suspendVisualCaches();
     annotations_.clear();
     // Old GPU tile keys were collected by suspendVisualCaches(). A fresh
@@ -398,6 +400,7 @@ void PdfiumPageSource::drawPage(IPaintTarget& t, int index, const Rect& dest,
                           : IPaintTarget::ImageTint::None;
 
     if (!worker_->pageMetaLoaded(index)) {
+        if (gridFirst_ >= 0) visibleFrameComplete_ = false;
         worker_->requestMeta(index);
         return; // no distorted render while the real page geometry is pending
     }
@@ -432,6 +435,7 @@ void PdfiumPageSource::drawPage(IPaintTarget& t, int index, const Rect& dest,
         return;
     }
 
+    if (gridFirst_ >= 0) visibleFrameComplete_ = false;
     ++stats_.misses;
     if (pxW >= 768) {
         for (auto it = requested_.begin(); it != requested_.end();)
@@ -652,6 +656,7 @@ void PdfiumPageSource::drawVisiblePage(IPaintTarget& t, int index, const Rect& d
         staleKeys_.clear();
     }
     if (!worker_->pageMetaLoaded(index)) {
+        visibleFrameComplete_ = false;
         worker_->requestMeta(index);
         return; // paper until the real aspect ratio is known
     }
@@ -682,6 +687,7 @@ void PdfiumPageSource::drawVisiblePage(IPaintTarget& t, int index, const Rect& d
             allExact = false;
             break;
         }
+    if (!allExact) visibleFrameComplete_ = false;
     // A small thumbnail is a cheap continuous proxy during zoom/scroll.
     // It is never submitted as a full-size canvas render.
     auto proxy = cache_.end();

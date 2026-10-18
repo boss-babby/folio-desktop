@@ -158,6 +158,7 @@ void FolioApp::setHostServices(HostServices s) {
     }
     if (reader_) {
         reader_->onQuit = host_.close;
+        reader_->onCaptureViewport = host_.captureViewport;
         reader_->setWorkerWakeCallback(host_.wake);
     }
     router_.onTextFocusChange = host_.showKeyboard;

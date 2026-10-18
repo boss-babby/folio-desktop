@@ -95,6 +95,15 @@ FOLIO_TEST_MAIN("PDFium source zoom and eviction") {
           "distant geometry is provisional rather than eagerly scanned");
     source.setFocusPage(0);
     check(waitForImage(source, spy, 0, 1.f, 200), "first page draws bitmap");
+    const auto bytesBeforeSwitch = source.cacheStats().bytes;
+    source.suppressSourceAnnotations({}); // tab return with the same sidecar
+    check(source.cacheStats().bytes == bytesBeforeSwitch &&
+              source.hasCachedPageProxy(0),
+          "unchanged imported annotations do not delete the parked preview");
+    source.suppressSourceAnnotations({{0, {{999, 1}}}});
+    check(source.cacheStats().bytes == 0 && !source.hasCachedPageProxy(0),
+          "a real imported-annotation change invalidates old visual pixels");
+    source.suppressSourceAnnotations({});
     for (int i = 0; i < 300 && source.geometryRevision() == 0; ++i)
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     check(source.geometryRevision() > 0 && source.pageSize(1).w == 612.f,

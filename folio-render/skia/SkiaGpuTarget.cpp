@@ -14,6 +14,8 @@
 #include "SkiaPaintTarget.h"
 
 #include "include/core/SkCanvas.h"
+#include "include/core/SkImage.h"
+#include "include/core/SkSamplingOptions.h"
 #include "include/core/SkColorSpace.h"
 #include "include/core/SkSurface.h"
 #include "include/gpu/ganesh/GrBackendSurface.h"
@@ -160,6 +162,33 @@ void SkiaGpuTarget::purgeResources() {
 
 bool SkiaGpuTarget::valid() const noexcept {
     return impl_ && impl_->surface != nullptr;
+}
+
+bool SkiaGpuTarget::readScenePreview(int x, int y, int w, int h,
+                                     int previewW, int previewH,
+                                     void* bgra, std::size_t stride) {
+    if (!impl_->surface || !bgra || w <= 0 || h <= 0 ||
+        previewW <= 0 || previewH <= 0 || previewW > 384 || previewH > 576)
+        return false;
+    if (impl_->gl) impl_->gl->makeCurrent();
+    const auto scene = impl_->surface->makeImageSnapshot();
+    if (!scene) return false;
+    const auto info = SkImageInfo::Make(previewW, previewH,
+        kRGBA_8888_SkColorType, kPremul_SkAlphaType,
+        SkColorSpace::MakeSRGB());
+    auto small = SkSurfaces::RenderTarget(impl_->context.get(),
+        skgpu::Budgeted::kNo, info, 0, kBottomLeft_GrSurfaceOrigin, nullptr);
+    if (!small) return false;
+    small->getCanvas()->drawImageRect(scene.get(),
+        SkRect::MakeXYWH(static_cast<float>(x), static_cast<float>(y),
+                         static_cast<float>(w), static_cast<float>(h)),
+        SkRect::MakeWH(static_cast<float>(previewW),
+                       static_cast<float>(previewH)),
+        SkSamplingOptions(SkFilterMode::kLinear), nullptr,
+        SkCanvas::kStrict_SrcRectConstraint);
+    const auto dstInfo = SkImageInfo::Make(previewW, previewH,
+                                           kBGRA_8888_SkColorType, kPremul_SkAlphaType);
+    return small->readPixels(dstInfo, bgra, stride, 0, 0);
 }
 
 std::size_t SkiaGpuTarget::gpuBytesUsed() const {

@@ -62,6 +62,11 @@ public:
 
     [[nodiscard]] bool valid() const noexcept;
     [[nodiscard]] std::size_t gpuBytesUsed() const;
+    /// Scale the cropped scene on the GPU BEFORE reading back the small
+    /// snapshot. No full-resolution viewport copy or per-frame readback.
+    [[nodiscard]] bool readScenePreview(int x, int y, int w, int h,
+                                        int previewW, int previewH,
+                                        void* bgra, std::size_t stride);
 
 private:
     // Pimpl, so no Skia GPU header leaks into anything that includes this.

@@ -151,6 +151,10 @@ public:
     /// no timer is left running to do speculative background rendering.
     void beginVisibleFrame();
     void endVisibleFrame() override;
+    void beginCanvasFrame() override { visibleFrameComplete_ = true; }
+    [[nodiscard]] bool visibleFrameComplete() const noexcept override {
+        return visibleFrameComplete_;
+    }
     void setVisibleThumbnailRange(int first, int last) override;
     void setVisibleGridRange(int first, int last, int bufferFirst,
                              int bufferLast, int pixelW, int pixelH) override;
@@ -226,6 +230,7 @@ private:
     std::unordered_set<std::uint64_t>                    requestedTiles_;
     std::unordered_set<std::uint64_t>                    nextRequestedTiles_;
     std::uint64_t                                       frame_ = 0;
+    bool                                                visibleFrameComplete_ = true;
     std::size_t                                         tileBytes_ = 0;
     static std::uint64_t tileRequestKey(const TileId& k) {
         auto [page, width, x, y] = k;

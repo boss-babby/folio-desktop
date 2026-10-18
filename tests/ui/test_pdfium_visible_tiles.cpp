@@ -253,6 +253,54 @@ FOLIO_TEST_MAIN("visible-only tiles and tab lifetime") {
         if (im.fit == IPaintTarget::ImageFit::Final)
             check(im.w <= 512 && im.h <= 512,
                   "main canvas stores only 512-device-pixel final tiles");
+    section("grid viewport keeps all visible pages, even >2 from focus, in small rasters");
+    {
+        folio::engine::PdfiumPageSource gridPdf;
+        Spy gridSpy;
+        check(gridPdf.open("folio-grid.pdf") && gridPdf.pageCount() == 36,
+              "grid fixture has enough pages to exceed the focus +/-2 window");
+        gridPdf.setFocusPage(0);
+        gridPdf.setVisibleGridRange(0, 17, 0, 23, 138, 176);
+        // A sidebar Pages rail may show a completely different page range.
+        // Changing that range must not cancel grid-page raster jobs.
+        gridPdf.setVisibleThumbnailRange(29, 31);
+        // Simulate a fast wheel changing the focused page *while* the whole
+        // 18-cell viewport still requests its pages. Old dropQueuedOutside
+        // and tick discarded pages beyond focus +/-2.
+        gridPdf.setFocusPage(1);
+        auto drawGrid = [&] {
+            gridSpy.images.clear();
+            gridPdf.beginVisibleFrame();
+            gridPdf.tick();
+            for (int p = 0; p < 18; ++p) {
+                const auto ps = gridPdf.pageSize(p);
+                const float scale = std::min(138.f / ps.w, 176.f / ps.h);
+                const Rect dst{0.f, 0.f, ps.w * scale, ps.h * scale};
+                gridPdf.drawPage(gridSpy, p, dst, scale,
+                                 folio::ui::PageTheme::Light);
+            }
+            gridPdf.endVisibleFrame();
+        };
+        const auto until = std::chrono::steady_clock::now() +
+                           std::chrono::seconds(8);
+        do {
+            drawGrid();
+            if (gridSpy.images.size() >= 18) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        } while (std::chrono::steady_clock::now() < until);
+        check(gridSpy.images.size() == 18,
+              "every visible grid cell, not only the +/-2 pages, finishes rasterizing");
+        check(std::all_of(gridSpy.images.begin(), gridSpy.images.end(),
+                          [](const Spy::Image& im) { return im.w <= 138 && im.h <= 176; }),
+              "grid pages use cell-sized bitmaps instead of viewport-sized tiles");
+        check(gridPdf.cacheStats().bytes < 8u * 1024u * 1024u,
+              "grid plus a nearby row remain under an 8 MiB image budget");
+        gridPdf.setVisibleGridRange(17, 26, 11, 32, 138, 176);
+        gridPdf.setFocusPage(20);
+        gridPdf.setVisibleGridRange(-1, -1, -1, -1, 0, 0);
+        check(gridPdf.cacheStats().bytes < 8u * 1024u * 1024u,
+              "grid caches trim again after leaving the multi-page viewport");
+    }
     constexpr std::size_t kPreviewBytes = 512u * 768u * 4u;
     // One preview on either side, plus one ahead of a fling. Each is bounded
     // to <=240x320 even if its provisional page geometry is wrong.
@@ -304,6 +352,13 @@ FOLIO_TEST_MAIN("visible-only tiles and tab lifetime") {
     check(pdf.cacheStats().bytes >= 49u * 512u * 512u * 4u,
           "idle pruning retains every tile used in the last presented viewport");
 
+    pdf.parkVisualCaches(1);
+    check(pdf.isOpen() && pdf.cacheStats().bytes <= 512u * 768u * 4u &&
+              pdf.textPagesResident() == 0,
+          "inactive tab keeps at most one bounded page preview, not its tiles/text");
+    pdf.parkVisualCaches(1, true);
+    check(pdf.cacheStats().bytes <= (512u * 768u + 3u * 240u * 320u) * 4u,
+          "minimise retains only one page preview and at most three tiny neighbours");
     pdf.suspendVisualCaches();
     check(pdf.isOpen() && pdf.cacheStats().bytes == 0 && pdf.textPagesResident() == 0,
           "tab suspension drops all visual and text caches, not the document");
@@ -504,8 +559,8 @@ FOLIO_TEST_MAIN("visible-only tiles and tab lifetime") {
                                return o.color.a == 137 && o.corners.tl <= 2.5f &&
                                       o.corners.tl > 0.f && o.width < 1.f;
                            });
-    check(amber == 2 && fineEdges == 2,
-          "sepia paints translucent gradient bands with slightly rounded rectangular edges");
+    check(amber == 2 && fineEdges == 0,
+          "sepia keeps clipped amber bands without per-line outline glitches");
     check(std::all_of(spy.bands.begin(), spy.bands.end(),
               [](const Spy::Band& b) {
                   return b.top.a != 48 || b.mode == BlendMode::Multiply;
@@ -591,6 +646,56 @@ FOLIO_TEST_MAIN("visible-only tiles and tab lifetime") {
     check(cached->cachedBlits == beforeDisable && !loupeStage.selectedText().empty(),
           "disabled setting leaves mobile selection intact without a loupe");
     loupeStage.onPointer(finger(folio::ui::PointerPhase::Up, 122, magnifiedWord, 6.8));
+
+    section("opt-in desktop mouse selection magnifies resident PDF pixels");
+    auto mousePixels = std::make_shared<CachedSelectionSource>();
+    folio::ui::PageStage mouseStage;
+    mouseStage.setFrame(0, 0, 390, 640);
+    mouseStage.setSource(mousePixels, 0);
+    mouseStage.setZoom(.5f, 0);
+    mouseStage.snapZoomToTarget(1);
+    Spy mouseSpy;
+    mouseStage.onPaint(mouseSpy, {folio::ui::tokens::kLight, 7., 1.f});
+    auto mouse = [&](folio::ui::PointerPhase phase, Point point, double seconds) {
+        folio::ui::PointerEvent e;
+        e.pointerType = folio::ui::PointerType::Mouse;
+        e.pointerId = 0;
+        e.button = folio::ui::MouseButton::Left;
+        e.phase = phase;
+        e.pos = e.windowPos = point;
+        e.timestamp = seconds;
+        return e;
+    };
+    int mousePage = -1;
+    Point mouseNorm{};
+    check(mouseStage.hitPage(magnifiedWord, &mousePage, &mouseNorm),
+          "mouse probe lies within desktop page");
+    mouseStage.pressed = true; // EventRouter owns this state in production
+    mouseStage.onPointer(mouse(folio::ui::PointerPhase::Down, magnifiedWord, 7.1));
+    mouseStage.onPaint(mouseSpy, {folio::ui::tokens::kLight, 7.2, 1.f});
+    check(mousePixels->cachedBlits == 0,
+          "desktop magnifier stays off by default while text selection works");
+    mouseStage.onPointer(mouse(folio::ui::PointerPhase::Up, magnifiedWord, 7.3));
+    mouseStage.clearSelection();
+    mouseStage.setSelectionMagnifierEnabled(true);
+    mouseStage.onPointer(mouse(folio::ui::PointerPhase::Down, magnifiedWord, 8.));
+    mouseStage.onPointer(mouse(folio::ui::PointerPhase::Move,
+                               {magnifiedWord.x + 14.f, magnifiedWord.y}, 8.03));
+    mouseStage.onPaint(mouseSpy, {folio::ui::tokens::kLight, 8.1, 1.f});
+    const int mouseStartBlits = mousePixels->cachedBlits;
+    check(mouseStartBlits == 1 && !mouseStage.selectedText().empty(),
+          "enabled desktop mouse drag selects text and shows cached loupe");
+    mouseStage.onPointer(mouse(folio::ui::PointerPhase::Move,
+                               {magnifiedWord.x + 17.f, magnifiedWord.y}, 8.2));
+    mouseStage.onPaint(mouseSpy, {folio::ui::tokens::kLight, 8.2, 1.f});
+    check(mousePixels->cachedBlits == mouseStartBlits + 1,
+          "moving mouse selection follows cursor without requesting new raster");
+    mouseStage.onPointer(mouse(folio::ui::PointerPhase::Up,
+                               {magnifiedWord.x + 14.f, magnifiedWord.y}, 8.3));
+    mouseStage.pressed = false;
+    mouseStage.onPaint(mouseSpy, {folio::ui::tokens::kLight, 8.4, 1.f});
+    check(mousePixels->cachedBlits == mouseStartBlits + 1,
+          "mouse release hides magnifier and keeps committed text selection");
 
     section("annotation highlighter previews before stroke and tracks its cursor");
     auto markerPixels = std::make_shared<CachedSelectionSource>();
@@ -755,6 +860,36 @@ FOLIO_TEST_MAIN("visible-only tiles and tab lifetime") {
                         markerNorm.y) < .001f,
           "mouse highlighting retains immediate stroke and original row");
     markerStage.onPointer(mouseMarker(folio::ui::PointerPhase::Cancel, down, 7.2));
+
+    section("opt-in desktop mouse highlighter magnifies its live draft");
+    auto mouseMarkerPixels = std::make_shared<CachedSelectionSource>();
+    folio::ui::PageStage desktopMarkerStage;
+    desktopMarkerStage.setFrame(0, 0, 390, 640);
+    desktopMarkerStage.setSource(mouseMarkerPixels, 0);
+    desktopMarkerStage.setZoom(.5f, 0);
+    desktopMarkerStage.snapZoomToTarget(1);
+    folio::ui::AnnotationStore mouseMarks;
+    desktopMarkerStage.setStore(&mouseMarks);
+    desktopMarkerStage.setEditTool(folio::ui::PageStage::EditTool::Highlight);
+    desktopMarkerStage.setSelectionMagnifierEnabled(true);
+    desktopMarkerStage.onPaint(mouseSpy, {folio::ui::tokens::kLight, 9., 1.f});
+    desktopMarkerStage.pressed = true;
+    desktopMarkerStage.onPointer(mouse(folio::ui::PointerPhase::Down, down, 9.1));
+    desktopMarkerStage.onPaint(mouseSpy, {folio::ui::tokens::kLight, 9.2, 1.f});
+    check(mouseMarkerPixels->cachedBlits == 1 && mouseMarks.draft() &&
+              mouseMarks.draft()->kind == folio::ui::AnnotKind::Highlight,
+          "mouse highlight starts a live magnified preview when opted in");
+    desktopMarkerStage.onPointer(mouse(folio::ui::PointerPhase::Move,
+                                {down.x + 50.f, down.y}, 9.3));
+    desktopMarkerStage.onPaint(mouseSpy, {folio::ui::tokens::kLight, 9.4, 1.f});
+    check(mouseMarkerPixels->cachedBlits == 2,
+          "mouse highlighter loupe follows its horizontal stroke");
+    desktopMarkerStage.onPointer(mouse(folio::ui::PointerPhase::Up,
+                                {down.x + 50.f, down.y}, 9.5));
+    desktopMarkerStage.pressed = false;
+    desktopMarkerStage.onPaint(mouseSpy, {folio::ui::tokens::kLight, 9.6, 1.f});
+    check(mouseMarkerPixels->cachedBlits == 2 && mouseMarks.countOn(0) == 1,
+          "releasing mouse hides loupe and commits highlighter annotation");
 
     section("night selection and saved text markup preserve ink contrast");
     folio::ui::PageStage nightStage;

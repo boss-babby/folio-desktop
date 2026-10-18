@@ -140,8 +140,15 @@ if(TARGET folio-render-skia)
     # A Windows GUI binary must use the WINDOWS subsystem. A console-subsystem
     # build creates a second CMD window that stays open for the app's lifetime.
     if(WIN32)
+        # Resource compiler embeds the same layers mark as the Android icon.
+        # Absolute, forward-slash path survives both VS multi-config and
+        # Ninja builds (including workspaces with spaces in their names).
+        file(TO_CMAKE_PATH "${CMAKE_SOURCE_DIR}/assets/windows/Folio.ico"
+             FOLIO_WINDOWS_ICON)
+        configure_file(shell/Folio.rc.in "${CMAKE_CURRENT_BINARY_DIR}/Folio.rc" @ONLY)
         add_executable(folio-desktop WIN32
-            shell/NativeShell.cpp shell/main_native.cpp)
+            shell/NativeShell.cpp shell/main_native.cpp
+            "${CMAKE_CURRENT_BINARY_DIR}/Folio.rc")
         target_compile_definitions(folio-desktop PRIVATE UNICODE _UNICODE)
     else()
         add_executable(folio-desktop

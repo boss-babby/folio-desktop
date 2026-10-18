@@ -450,7 +450,7 @@ std::size_t gRasterBytes = 0;
 #if defined(__ANDROID__)
 std::size_t gRasterBudget = 16u * 1024u * 1024u;
 #else
-std::size_t gRasterBudget = 64u * 1024u * 1024u;
+std::size_t gRasterBudget = 32u * 1024u * 1024u;
 #endif
 std::size_t gRasterHits = 0, gRasterMisses = 0, gRasterEvictions = 0;
 
@@ -571,7 +571,7 @@ std::size_t   g_imageBytes = 0;
 #if defined(__ANDROID__)
 constexpr std::size_t kImageBudget = 24u * 1024u * 1024u;
 #else
-constexpr std::size_t kImageBudget = 64u * 1024u * 1024u;
+constexpr std::size_t kImageBudget = 40u * 1024u * 1024u;
 #endif
 
 void evictImages() {

@@ -24,6 +24,8 @@
 #include "folio/ui/Widget.h"
 #include "components/Annotations.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -96,6 +98,11 @@ public:
     /// Canvas focus and sidebar focus are independent: a user may scroll
     /// thumbnails to page 90 while reading page 2.
     virtual void setVisibleThumbnailRange(int /*first*/, int /*last*/) {}
+    /// Grid's simultaneous visible pages and one-row buffer. Never use the
+    /// reader's single-page +/-2 focus rule for an entire viewport of pages.
+    virtual void setVisibleGridRange(int /*first*/, int /*last*/,
+                                     int /*bufferFirst*/, int /*bufferLast*/,
+                                     int /*pixelW*/, int /*pixelH*/) {}
 
     /// The page's laid-out glyphs, 0..1 page-normalised with a top-left
     /// origin - the same space annotations use, so a selection rectangle
@@ -199,7 +206,13 @@ public:
     void prevPage(double now) { goToPage(currentPage() - 1, now); }
 
     /// Grid thumbnail size, for LayoutMode::Grid.
-    void setGridSize(float px) { gridSize_ = px; }
+    void setGridSize(float px) {
+        const float safe = std::clamp(px, 72.f, 320.f);
+        if (std::fabs(gridSize_ - safe) > .01f) {
+            gridSize_ = safe;
+            lastLayoutW_ = 0.f;
+        }
+    }
     [[nodiscard]] float gridSize() const noexcept { return gridSize_; }
 
     std::function<void(int)> onPageChanged;
@@ -211,6 +224,9 @@ public:
     void onPaint(IPaintTarget& t, const PaintCtx& ctx) override;
     bool onPointer(const PointerEvent& e) override;
     bool onKey(const KeyEvent& e) override;
+    [[nodiscard]] bool geometryChanged() const {
+        return source_ && source_->geometryRevision() != lastGeometryRevision_;
+    }
     [[nodiscard]] bool animating(double now) const override;
 
 private:

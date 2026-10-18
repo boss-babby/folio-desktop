@@ -676,6 +676,9 @@ bool Win32Window::create(const WindowDesc& desc, std::string* error) {
     wc.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS | CS_OWNDC;
     wc.lpfnWndProc = &Win32Window::wndProcThunk;
     wc.hInstance = inst;
+    wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(1));
+    wc.hIconSm = static_cast<HICON>(LoadImageW(inst, MAKEINTRESOURCEW(1),
+                                      IMAGE_ICON, 16, 16, LR_DEFAULTCOLOR));
     wc.hCursor = nullptr;        // WM_SETCURSOR owns this
     wc.hbrBackground = nullptr;  // GL paints every pixel; no flicker fill
     wc.lpszClassName = kClassName;

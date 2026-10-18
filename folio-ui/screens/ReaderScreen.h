@@ -209,8 +209,12 @@ private:
     // sun/moon button remains in the phone title bar; only the redundant
     // command-bar Display shortcut is hidden on phones.
     Button* docBtn_ = nullptr;
+    Button* docListBtn_ = nullptr; // fixed beside desktop window controls
     Popover* docPop_ = nullptr;
+    ScrollView* docMenuScroll_ = nullptr;
+    Widget* docMenuContent_ = nullptr;
     std::vector<Button*> docItems_;
+    std::vector<std::weak_ptr<IPageSource>> warmVisuals_; // LRU, bounded inactive previews
     Button* themeBtn_ = nullptr;
     /// Bottom-corner sheet handles. Left thumb opens pages/outline, right
     /// thumb opens the inspector; both are within reach without shifting

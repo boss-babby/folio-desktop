@@ -107,7 +107,21 @@ PdfiumWorker::~PdfiumWorker() {
 PdfiumWorker::PageMeta PdfiumWorker::pageMeta(int index) const {
     std::lock_guard<std::mutex> lk(m_);
     if (index < 0 || index >= static_cast<int>(meta_.size())) return {};
-    return meta_[static_cast<std::size_t>(index)];
+    if (metaLoaded_[static_cast<std::size_t>(index)] == 1)
+        return meta_[static_cast<std::size_t>(index)];
+    // The cover need not resemble the body. Search only actual resolved
+    // sizes; std::set avoids an O(pages^2) layout on large PDFs.
+    auto right = resolvedMeta_.lower_bound(index);
+    if (right == resolvedMeta_.end()) return meta_[static_cast<std::size_t>(*resolvedMeta_.rbegin())];
+    if (right == resolvedMeta_.begin()) return meta_[static_cast<std::size_t>(*right)];
+    const int left = *std::prev(right);
+    return meta_[static_cast<std::size_t>(index - left <= *right - index ? left : *right)];
+}
+
+bool PdfiumWorker::pageMetaLoaded(int index) const {
+    std::lock_guard<std::mutex> lk(m_);
+    return index >= 0 && index < static_cast<int>(metaLoaded_.size()) &&
+           metaLoaded_[static_cast<std::size_t>(index)] == 1;
 }
 
 std::vector<PdfiumRasterizer::Bookmark> PdfiumWorker::outline() const {
@@ -345,9 +359,27 @@ void PdfiumWorker::setThumbnailRange(int first, int last) {
         const Job& job = it->second;
         if (!job.visiblePreview && job.requestedWidth <= 256 &&
             (job.page < first || job.page > last) &&
-            std::abs(job.page - focus) > 2)
+            std::abs(job.page - focus) > 2 &&
+            !(gridBufferFirst_ >= 0 && job.page >= gridBufferFirst_ &&
+              job.page <= gridBufferLast_))
             it = renderQueue_.erase(it);
         else ++it;
+    }
+}
+
+void PdfiumWorker::setGridRange(int first, int last, int bufferFirst, int bufferLast) {
+    std::lock_guard<std::mutex> lk(m_);
+    gridFirst_ = first; gridLast_ = last;
+    gridBufferFirst_ = bufferFirst; gridBufferLast_ = bufferLast;
+    const int focus = focus_.load(std::memory_order_relaxed);
+    for (auto it = renderQueue_.begin(); it != renderQueue_.end();) {
+        const Job& j = it->second;
+        const bool grid = bufferFirst >= 0 && j.page >= bufferFirst &&
+                          j.page <= bufferLast;
+        const bool thumb = !j.visiblePreview && j.requestedWidth <= 256 &&
+                           j.page >= thumbnailFirst_ && j.page <= thumbnailLast_;
+        it = !grid && !thumb && std::abs(j.page - focus) > 2
+            ? renderQueue_.erase(it) : std::next(it);
     }
 }
 
@@ -357,7 +389,9 @@ void PdfiumWorker::dropQueuedOutside(int page, int radius) {
         const Job& job = it->second;
         const bool visibleThumb = !job.visiblePreview && job.requestedWidth <= 256 &&
                                   job.page >= thumbnailFirst_ && job.page <= thumbnailLast_;
-        it = std::abs(job.page - page) > radius && !visibleThumb
+        const bool grid = gridBufferFirst_ >= 0 &&
+                          job.page >= gridBufferFirst_ && job.page <= gridBufferLast_;
+        it = std::abs(job.page - page) > radius && !visibleThumb && !grid
             ? renderQueue_.erase(it) : std::next(it);
     }
     for (auto it = tileQueue_.begin(); it != tileQueue_.end();)
@@ -386,6 +420,23 @@ bool PdfiumWorker::takeNextJob(Job& out) {
         out = std::move(*exportJob_);
         exportJob_.reset();
         return true;
+    }
+    // Grid paints EVERY on-screen page at its small device size. The usual
+    // +/-2 page focus would starve all but one column of the same viewport.
+    if (gridFirst_ >= 0) {
+        for (auto it = metaQueue_.lower_bound(gridFirst_);
+             it != metaQueue_.end() && it->first <= gridLast_; ++it) {
+            out = std::move(it->second);
+            metaQueue_.erase(it);
+            return true;
+        }
+        for (auto it = renderQueue_.begin(); it != renderQueue_.end(); ++it) {
+            if (it->second.page < gridFirst_ || it->second.page > gridLast_)
+                continue;
+            out = std::move(it->second);
+            renderQueue_.erase(it);
+            return true;
+        }
     }
     // Later pages initially advertise page-one dimensions. Resolve the
     // focused page's actual geometry before allocating its preview/tiles;
@@ -580,7 +631,12 @@ void PdfiumWorker::threadMain() {
             snapshot_ = snapshot;
             meta_ = std::move(meta);
             metaLoaded_.assign(meta_.size(), pathToLoad.empty() ? 1 : 0);
+            resolvedMeta_.clear();
             if (!metaLoaded_.empty()) metaLoaded_[0] = 1;
+            if (pathToLoad.empty()) {
+                for (int i = 0; i < static_cast<int>(meta_.size()); ++i)
+                    resolvedMeta_.insert(i);
+            } else if (!meta_.empty()) resolvedMeta_.insert(0);
             metaQueue_.clear();
             annotationsQueue_.clear();
             outline_ = std::move(toc);
@@ -692,6 +748,7 @@ void PdfiumWorker::threadMain() {
                     meta_[static_cast<std::size_t>(job.page)] =
                         PageMeta{info.widthPt, info.heightPt, info.rotation};
                     metaLoaded_[static_cast<std::size_t>(job.page)] = 1;
+                    resolvedMeta_.insert(job.page);
                     geometryRevision_.fetch_add(1, std::memory_order_release);
                 }
             }

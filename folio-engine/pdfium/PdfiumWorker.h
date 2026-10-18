@@ -46,6 +46,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <map>
+#include <set>
 #include <utility>
 #include <memory>
 #include <mutex>
@@ -127,6 +128,7 @@ public:
 
     [[nodiscard]] int pageCount() const noexcept { return static_cast<int>(meta_.size()); }
     [[nodiscard]] PageMeta pageMeta(int index) const;
+    [[nodiscard]] bool pageMetaLoaded(int index) const;
     /// The /Outlines tree, read on the worker thread at load time and
     /// cached. Empty when the document has no bookmarks.
     [[nodiscard]] std::vector<PdfiumRasterizer::Bookmark> outline() const;
@@ -171,6 +173,7 @@ public:
     /// The Pages panel can show pages far from the canvas focus. Only its
     /// visible thumbnails are eligible to remain queued/rendered.
     void setThumbnailRange(int first, int last);
+    void setGridRange(int first, int last, int bufferFirst, int bufferLast);
 
     /// Hand over everything finished since the last call. UI thread only.
     [[nodiscard]] std::vector<Result> drain();
@@ -230,12 +233,15 @@ private:
     std::uint64_t               activeTileEpoch_ = 0;
     int                         thumbnailFirst_ = -1; // protected by m_
     int                         thumbnailLast_ = -1;
+    int                         gridFirst_ = -1, gridLast_ = -1;
+    int                         gridBufferFirst_ = -1, gridBufferLast_ = -1;
     std::map<int, Job>          textQueue_;
     std::map<int, Job>          annotationsQueue_;
     std::map<int, Job>          metaQueue_;
     bool                        outlinePending_ = false;
     bool                        firstRenderDone_ = false;
     std::vector<std::uint8_t>   metaLoaded_;
+    std::set<int>               resolvedMeta_; // nearest-geometry lookup, O(log pages)
     std::unique_ptr<Job>        exportJob_;
     std::vector<Result>         done_;
     bool                        exporting_ = false;

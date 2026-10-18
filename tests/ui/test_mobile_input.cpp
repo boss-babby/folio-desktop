@@ -26,6 +26,33 @@ struct MixedPages final : IPageSource {
     }
     void drawPage(IPaintTarget&, int, const Rect&, float, PageTheme) override {}
 };
+struct GridProbe final : IPageSource {
+    struct Paint { int page; Rect dest; float scale; };
+    std::vector<Paint> paints;
+    int first = -1, last = -1, bufferFirst = -1, bufferLast = -1;
+    int pixelW = 0, pixelH = 0, glyphRequests = 0, tileRequests = 0;
+    int pageCount() const override { return 60; }
+    PageSizePt pageSize(int p) const override {
+        return p % 4 == 0 ? PageSizePt{792.f, 450.f}
+                          : PageSizePt{612.f, 792.f};
+    }
+    bool cachesOwnRasters() const override { return true; }
+    void drawPage(IPaintTarget&, int page, const Rect& dst,
+                  float scale, PageTheme) override {
+        paints.push_back({page, dst, scale});
+    }
+    void drawVisiblePage(IPaintTarget&, int, const Rect&, const Rect&,
+                         float, PageTheme) override { ++tileRequests; }
+    const std::vector<PageGlyph>* glyphs(int) override {
+        ++glyphRequests;
+        return nullptr;
+    }
+    void setVisibleGridRange(int a, int b, int c, int d,
+                             int w, int h) override {
+        first = a; last = b; bufferFirst = c; bufferLast = d;
+        pixelW = w; pixelH = h;
+    }
+};
 struct ColumnText final : IPageSource {
     std::vector<PageGlyph> chars{
         {U'A', .10f, .10f, .14f, .13f},
@@ -340,6 +367,46 @@ FOLIO_TEST_MAIN("mobile input and layouts") {
           "zoom-in tracks the moving midpoint instead of leaving the PDF left pinned");
     mixedZoom.onPointer(touch(PointerPhase::Up, 35, 90, 320, 1.03));
     mixedZoom.onPointer(touch(PointerPhase::Up, 36, 210, 320, 1.04));
+
+    section("grid publishes full viewport and paints pages at cell resolution");
+    auto gridSource = std::make_shared<GridProbe>();
+    PageStage grid;
+    grid.setFrame(0, 0, 780, 590);
+    grid.setSource(gridSource, 0);
+    grid.setGridSize(132.f);
+    grid.setLayout(LayoutMode::Grid, 0);
+    GesturePaint gridPaint;
+    grid.onPaint(gridPaint, {tokens::kLight, 2., 2.f});
+    check(gridSource->first == 0 && gridSource->last >= 9 &&
+          gridSource->bufferLast > gridSource->last &&
+          gridSource->paints.size() >= 10,
+          "all on-screen columns publish their inclusive visible/next-row range");
+    check(gridSource->tileRequests == 0 && gridSource->glyphRequests == 0 &&
+          std::all_of(gridSource->paints.begin(), gridSource->paints.end(),
+              [&](const GridProbe::Paint& p) {
+                  const auto pt = gridSource->pageSize(p.page);
+                  return p.dest.w < 135.f && p.dest.h < 170.f &&
+                         std::fabs(p.scale - 2.f * p.dest.w / pt.w) < .005f;
+              }),
+          "grid requests tiny full-page device rasters, never reading tiles or text");
+    PointerEvent gridWheel{};
+    gridWheel.phase = PointerPhase::Wheel;
+    gridWheel.wheelY = -3.f;
+    gridWheel.pos = gridWheel.windowPos = {200.f, 260.f};
+    gridWheel.timestamp = 2.1;
+    check(grid.onPointer(gridWheel), "mouse wheel is handled by grid stage");
+    gridSource->paints.clear();
+    grid.onPaint(gridPaint, {tokens::kLight, 2.25, 2.f});
+    check(grid.scrollY() > 310.f && gridSource->first > 0 &&
+          gridSource->bufferFirst < gridSource->first,
+          "three wheel detents move promptly and reprioritize the new visible rows");
+    const float wheelY = grid.scrollY();
+    gridWheel.timestamp = 2.3;
+    gridWheel.wheelY = -2.f;
+    grid.onPointer(gridWheel);
+    grid.onPaint(gridPaint, {tokens::kLight, 2.42, 2.f});
+    check(grid.scrollY() > wheelY + 100.f,
+          "consecutive wheel events accumulate instead of restarting a slow ease-in");
 
     section("tab view-state snapshot restores exact zoom, page and XY position");
     PageStage savedStage;
@@ -969,6 +1036,32 @@ FOLIO_TEST_MAIN("mobile input and layouts") {
     check(thin > 0.f && thick > thin * 2.f && markerMarks.all().empty(),
           "radial thickness settings change actual marker band and its preview");
     markerMenu.onPointer(touch(PointerPhase::Cancel, 99, 240, 400, 19.25));
+
+    section("desktop tab strip clips overflow and scrolls to the selected PDF");
+    TabBar docTabs;
+    docTabs.setFrame(0.f, 0.f, 220.f, 44.f);
+    int chosen = -1;
+    docTabs.onSelect = [&](int i) { chosen = i; };
+    for (int i = 0; i < 8; ++i)
+        docTabs.addTab("document " + std::to_string(i), 1.0, true);
+    check(docTabs.clipsContent && docTabs.intrinsicWidth(2.0) > docTabs.frame.w,
+          "overflowing PDF tabs stay clipped inside their title-bar strip");
+    docTabs.selectTab(0, 2.0);
+    PointerEvent wheel{};
+    wheel.phase = PointerPhase::Wheel;
+    wheel.pos = {100.f, 20.f};
+    wheel.wheelY = -5.f;
+    wheel.timestamp = 2.0;
+    check(docTabs.onPointer(wheel), "wheel pans the overflowing strip");
+    PointerEvent pick{};
+    pick.phase = PointerPhase::Up;
+    pick.pos = {50.f, 20.f};
+    pick.timestamp = 2.0;
+    docTabs.onPointer(pick);
+    check(chosen > 0 && chosen < 8,
+          "tab hit targets follow horizontal scrolling instead of the old off-screen positions");
+    docTabs.selectTab(7, 2.1);
+    check(docTabs.active() == 7, "dropdown selection activates a far tab");
 
     section("open/save modal controls stay on a phone viewport");
     OpenDialog dialog;

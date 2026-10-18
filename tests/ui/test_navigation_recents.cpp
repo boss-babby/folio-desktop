@@ -87,6 +87,40 @@ FOLIO_TEST_MAIN("navigation and persistent recents") {
         check(moves == 1, "close button never initiates a window drag");
     }
 
+    section("many desktop PDF tabs remain scrollable with a fixed all-documents menu");
+    {
+        FolioApp many(1024.f, 720.f);
+        many.showScreen(Screen::Reader, 1.0);
+        TabBar* strip = nullptr;
+        Button* list = nullptr;
+        many.root().forEach([&](Widget& w) {
+            if (auto* tab = dynamic_cast<TabBar*>(&w)) strip = tab;
+            if (auto* b = dynamic_cast<Button*>(&w);
+                b && b->tooltip == "All open PDFs") list = b;
+        });
+        check(strip && list && list->visible && strip->clipsContent,
+              "title bar clips PDFs and exposes a persistent switcher beside window controls");
+        if (strip && list) {
+            for (int i = 0; i < 18; ++i)
+                strip->addTab("Long title for PDF " + std::to_string(i), 2.0, false);
+            many.root().layoutTree();
+            check(strip->frame.right() <= list->frame.x &&
+                  list->frame.right() < 1024.f - 50.f,
+                  "the fixed switcher stays clear of the overflowing strip and controls");
+            list->onClick();
+            Popover* menu = nullptr;
+            ScrollView* scroller = nullptr;
+            many.root().forEach([&](Widget& w) {
+                if (auto* p = dynamic_cast<Popover*>(&w); p && p->isOpen()) menu = p;
+                if (w.parent() && dynamic_cast<Popover*>(w.parent()) &&
+                    dynamic_cast<ScrollView*>(&w)) scroller = static_cast<ScrollView*>(&w);
+            });
+            check(menu && scroller && menu->frame.h <= 624.f &&
+                      scroller->contentHeight > scroller->frame.h,
+                  "all opened PDFs live in a height-bounded, wheel-scrollable dropdown");
+        }
+    }
+
     section("expanded Pages and Outline change actual left-panel content");
     FolioApp app(1440.f, 900.f);
     app.showScreen(Screen::Reader, 1.0);
@@ -138,6 +172,37 @@ FOLIO_TEST_MAIN("navigation and persistent recents") {
     check(inspector && inspector->collapsed() &&
               inspector->currentWidth(0.0) <= tokens::size::panelRailCollapsed + 1.f,
           "the actual command panel starts collapsed, without an opening animation");
+    auto headerFits = [&](SidePanel* panel) {
+        if (!panel) return false;
+        std::vector<Button*> actions;
+        ScrollView* body = nullptr;
+        for (const auto& child : panel->children()) {
+            if (auto* b = dynamic_cast<Button*>(child.get()); b && b->visible)
+                actions.push_back(b);
+            if (auto* sc = dynamic_cast<ScrollView*>(child.get()); sc && sc->visible)
+                body = sc;
+        }
+        if (actions.size() < 6 || !body) return false;
+        const auto overlap = [](Rect a, Rect b) {
+            return a.x < b.right() && b.x < a.right() &&
+                   a.y < b.bottom() && b.y < a.bottom();
+        };
+        for (std::size_t i = 0; i < actions.size(); ++i) {
+            if (actions[i]->frame.bottom() > body->frame.y + .01f) return false;
+            for (std::size_t j = i + 1; j < actions.size(); ++j)
+                if (overlap(actions[i]->frame, actions[j]->frame)) return false;
+        }
+        return true;
+    };
+    if (inspector) {
+        inspector->setCollapsedImmediately(false);
+        app.root().layoutTree();
+        check(headerFits(inspector),
+              "desktop history, rotation, Focus, collapse and inspector never overlap");
+        inspector->setCollapsedImmediately(true);
+        app.root().layoutTree();
+    }
+
     FolioApp::HostServices host;
     host.close = [&] { ++closeButtons; };
     app.setHostServices(std::move(host));
@@ -478,6 +543,21 @@ FOLIO_TEST_MAIN("navigation and persistent recents") {
               !rightUndo->enabled && !rightRedo->enabled &&
               rightUndo->frame.right() < focusPanel->frame.x,
           "right-panel Undo and Redo fit beside Focus, disabled until edits exist");
+    SidePanel* phoneInspector = focusPanel
+        ? dynamic_cast<SidePanel*>(focusPanel->parent()) : nullptr;
+    check(headerFits(phoneInspector),
+          "phone header buttons and PAGE THEME body occupy separate rows");
+    if (phoneInspector) {
+        phone.resize(320.f, 800.f);
+        phoneInspector->setCollapsedImmediately(false);
+        phone.root().layoutTree();
+        check(headerFits(phoneInspector),
+              "narrow landscape-width sheet wraps rotations without overlap");
+        phone.resize(390.f, 800.f);
+        phoneInspector->setCollapsedImmediately(false);
+        phone.root().layoutTree();
+    }
+
     if (focusPanel && focus && exitFocus && annotate && edit && read) {
         annotate->onClick();
         check(phone.state().mode == Mode::Annotate && !focus->visible &&

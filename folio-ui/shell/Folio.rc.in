@@ -1,0 +1,2 @@
+// Embedded Windows shell/taskbar icon; source art matches Android ic_folio.xml.
+1 ICON "@FOLIO_WINDOWS_ICON@"

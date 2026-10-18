@@ -21,6 +21,16 @@ struct MixedWidthProbe final : IPageSource {
     }
     void drawPage(IPaintTarget&, int, const Rect&, float, PageTheme) override {}
 };
+struct CoverGeometryProbe final : IPageSource {
+    bool resolved = false;
+    int pageCount() const override { return 8; }
+    PageSizePt pageSize(int i) const override {
+        return resolved && i > 0 && i < 4 ? PageSizePt{600.f, 800.f}
+                                             : PageSizePt{200.f, 300.f};
+    }
+    unsigned geometryRevision() const override { return resolved ? 1u : 0u; }
+    void drawPage(IPaintTarget&, int, const Rect&, float, PageTheme) override {}
+};
 struct ViewportProbe final : IPageSource {
     struct Draw { int page; Rect dest, visible; };
     std::vector<Draw> draws;
@@ -162,6 +172,25 @@ FOLIO_TEST_MAIN("retained chrome redraw") {
     check(mixed.hitPage({195.f, 320.f}, &afterPage, &atCentre) &&
               afterPage == 1 && std::fabs(atCentre.x - 0.5f) < 0.01f,
           "narrow anchor page stays under the midpoint after zooming in");
+
+    section("real page dimensions replace a tiny cover without jumping the scroll position");
+    auto cover = std::make_shared<CoverGeometryProbe>();
+    PageStage coverStage;
+    coverStage.setFrame(0.f, 0.f, 390.f, 640.f);
+    coverStage.setSource(cover, 1.0);
+    coverStage.setZoom(1.f, 1.0);
+    coverStage.snapZoomToTarget(1.0);
+    coverStage.goToPage(5, 1.0);
+    coverStage.paintTree(target, PaintCtx{ctx.pal, 2.0, 1.f});
+    const float beforeGeometry = coverStage.scrollY();
+    check(coverStage.currentPage() == 5 && beforeGeometry > 500.f,
+          "fast scroll has moved beyond the cover and into the book");
+    cover->resolved = true;
+    check(coverStage.geometryChanged(), "async source publishes corrected page geometry");
+    coverStage.paintTree(target, PaintCtx{ctx.pal, 3.0, 1.f});
+    check(coverStage.currentPage() == 5 &&
+              std::fabs(coverStage.scrollY() - beforeGeometry - 1500.f) < 3.f,
+          "geometry change keeps the same visible page anchored across three resized pages");
 
     section("immersive controls sleep once, wake by page tap/corner, and never trap exit");
     FolioApp phone(390.f, 800.f);

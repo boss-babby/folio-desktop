@@ -263,8 +263,11 @@ private:
     /// hover highlight both go through this so they cannot disagree.
     [[nodiscard]] Rect plusRect() const;
     void reapClosed(double now);
+    void revealActive(double now);
+    [[nodiscard]] float maxScroll(double now) const;
 
     std::vector<Tab> tabs_;
+    float scrollX_ = 0.f;
     Point hoverPos_{-1.f, -1.f};
     /// Last painted clock, so plusRect() can measure animating tab widths
     /// from an event handler (which has no clock of its own).

@@ -386,6 +386,7 @@ bool SidePanel::animating(double now) const {
 
 TabBar::TabBar() {
     acceptsPointer = true;
+    clipsContent = true; // an arbitrary number of tabs must never cover window controls
     debugName = "TabBar";
 }
 
@@ -394,7 +395,10 @@ void TabBar::addTab(std::string title, double now, bool select) {
     t.title = std::move(title);
     t.open.start(now, tokens::dur::tabOpen);
     tabs_.push_back(std::move(t));
-    if (select) active_ = static_cast<int>(tabs_.size()) - 1;
+    if (select) {
+        active_ = static_cast<int>(tabs_.size()) - 1;
+        revealActive(now);
+    }
 }
 
 void TabBar::closeTab(int index, double now) {
@@ -415,7 +419,7 @@ void TabBar::selectTab(int index, double now) {
     if (index < 0 || static_cast<std::size_t>(index) >= tabs_.size()) return;
     if (tabs_[static_cast<std::size_t>(index)].isClosing) return;
     active_ = index;
-    (void)now;
+    revealActive(now);
     if (onSelect) onSelect(index);
 }
 
@@ -438,8 +442,23 @@ float TabBar::intrinsicWidth(double now) const {
     return w + 30.f;  // the "+" button
 }
 
+float TabBar::maxScroll(double now) const {
+    return std::max(0.f, intrinsicWidth(now) - frame.w);
+}
+
+void TabBar::revealActive(double now) {
+    float left = 0.f;
+    for (int i = 0; i < active_ && i < static_cast<int>(tabs_.size()); ++i)
+        left += tabWidth(tabs_[i], now) + 4.f;
+    const float right = active_ < static_cast<int>(tabs_.size())
+        ? left + tabWidth(tabs_[static_cast<std::size_t>(active_)], now) : left;
+    if (left < scrollX_) scrollX_ = left;
+    if (right + 8.f > scrollX_ + frame.w) scrollX_ = right + 8.f - frame.w;
+    scrollX_ = std::clamp(scrollX_, 0.f, maxScroll(now));
+}
+
 int TabBar::hitTab(Point local, double now, bool* closeHit) const {
-    float x = 0.f;
+    float x = -scrollX_;
     if (closeHit) *closeHit = false;
     for (std::size_t i = 0; i < tabs_.size(); ++i) {
         const float w = tabWidth(tabs_[i], now);
@@ -457,10 +476,11 @@ void TabBar::reapClosed(double now) {
         return t.isClosing && !t.closing.active(now) && t.closing.value(now) <= 0.01f;
     });
     active_ = std::clamp(active_, 0, static_cast<int>(tabs_.size()) - 1);
+    scrollX_ = std::clamp(scrollX_, 0.f, maxScroll(now));
 }
 
 Rect TabBar::plusRect() const {
-    float x = 0.f;
+    float x = -scrollX_;
     for (const Tab& tab : tabs_) x += tabWidth(tab, lastNow_) + 4.f;
     const float th = tokens::size::tab::height;
     const float y = (frame.h - th) * 0.5f;
@@ -468,6 +488,12 @@ Rect TabBar::plusRect() const {
 }
 
 bool TabBar::onPointer(const PointerEvent& e) {
+    if (e.phase == PointerPhase::Wheel) {
+        if (maxScroll(e.timestamp) <= 0.f) return false;
+        scrollX_ = std::clamp(scrollX_ - (e.wheelX != 0.f ? e.wheelX : e.wheelY) * 64.f,
+                              0.f, maxScroll(e.timestamp));
+        return true;
+    }
     const bool oldPlus = hoverTab_ < 0 &&
         plusRect().contains(hoverPos_.x, hoverPos_.y);
     hoverPos_ = e.pos;
@@ -523,9 +549,13 @@ void TabBar::onPaint(IPaintTarget& t, const PaintCtx& ctx) {
     const_cast<TabBar*>(this)->reapClosed(ctx.now);
 
     lastNow_ = ctx.now;
+    auto* self = const_cast<TabBar*>(this);
+    self->scrollX_ = std::clamp(scrollX_, 0.f, maxScroll(ctx.now));
+    // Width animation may reveal a newly added tab outside the visible strip.
+    if (animating(ctx.now)) self->revealActive(ctx.now);
     const float h = tokens::size::tab::height;
     const float y = (frame.h - h) * 0.5f;
-    float x = 0.f;
+    float x = -scrollX_;
 
     for (std::size_t i = 0; i < tabs_.size(); ++i) {
         const Tab& tab = tabs_[i];

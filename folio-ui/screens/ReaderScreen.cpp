@@ -35,6 +35,16 @@ std::string utf8Path(const std::filesystem::path& path) {
 #endif
 
 namespace {
+// Keep the dropdown's hit regions in sync with inertial/wheel scrolling in
+// the SAME frame, before its button children are painted or hit-tested.
+class DocumentMenuScroll final : public ScrollView {
+public:
+    void onPaint(IPaintTarget& t, const PaintCtx& ctx) override {
+        ScrollView::onPaint(t, ctx);
+        if (!children().empty()) children().front()->frame.y = -scrollY();
+    }
+};
+
 /// The ink palette. Shared by the side-panel swatches, the command-bar
 /// chip and the popover grid, so there is one definition of "yellow".
 ///
@@ -426,6 +436,14 @@ void ReaderScreen::buildTitleBar() {
     };
     tabs_->onSelect = [this](int i) { switchToDoc(i, now()); };
     tabs_->onClose = [this](int i) { closeDoc(i, now()); };
+    docListBtn_ = emplace<Button>("", "chevron-down", ButtonStyle::Icon);
+    docListBtn_->tooltip = "All open PDFs";
+    docListBtn_->onClick = [this] {
+        if (docPop_->isOpen()) { docPop_->close(now()); return; }
+        syncDocMenu();
+        docPop_->setOwner(docListBtn_);
+        openPopoverFor(docPop_, docListBtn_, false);
+    };
 
     // The prototype's title bar has no way back to the library, which is a
     // gap in the prototype rather than a design decision: once a document is
@@ -457,6 +475,7 @@ void ReaderScreen::buildPhoneChrome() {
     docBtn_->onClick = [this] {
         if (docPop_->isOpen()) { docPop_->close(now()); return; }
         syncDocMenu();
+        docPop_->setOwner(docBtn_);
         // Drops straight below the name with the same circular reveal as
         // every other menu. A different animation here would read as a
         // different kind of surface.
@@ -465,6 +484,8 @@ void ReaderScreen::buildPhoneChrome() {
 
     docPop_ = emplace<Popover>();
     docPop_->setOwner(docBtn_);
+    docMenuScroll_ = docPop_->emplace<DocumentMenuScroll>();
+    docMenuContent_ = docMenuScroll_->emplace<Widget>();
 
     // Keep the always-reachable title-bar theme shortcut on phones. It is
     // distinct from the Display control in the command bar, which is the
@@ -573,14 +594,14 @@ void ReaderScreen::syncPhoneFabs() {
 
 void ReaderScreen::syncDocMenu() {
     docItems_.clear();
-    docPop_->removeAllChildren();
+    docMenuContent_->removeAllChildren();
 
     constexpr float kRowH = 40.f;
     constexpr float w = 264.f;
     const int count = tabs_ ? static_cast<int>(tabs_->count()) : 0;
     float y = 6.f;
     for (int i = 0; i < count; ++i) {
-        auto* b = docPop_->emplace<Button>(tabs_->tabs()[i].title, "file-text",
+        auto* b = docMenuContent_->emplace<Button>(tabs_->tabs()[i].title, "file-text",
                                            ButtonStyle::ListItem);
         b->toggled = (i == tabs_->active());
         b->setFrame(6.f, y, w - 12.f, kRowH);
@@ -593,7 +614,7 @@ void ReaderScreen::syncDocMenu() {
     }
     // The library is the only route to a second document in this build, so
     // the menu has to carry it or the switcher is a dead end.
-    auto* open = docPop_->emplace<Button>("Open a PDF...", "folder-open",
+    auto* open = docMenuContent_->emplace<Button>("Open a PDF...", "folder-open",
                                           ButtonStyle::ListItem);
     open->setFrame(6.f, y + 4.f, w - 12.f, kRowH);
     open->onClick = [this] {
@@ -601,7 +622,13 @@ void ReaderScreen::syncDocMenu() {
         if (onBrowse) onBrowse();
     };
     docItems_.push_back(open);
-    docPop_->setFrame(0.f, 0.f, w, y + kRowH + 14.f);
+    const float totalH = y + kRowH + 14.f;
+    const float height = std::min(totalH, std::max(96.f, frame.h - 96.f));
+    docPop_->setFrame(0.f, 0.f, w, height);
+    docMenuScroll_->setFrame(0.f, 0.f, w, height);
+    docMenuScroll_->contentHeight = totalH;
+    docMenuScroll_->restoreScrollY(0.f);
+    docMenuContent_->setFrame(0.f, 0.f, w, totalH);
 }
 
 void ReaderScreen::buildCommandBar() {
@@ -1303,15 +1330,9 @@ void ReaderScreen::installPanelPainters() {
                         folio::render::TextAlign::Left);
     };
 
-    rightPanel_->drawOverlay = [this](IPaintTarget& t, const PaintCtx& ctx) {
-        if (rightCollapse_->visible && !stylingActive())
-            // Keep this caption below the pinned history/rotation row. At y=20
-            // it was painted straight through Undo/Redo on phone sheets.
-            t.drawTextInBox("DISPLAY", Rect{14.f, 56.f, rightPanel_->frame.w - 28.f, 16.f},
-                            styleFor(tokens::type_sectionHeader,
-                                     fade(ctx.pal.muted, rightPanel_->contentAlpha(ctx.now))),
-                            folio::render::TextAlign::Left);
-    };
+    // The scrolling content already begins with PAGE THEME. A second DISPLAY
+    // caption in the parent covered it at the same y (including on phones).
+    rightPanel_->drawOverlay = {};
 
     static_cast<InspectorContent*>(inspectorContent_)->drawOverlay =
         [this](IPaintTarget& t, const PaintCtx& ctx) {
@@ -3054,8 +3075,20 @@ void ReaderScreen::stashActiveDoc() {
 #if FOLIO_HAVE_PDFIUM_SOURCE
     // Keep the mapped document/worker for instant tab switches, not every
     // tab's decoded 4K page bitmaps and GPU image keys.
-    if (auto pdf = std::dynamic_pointer_cast<folio::engine::PdfiumPageSource>(d.source))
-        pdf->suspendVisualCaches();
+    if (auto pdf = std::dynamic_pointer_cast<folio::engine::PdfiumPageSource>(d.source)) {
+        pdf->parkVisualCaches(stage_->currentPage() - 1);
+        // Never let an unbounded tab count turn into an unbounded warm cache.
+        warmVisuals_.erase(std::remove_if(warmVisuals_.begin(), warmVisuals_.end(),
+            [&](const auto& w) { auto p = w.lock(); return !p || p == d.source; }),
+            warmVisuals_.end());
+        warmVisuals_.insert(warmVisuals_.begin(), d.source);
+        while (warmVisuals_.size() > 4) {
+            if (auto old = warmVisuals_.back().lock())
+                if (auto cold = std::dynamic_pointer_cast<folio::engine::PdfiumPageSource>(old))
+                    cold->suspendVisualCaches();
+            warmVisuals_.pop_back();
+        }
+    }
     if (onDocumentChanged) onDocumentChanged();
 #endif
     d.page = stage_->currentPage();
@@ -3091,11 +3124,17 @@ void ReaderScreen::trimIdleVisualCaches() {
 
 void ReaderScreen::releaseVisualCaches() {
 #if FOLIO_HAVE_PDFIUM_SOURCE
-    for (auto& doc : docs_)
+    // Minimise discards the framebuffer and GPU resources, but keep a tiny
+    // CPU preview of the current page and neighbours for a smooth restore.
+    // Every background tab becomes cold; none consumes a full tile grid.
+    for (auto& doc : docs_) {
+        if (doc.source == pageSource_) continue;
         if (auto pdf = std::dynamic_pointer_cast<folio::engine::PdfiumPageSource>(doc.source))
             pdf->suspendVisualCaches();
+    }
+    warmVisuals_.clear();
     if (auto pdf = std::dynamic_pointer_cast<folio::engine::PdfiumPageSource>(pageSource_))
-        pdf->suspendVisualCaches();
+        pdf->parkVisualCaches(stage_->currentPage() - 1, true);
 #endif
     if (onDocumentChanged) onDocumentChanged();
 }
@@ -3107,6 +3146,9 @@ void ReaderScreen::switchToDoc(int index, double now) {
     const OpenDoc& d = docs_[static_cast<std::size_t>(index)];
     if (!loadPath(d.path, now, d.source)) return;
     activeDoc_ = index;
+    warmVisuals_.erase(std::remove_if(warmVisuals_.begin(), warmVisuals_.end(),
+        [&](const auto& w) { auto p = w.lock(); return !p || p == d.source; }),
+        warmVisuals_.end());
     // addExisting, not add: the ids have to survive a switch or any undo
     // entry still referring to them would resolve to nothing.
     annots_.clear();
@@ -3601,9 +3643,13 @@ void ReaderScreen::onLayout() {
     // narrow frames or the home button lands on top of the logotype.
     const float homeX = chromeLead_ + 86.f;
     const float tabsX = homeX + 38.f;
-    const float tabsW = std::max(60.f, W - tabsX - trail - 12.f);
+    const float listW = 30.f;
+    const float tabsW = std::max(0.f, W - tabsX - trail - listW - 12.f);
     tabs_->setFrame(tabsX, chromeY, tabsW, tb);
     tabs_->visible = m.showTabs;
+    docListBtn_->setFrame(tabsX + tabsW + 3.f, chromeY + (tb - 30.f) * .5f,
+                          listW, 30.f);
+    docListBtn_->visible = m.showTabs;
     backBtn_->setFrame(homeX, chromeY + (tb - 28.f) * 0.5f, 28.f, 28.f);
     layOutPhoneChrome(m, W, H, chromeY, tb);
 
@@ -3861,10 +3907,16 @@ void ReaderScreen::onLayout() {
         redoPanelBtn_->setFrame(kPad + 38.f, kPad - 3.f, 34.f, 34.f);
         undoPanelBtn_->visible = redoPanelBtn_->visible = rightCollapse_->visible;
         undoPanelBtn_->opacity = redoPanelBtn_->opacity = rBody;
-        // Straight quarter-turn arrows are deliberately distinct from the
-        // curved Undo/Redo pair; these change only the viewport orientation.
-        rotateLeftBtn_->setFrame(kPad + 79.f, kPad - 3.f, 34.f, 34.f);
-        rotateRightBtn_->setFrame(kPad + 117.f, kPad - 3.f, 34.f, 34.f);
+        // Fit six actions without letting rotate arrows collide with Focus
+        // and Collapse on narrow desktop panels or phone sheets. Above the
+        // threshold the row stays compact; below it rotation gets its own
+        // 34dp row and the scroll content begins BELOW that row.
+        const bool twoHeaderRows = rightPanel_->expandedWidth() < 330.f;
+        const float rotateY = twoHeaderRows ? kPad + 34.f : kPad - 3.f;
+        rotateLeftBtn_->setFrame(kPad + (twoHeaderRows ? 0.f : 79.f),
+                                 rotateY, 34.f, 34.f);
+        rotateRightBtn_->setFrame(kPad + (twoHeaderRows ? 38.f : 117.f),
+                                  rotateY, 34.f, 34.f);
         rotateLeftBtn_->visible = rotateRightBtn_->visible = rightCollapse_->visible;
         rotateLeftBtn_->opacity = rotateRightBtn_->opacity = rBody;
 
@@ -3875,17 +3927,21 @@ void ReaderScreen::onLayout() {
         // annotation tool is active, page-display options otherwise.
         float y = 22.f;
 
-        annotHdr_->setFrame(kPad, 36.f, std::max(0.f, innerW - 38.f), 16.f);
+        annotHdr_->setFrame(kPad, twoHeaderRows ? 82.f : 50.f,
+                            std::max(0.f, innerW - 38.f), 16.f);
         // Below the Focus/collapse row; never put Delete over either icon.
         deleteAnnotBtn_->setFrame(std::max(0.f, rwF - kPad - 34.f),
-                                  46.f, 34.f, 34.f);
+                                  twoHeaderRows ? 84.f : 52.f, 34.f, 34.f);
         deleteAnnotBtn_->visible = selectedAnnot_ != 0 &&
                                    annots_.get(selectedAnnot_) && bodyVisible;
         deleteAnnotBtn_->opacity = rBody;
         annotHdr_->visible = authoring && bodyVisible;
         annotHdr_->opacity = rBody;
 
-        const float inspectorTop = deleteAnnotBtn_->visible ? 86.f : 60.f;
+        float inspectorTop = twoHeaderRows ? (authoring ? 106.f : 86.f)
+                                           : (authoring ? 75.f : 54.f);
+        if (deleteAnnotBtn_->visible)
+            inspectorTop = std::max(inspectorTop, twoHeaderRows ? 126.f : 95.f);
         const float panelH = sheet ? rSheetH : rhF;
         inspectorScroll_->setFrame(0.f, inspectorTop,
                                    std::max(rwF, rightPanel_->expandedWidth()),
@@ -4243,7 +4299,7 @@ bool ReaderScreen::animating(double now) const {
 }
 
 bool ReaderScreen::requiresFullFrame(double now) const {
-    return layoutWasAnimating_ || focusT_.active(now) ||
+    return stage_->geometryChanged() || layoutWasAnimating_ || focusT_.active(now) ||
            leftPanel_->animating(now) || rightPanel_->animating(now) ||
            tabs_->animating(now) ||
            (stage_->animating(now) && !stage_->thumbOverlayOnly(now));

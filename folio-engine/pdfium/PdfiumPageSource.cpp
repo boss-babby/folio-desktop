@@ -47,6 +47,8 @@ bool PdfiumPageSource::open(const std::string& path) {
     focusPage_ = -1;
     scrollDirection_ = 1;
     thumbnailFirst_ = thumbnailLast_ = -1;
+    gridFirst_ = gridLast_ = gridBufferFirst_ = gridBufferLast_ = -1;
+    gridPixelW_ = gridPixelH_ = 0;
     worker_->setThumbnailRange(-1, -1);
     text_.clear();
     textRequested_.clear();
@@ -181,7 +183,8 @@ bool PdfiumPageSource::tick() {
         // Results from a suspended tab have no live request marker.
         if (!requested_.count(key(r.page, r.requestedWidth))) continue;
         if (focusPage_ >= 0 && std::abs(r.page - focusPage_) > 2 &&
-            !visibleThumbnail(r.page, r.requestedWidth)) {
+            !visibleThumbnail(r.page, r.requestedWidth) &&
+            !gridBuffered(r.page)) {
             requested_.erase(key(r.page, r.requestedWidth));
             continue; // neither the canvas nor the Pages panel wants it
         }
@@ -235,22 +238,91 @@ void PdfiumPageSource::setFocusPage(int page) {
         it = std::abs(*it - page) > 2 ? adjacentPreviewQueued_.erase(it)
                                          : std::next(it);
     worker_->setFocusPage(page);
-    for (int p = std::max(0, page - 1); p <= page + 1 && p < pageCount_; ++p)
-        worker_->requestMeta(p);
+    if (gridFirst_ < 0)
+        for (int p = std::max(0, page - 3); p <= page + 4 && p < pageCount_; ++p)
+            worker_->requestMeta(p);
     // Discard superseded work as well as its markers: otherwise returning
     // to a page can find an old marker for a job that was never rendered.
     worker_->dropQueuedOutside(page, 2);
     for (auto it = requested_.begin(); it != requested_.end();) {
         const int p = static_cast<int>(*it >> 32);
         const int width = static_cast<int>(*it & 0xFFFFFFFFu);
-        it = std::abs(p - page) > 2 && !visibleThumbnail(p, width)
-            ? requested_.erase(it) : std::next(it);
+        it = std::abs(p - page) > 2 && !visibleThumbnail(p, width) &&
+             !gridBuffered(p) ? requested_.erase(it) : std::next(it);
     }
-    trimTo(page, 2);
+    if (gridFirst_ < 0) trimTo(page, 2);
     for (auto it = previewWidth_.begin(); it != previewWidth_.end();)
         it = std::abs(it->first - page) > 2 ? previewWidth_.erase(it) : std::next(it);
     for (auto it = failedPreview_.begin(); it != failedPreview_.end();)
         it = std::abs(*it - page) > 2 ? failedPreview_.erase(it) : std::next(it);
+}
+
+void PdfiumPageSource::setVisibleGridRange(int first, int last,
+                                           int bufferFirst, int bufferLast,
+                                           int pixelW, int pixelH) {
+    if (first == gridFirst_ && last == gridLast_ &&
+        bufferFirst == gridBufferFirst_ && bufferLast == gridBufferLast_ &&
+        pixelW == gridPixelW_ && pixelH == gridPixelH_) return;
+    const bool wasGrid = gridFirst_ >= 0;
+    gridFirst_ = first; gridLast_ = last;
+    gridBufferFirst_ = bufferFirst; gridBufferLast_ = bufferLast;
+    gridPixelW_ = pixelW; gridPixelH_ = pixelH;
+    worker_->setGridRange(first, last, bufferFirst, bufferLast);
+    if (first >= 0 && !wasGrid) {
+        // The reading view's full-DPI tiles are not useful in the overview.
+        // Release them immediately instead of holding the previous zoom's
+        // page-sized GPU/CPU cache through a long grid-scrolling session.
+        worker_->dropQueuedOutside(focusPage_, -1);
+        for (const auto& [id, entry] : tileCache_)
+            staleKeys_.push_back(tileImageKey(id));
+        tileCache_.clear();
+        requestedTiles_.clear();
+        nextRequestedTiles_.clear();
+        tileBytes_ = 0;
+    }
+    if (first < 0) {
+        if (wasGrid && focusPage_ >= 0) trimTo(focusPage_, 2);
+        return;
+    }
+    // Drop stale offscreen markers, not just queued worker jobs; otherwise
+    // returning to a row sees a cancelled request and leaves its cell white.
+    for (auto it = requested_.begin(); it != requested_.end();) {
+        const int page = static_cast<int>(*it >> 32);
+        const int width = static_cast<int>(*it & 0xFFFFFFFFu);
+        it = !gridBuffered(page) && !visibleThumbnail(page, width)
+            ? requested_.erase(it) : std::next(it);
+    }
+    for (auto it = cache_.begin(); it != cache_.end();) {
+        const int page = static_cast<int>(it->first >> 32);
+        const int width = static_cast<int>(it->first & 0xFFFFFFFFu);
+        if (gridBuffered(page) || visibleThumbnail(page, width) ||
+            std::abs(page - focusPage_) <= 1) { ++it; continue; }
+        bytes_ -= it->second.tile->pixels.size();
+        staleKeys_.push_back(imageKey(page, width));
+        requested_.erase(it->first);
+        it = cache_.erase(it);
+    }
+    queueGridBuffer();
+}
+
+void PdfiumPageSource::queueGridBuffer() {
+    if (gridFirst_ < 0) return;
+    for (int page = gridBufferFirst_; page <= gridBufferLast_; ++page) {
+        if (!worker_->pageMetaLoaded(page)) {
+            worker_->requestMeta(page);
+            continue;
+        }
+        // On-screen cells request their own exact dimensions in drawPage().
+        // Only the row above/below is speculative, at the same small cap.
+        if (page >= gridFirst_ && page <= gridLast_) continue;
+        const auto m = worker_->pageMeta(page);
+        if (m.widthPt <= 0 || m.heightPt <= 0) continue;
+        const float scale = std::min(gridPixelW_ / static_cast<float>(m.widthPt),
+                                      gridPixelH_ / static_cast<float>(m.heightPt));
+        const int width = std::max(1, static_cast<int>(std::lround(m.widthPt * scale)));
+        if (requested_.insert(key(page, width)).second)
+            worker_->requestRender(page, scale, 0, width);
+    }
 }
 
 void PdfiumPageSource::setVisibleThumbnailRange(int first, int last) {
@@ -265,9 +337,10 @@ void PdfiumPageSource::setVisibleThumbnailRange(int first, int last) {
         const int p = static_cast<int>(*it >> 32);
         const int width = static_cast<int>(*it & 0xFFFFFFFFu);
         it = std::abs(p - focusPage_) > 2 && width <= 256 &&
-             !visibleThumbnail(p, width) ? requested_.erase(it) : std::next(it);
+             !visibleThumbnail(p, width) && !gridBuffered(p)
+            ? requested_.erase(it) : std::next(it);
     }
-    if (focusPage_ >= 0) trimTo(focusPage_, 2);
+    if (focusPage_ >= 0 && gridFirst_ < 0) trimTo(focusPage_, 2);
 }
 
 std::shared_ptr<const PageText> PdfiumPageSource::pageText(int index) {
@@ -324,6 +397,10 @@ void PdfiumPageSource::drawPage(IPaintTarget& t, int index, const Rect& dest,
                           ? IPaintTarget::ImageTint::Invert
                           : IPaintTarget::ImageTint::None;
 
+    if (!worker_->pageMetaLoaded(index)) {
+        worker_->requestMeta(index);
+        return; // no distorted render while the real page geometry is pending
+    }
     const auto m = worker_->pageMeta(index);
     // Likewise, FPDF_RenderPageBitmap applies the page's own /Rotate. The
     // rotation argument is reserved for an extra, user-requested view
@@ -411,6 +488,10 @@ void PdfiumPageSource::endVisibleFrame() {
     worker_->retainQueuedTiles(nextRequestedTiles_);
     requestedTiles_ = std::move(nextRequestedTiles_);
     nextRequestedTiles_.clear();
+    if (gridFirst_ >= 0) {
+        queueGridBuffer();
+        return; // grid already owns every visible/adjacent page's priority
+    }
     if (focusPage_ < 0) return;
     // Tab switches and first opens prioritize the actual visible page.
     // After its first pixels, queue only tiny proxies: one in each direction
@@ -448,6 +529,10 @@ bool PdfiumPageSource::drawCachedRegion(IPaintTarget& t, int index,
                                          float scale, folio::ui::PageTheme theme) {
     if (index < 0 || index >= pageCount_ || dest.empty() || visible.empty() ||
         scale <= 0.f) return false;
+    if (!worker_->pageMetaLoaded(index)) {
+        worker_->requestMeta(index);
+        return false;
+    }
     const auto m = worker_->pageMeta(index);
     if (m.widthPt <= 0 || m.heightPt <= 0) return false;
     const core::TileGrid grid(static_cast<float>(m.widthPt),
@@ -565,6 +650,10 @@ void PdfiumPageSource::drawVisiblePage(IPaintTarget& t, int index, const Rect& d
     if (!staleKeys_.empty()) {
         for (auto k : staleKeys_) t.invalidateImage(k);
         staleKeys_.clear();
+    }
+    if (!worker_->pageMetaLoaded(index)) {
+        worker_->requestMeta(index);
+        return; // paper until the real aspect ratio is known
     }
     const auto m = worker_->pageMeta(index);
     if (m.widthPt <= 0 || m.heightPt <= 0 || scale <= 0) return;
@@ -717,7 +806,11 @@ void PdfiumPageSource::trimIdle() {
         const bool tinyNeighbour = focusPage_ >= 0 &&
             adjacentPreviewQueued_.count(p) && std::abs(p - focusPage_) <= 2 &&
             it->second.pxW <= 240 && it->second.pxH <= 320;
-        if (it->second.lastFrame == frame_ || tinyNeighbour) { ++it; continue; }
+        const bool gridProxy = gridBuffered(p) && it->second.pxW <= gridPixelW_ &&
+                               it->second.pxH <= gridPixelH_;
+        if (it->second.lastFrame == frame_ || tinyNeighbour || gridProxy) {
+            ++it; continue;
+        }
         bytes_ -= it->second.tile->pixels.size();
         staleKeys_.push_back(imageKey(static_cast<int>(it->first >> 32),
                                       static_cast<int>(it->first & 0xFFFFFFFFu)));
@@ -733,6 +826,54 @@ void PdfiumPageSource::trimIdle() {
     }
     stats_.pages = cache_.size() + tileCache_.size();
     stats_.bytes = bytes_ + tileBytes_;
+}
+
+void PdfiumPageSource::parkVisualCaches(int page, bool retainNearby) {
+    // Tab switch: one screenshot-sized preview. Minimise: that preview plus
+    // tiny adjacent proxies, never 4K tiles. GPU/Skia image copies are
+    // purged by the shell independently; this CPU budget survives restore.
+    worker_->suspendVisualWork();
+    std::unordered_set<std::uint64_t> keepKeys;
+    std::size_t keepBytes = 0;
+    const auto choose = [&](int p, int maxW, int maxH) {
+        auto best = cache_.end();
+        for (auto it = cache_.lower_bound(key(p, 0));
+             it != cache_.end() && static_cast<int>(it->first >> 32) == p; ++it) {
+            if (!it->second.tile || it->second.pxW > maxW ||
+                it->second.pxH > maxH) continue;
+            if (best == cache_.end() || it->second.pxW > best->second.pxW)
+                best = it;
+        }
+        if (best != cache_.end()) {
+            keepKeys.insert(best->first);
+            keepBytes += best->second.tile->pixels.size();
+        }
+    };
+    choose(page, 512, 768);
+    if (retainNearby) {
+        for (int p : {page - 1, page + 1, page + 2})
+            if (p >= 0 && p < pageCount_) choose(p, 240, 320);
+    }
+    for (const auto& [k, v] : tileCache_) staleKeys_.push_back(tileImageKey(k));
+    tileCache_.clear();
+    tileBytes_ = 0;
+    for (auto it = cache_.begin(); it != cache_.end();) {
+        if (keepKeys.count(it->first)) { ++it; continue; }
+        staleKeys_.push_back(imageKey(static_cast<int>(it->first >> 32),
+                                      static_cast<int>(it->first & 0xFFFFFFFFu)));
+        it = cache_.erase(it);
+    }
+    bytes_ = keepBytes;
+    requestedTiles_.clear(); nextRequestedTiles_.clear();
+    requested_ = std::move(keepKeys);
+    previewWidth_.clear(); failedPreview_.clear(); adjacentPreviewQueued_.clear();
+    if (retainNearby)
+        for (int p : {page - 1, page + 1, page + 2})
+            if (p >= 0 && p < pageCount_) adjacentPreviewQueued_.insert(p);
+    text_.clear(); textRequested_.clear(); uiGlyphs_.clear();
+    requestedAnnotations_.clear();
+    stats_.pages = cache_.size();
+    stats_.bytes = bytes_;
 }
 
 void PdfiumPageSource::suspendVisualCaches() {
@@ -765,7 +906,8 @@ void PdfiumPageSource::evictTo(std::size_t budget) {
         auto oldest = cache_.end();
         for (auto it = cache_.begin(); it != cache_.end(); ++it) {
             const int p = static_cast<int>(it->first >> 32);
-            const bool nearby = focusPage_ >= 0 && std::abs(p - focusPage_) <= 1;
+            const bool nearby = gridBuffered(p) ||
+                (focusPage_ >= 0 && std::abs(p - focusPage_) <= 1);
             const auto next = std::next(it);
             const bool lastForPage =
                 (it == cache_.begin() || static_cast<int>(std::prev(it)->first >> 32) != p) &&
@@ -795,7 +937,8 @@ void PdfiumPageSource::trimTo(int page, int radius) {
     for (auto it = cache_.begin(); it != cache_.end();) {
         const int p = static_cast<int>(it->first >> 32);
         const int width = static_cast<int>(it->first & 0xFFFFFFFFu);
-        if (std::abs(p - page) > radius && !visibleThumbnail(p, width)) {
+        if (std::abs(p - page) > radius && !visibleThumbnail(p, width) &&
+            !gridBuffered(p)) {
             bytes_ -= it->second.tile ? it->second.tile->pixels.size() : 0;
             staleKeys_.push_back(imageKey(p, width));
             requested_.erase(it->first);

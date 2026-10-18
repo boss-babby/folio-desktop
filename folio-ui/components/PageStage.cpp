@@ -1306,8 +1306,7 @@ bool PageStage::handleAuthoring(const PointerEvent& e) {
             highlightTouchControlled_ = editTool_ == EditTool::Highlight && e.isTouch();
             highlightStrokeLocked_ = false;
             highlightTouchDown_ = e.pos;
-            if (highlightTouchControlled_ && magnifierEnabled_ &&
-                layout_ != LayoutMode::Grid) {
+            if (magnifierEnabled_ && layout_ != LayoutMode::Grid) {
                 // This tool paints a HORIZONTAL strip. The preview begins
                 // immediately at Down, while the draft still has zero width.
                 highlightMagnifierActive_ = true;
@@ -1383,8 +1382,7 @@ bool PageStage::handleAuthoring(const PointerEvent& e) {
                     // its Y would jump the mark just as drawing begins.
                     highlightStrokeLocked_ = true;
                 }
-                if (highlightMagnifierActive_ && e.isTouch() &&
-                    e.pointerId == highlightPointer_)
+                if (highlightMagnifierActive_ && e.pointerId == highlightPointer_)
                     highlightCursor_ = {c.x, authorStart_.y};
                 const float bandH = highlightBandHeight(annotWidth_);
                 d->box = Rect{std::min(authorStart_.x, c.x),
@@ -1398,6 +1396,7 @@ bool PageStage::handleAuthoring(const PointerEvent& e) {
         case PointerPhase::Cancel:
             if (!authoring_) return false;
             authoring_ = false;
+            highlightMagnifierActive_ = false;
             highlightTouchControlled_ = highlightStrokeLocked_ = false;
             store_->cancelDraft();
             penPressSum_ = 0.f;
@@ -1406,6 +1405,7 @@ bool PageStage::handleAuthoring(const PointerEvent& e) {
         case PointerPhase::Up: {
             if (!authoring_) return false;
             authoring_ = false;
+            highlightMagnifierActive_ = false;
             highlightTouchControlled_ = highlightStrokeLocked_ = false;
             if (editTool_ == EditTool::Note) {
                 // Only now raise the properties sheet; on Down it would
@@ -1835,9 +1835,10 @@ void PageStage::paintSelectionBands(IPaintTarget& t, const Rect& page,
         // explicitly before the fine border and every subsequent page blit.
         t.setBlendMode(folio::render::BlendMode::SrcOver);
         t.restore();
-        t.strokeRoundedRect(band, corners, ink.edge,
-            std::min({0.85f, sr.h * 0.06f,
-                      std::min(gapTop, gapBottom) * 0.20f}));
+        // A hairline around every extracted glyph-line quad turns into a
+        // lattice of horizontal/vertical guides behind the floating markup
+        // and ink popovers. The softly clipped amber fill is the selection;
+        // do not outline each line independently.
     }
     t.restore();
 }
@@ -1846,7 +1847,7 @@ void PageStage::paintSelectionMagnifier(IPaintTarget& t, const PaintCtx& ctx,
                                         float deviceScale, int page,
                                         const std::vector<Rect>& lines) const {
     if (!magnifierEnabled_ || !source_ || frame.w < 115.f ||
-        frame.h < 115.f || touch_.count() != 1) return;
+        frame.h < 115.f || (touch_.count() != 1 && !pressed)) return;
     const Annotation* draft = store_ ? store_->draft() : nullptr;
     const bool marker = highlightMagnifierActive_ && authoring_ &&
         editTool_ == EditTool::Highlight && draft &&
@@ -1857,9 +1858,13 @@ void PageStage::paintSelectionMagnifier(IPaintTarget& t, const PaintCtx& ctx,
     const PointerId pointer = marker ? highlightPointer_ : magnifierPointer_;
     // No floating bubble after a lost pointer/cancelled capture. The drawing
     // tool itself retains its original event ownership and hit testing.
-    const auto finger = std::find_if(touch_.pointers().begin(), touch_.pointers().end(),
-        [pointer](const ActivePointer& p) { return p.id == pointer; });
-    if (finger == touch_.pointers().end()) return;
+    if (touch_.count() == 1) {
+        const auto finger = std::find_if(touch_.pointers().begin(), touch_.pointers().end(),
+            [pointer](const ActivePointer& p) { return p.id == pointer; });
+        if (finger == touch_.pointers().end()) return;
+    } else if (pointer != 0 || !pressed) {
+        return; // the desktop mouse owns this drag until Up/Cancel
+    }
     if (marker) page = authorPage_;
     if (page < 0) return;
     const auto it = std::find_if(placed_.begin(), placed_.end(),
@@ -2904,7 +2909,7 @@ bool PageStage::onPointer(const PointerEvent& e) {
           (e.phase == PointerPhase::Cancel && e.pointerId == 0)) ||
          (e.phase == PointerPhase::Down && e.pointerId != highlightPointer_)))
         highlightMagnifierActive_ = false;
-    if (e.isTouch() && e.phase == PointerPhase::Cancel &&
+    if (e.phase == PointerPhase::Cancel &&
         (e.pointerId == 0 || e.pointerId == magnifierPointer_)) {
         magnifierActive_ = false;
         selecting_ = false;
@@ -2977,7 +2982,7 @@ bool PageStage::onPointer(const PointerEvent& e) {
             // sees both contacts and starts its normal two-finger gesture.
         } else if (e.pointerId == selectionPointer_) {
             if (e.isTouch()) touch_.onPointer(e);
-            if (e.isTouch() && e.phase == PointerPhase::Move && magnifierActive_)
+            if (e.phase == PointerPhase::Move && magnifierActive_)
                 magnifierFinger_ = e.pos;
             if (e.phase == PointerPhase::Move) {
                 int page = -1;
@@ -3030,13 +3035,11 @@ bool PageStage::onPointer(const PointerEvent& e) {
             selectionPointer_ = e.pointerId;
             selecting_ = false;
             touchPanning_ = false;
-            if (e.isTouch()) {
-                touch_.onPointer(e);
-                if (magnifierEnabled_) {
-                    magnifierActive_ = true;
-                    magnifierPointer_ = e.pointerId;
-                    magnifierFinger_ = e.pos;
-                }
+            if (e.isTouch()) touch_.onPointer(e);
+            if (magnifierEnabled_) {
+                magnifierActive_ = true;
+                magnifierPointer_ = e.pointerId;
+                magnifierFinger_ = e.pos;
             }
             if (onSelectionCleared) onSelectionCleared(); // popup only; keep text
             return true;
@@ -3077,16 +3080,19 @@ bool PageStage::onPointer(const PointerEvent& e) {
                 scrollX_ -= dx * 64.f;
                 clampScroll();
             } else {
-                // Ease towards the target rather than teleporting 64px per
-                // notch. Consecutive notches extend the same glide, which is
-                // what makes a wheel feel continuous instead of steppy; a
-                // trackpad sends many small deltas and gets the same path.
-                constexpr int kGlideMs = 190;
+                // The old 190ms ease-in-out restarted from zero velocity on
+                // EVERY detent: rapid mouse-wheel input felt delayed and
+                // crawled behind the cursor. Keep the accumulated target,
+                // use a short linear glide without repeated slow starts, and
+                // let high-frequency fractional trackpad deltas settle even
+                // faster. Touch drag/fling is unchanged.
+                const int glideMs = std::fabs(e.wheelY) < .5f ? 65 : 105;
                 const float base = smoothing_ ? smoothTarget_ : scrollY_;
                 const float maxS = std::max(0.f, contentH_ - frame.h);
-                smoothTarget_ = std::clamp(base - e.wheelY * 64.f, 0.f, maxS);
+                smoothTarget_ = std::clamp(base - e.wheelY * 112.f, 0.f, maxS);
                 smoothScroll_.reset(scrollY_);
-                smoothScroll_.animateTo(smoothTarget_, kGlideMs, e.timestamp);
+                smoothScroll_.animateTo(smoothTarget_, glideMs,
+                                        e.timestamp, Curve::Linear);
                 smoothing_ = true;
                 velocity_ = 0.f;
                 updateCurrentFromScroll();
@@ -3140,6 +3146,11 @@ bool PageStage::onPointer(const PointerEvent& e) {
                     if (hasSelection() && onSelectionCleared) onSelectionCleared();
                     selA_ = selB_ = TextPos{pg, g};
                     selecting_ = true;
+                    if (magnifierEnabled_) {
+                        magnifierActive_ = true;
+                        magnifierPointer_ = e.pointerId;
+                        magnifierFinger_ = e.pos;
+                    }
                     velocity_ = 0.f;
                     smoothing_ = false;
                     return true;
@@ -3155,6 +3166,8 @@ bool PageStage::onPointer(const PointerEvent& e) {
         }
         case PointerPhase::Move:
             if (selecting_ && pressed) {
+                if (magnifierActive_ && e.pointerId == magnifierPointer_)
+                    magnifierFinger_ = e.pos;
                 int pg = 0;
                 Point n{0.f, 0.f};
                 if (hitPage(e.pos, &pg, &n)) {
@@ -3184,6 +3197,7 @@ bool PageStage::onPointer(const PointerEvent& e) {
             // not chase the cursor while the user is still choosing words.
             const bool wasSelecting = selecting_;
             selecting_ = false;
+            magnifierActive_ = false;
             dragging_ = false;
             if (pendingTextClear_ && hasSelection()) {
                 clearSelection();
@@ -3345,7 +3359,31 @@ void PageStage::onPaint(IPaintTarget& t, const PaintCtx& ctx) {
         if (source_->geometryRevision() != lastGeometryRevision_) {
             auto* mutableStage = const_cast<PageStage*>(this);
             mutableStage->lastGeometryRevision_ = source_->geometryRevision();
+            // Metadata can land while a fast fling crosses a cover-sized
+            // first page. Keep the SAME visible page and relative viewport
+            // location; relayout alone retained the old absolute scroll Y,
+            // which jumped to a different page after heights changed.
+            int anchorPage = current_;
+            float fraction = 0.f, viewportY = frame.h * .33f;
+            const float probe = scrollY_ + viewportY;
+            for (const Placed& p : placed_) {
+                if (p.rect.y <= probe && p.rect.bottom() > probe) {
+                    anchorPage = p.index;
+                    fraction = std::clamp((probe - p.rect.y) /
+                                          std::max(1.f, p.rect.h), 0.f, 1.f);
+                    break;
+                }
+            }
             mutableStage->relayout(ctx.now);
+            if (layout_ != LayoutMode::Single) {
+                for (const Placed& p : placed_) if (p.index == anchorPage) {
+                    mutableStage->scrollY_ = p.rect.y + fraction * p.rect.h - viewportY;
+                    mutableStage->clampScroll();
+                    if (smoothing_) mutableStage->smoothing_ = false;
+                    mutableStage->updateCurrentFromScroll();
+                    break;
+                }
+            }
         }
     }
     const Rect b = localBounds();
@@ -3435,6 +3473,34 @@ void PageStage::onPaint(IPaintTarget& t, const PaintCtx& ctx) {
             self->overscrollY_ = self->overscrollVelocity_ = 0.f;
     }
 
+    // Inertial scrolling and animated page jumps update scrollY *during*
+    // paint. Publish the resulting page before submitting visible tile work;
+    // otherwise the worker keeps prioritising the previous page for a frame
+    // (or several frames in a fast fling).
+    self->updateCurrentFromScroll();
+    source_->setFocusPage(current_);
+
+    if (layout_ == LayoutMode::Grid && !placed_.empty()) {
+        int first = -1, last = -1;
+        for (const Placed& p : placed_) {
+            if (p.rect.bottom() <= scrollY_ || p.rect.y >= scrollY_ + b.h) continue;
+            if (first < 0) first = p.index;
+            last = p.index;
+        }
+        if (first >= 0) {
+            const int cols = std::max(1, static_cast<int>((b.w - kMargin) /
+                                        (gridSize_ + kGridGap)));
+            source_->setVisibleGridRange(first, last,
+                std::max(0, first - cols),
+                std::min(source_->pageCount() - 1, last + cols),
+                std::max(1, static_cast<int>(std::ceil(gridSize_ * ctx.dpr))),
+                std::max(1, static_cast<int>(std::ceil(
+                    (gridSize_ * 1.42f - 18.f) * ctx.dpr))));
+        }
+    } else {
+        source_->setVisibleGridRange(-1, -1, -1, -1, 0, 0);
+    }
+
     const float rot = rotationAnim_.value(ctx.now);
     const Color paper = paperOf(pageTheme_);
 
@@ -3479,19 +3545,32 @@ void PageStage::onPaint(IPaintTarget& t, const PaintCtx& ctx) {
         // then rotate the entire composition. The former subtraction of
         // rotation_ * 90 undid the final turn and stretched portrait pages.
         Rect r = p.rect;
+        const bool small = layout_ == LayoutMode::Grid;
+        const Corners rr = Corners::all(small ? 4.f : 2.f);
+        const auto elev = small ? tokens::elevation::pageSmall(ctx.pal)
+                                : tokens::elevation::page(ctx.pal);
+
+        if (small) {
+            // Fit each *actual* page into its grid cell, reserving room for
+            // the number. A cover, landscape insert or rotated page must
+            // never be forced into the old hard-coded Letter aspect ratio.
+            const PageSizePt ps = source_->pageSize(p.index);
+            const float aspect = ((rotation_ & 1) ? ps.h / std::max(1.f, ps.w)
+                                                   : ps.w / std::max(1.f, ps.h));
+            const float maxH = std::max(1.f, r.h - 18.f);
+            const float pageW = std::min(r.w, maxH * aspect);
+            const float pageH = std::min(maxH, r.w / std::max(0.01f, aspect));
+            r.x += (r.w - pageW) * .5f;
+            r.w = pageW;
+            r.h = pageH;
+        }
         if (std::fabs(std::fmod(rot, 360.f)) > 0.01f) {
             t.translate(r.x + r.w * 0.5f, r.y + r.h * 0.5f);
             t.rotateDegrees(std::fmod(rot, 360.f));
             t.translate(-(r.x + r.w * 0.5f), -(r.y + r.h * 0.5f));
         }
 
-        const bool small = layout_ == LayoutMode::Grid;
-        const Corners rr = Corners::all(small ? 4.f : 2.f);
-        const auto elev = small ? tokens::elevation::pageSmall(ctx.pal)
-                                : tokens::elevation::page(ctx.pal);
-
         Rect pageRect = sourceRect(r);
-        if (small) pageRect.h = pageRect.w * (792.f / 612.f);  // label sits below
 
         drawElevation(t, pageRect, rr, elev, 1.f, /*interiorOpaque=*/true);
 
@@ -3533,7 +3612,18 @@ void PageStage::onPaint(IPaintTarget& t, const PaintCtx& ctx) {
         // Baking them in would invalidate the page raster on every stroke -
         // the one moment the renderer must stay responsive. They are drawn
         // over the blit instead, which costs a handful of paths per page.
-        if (src->cachesOwnRasters()) {
+        if (small && src->cachesOwnRasters()) {
+            // Grid is many complete tiny pages, not the one-page tile rail.
+            // Request exactly the device pixels the cell displays; PDFium
+            // runs off-thread and returns one bounded bitmap per page.
+            t.fillRoundedRect(pageRect, rr, pc);
+            t.save();
+            t.clipRoundedRect(pageRect, rr, true);
+            const PageSizePt ps = src->pageSize(idx);
+            src->drawPage(t, idx, pageRect,
+                          pageRect.w / std::max(1.f, ps.w) * ctx.dpr, th);
+            t.restore();
+        } else if (src->cachesOwnRasters()) {
             // The source hands us a ready bitmap. Going through drawCached
             // here would allocate an offscreen surface and composite the
             // whole page into it every time the zoom changes, purely to
@@ -3689,10 +3779,12 @@ void PageStage::onPaint(IPaintTarget& t, const PaintCtx& ctx) {
     // Queue visible text *after* drawPage queued its rasters: a PDF with a
     // huge text layer must not keep its first visible page blank while text
     // extraction monopolises the document's single PDFium worker.
-    const int cur = currentPage() - 1;
-    for (int p = std::max(0, cur - 1); p <= cur + 1; ++p) {
-        if (p >= source_->pageCount()) break;
-        (void)source_->glyphs(p);
+    if (layout_ != LayoutMode::Grid) {
+        const int cur = currentPage() - 1;
+        for (int p = std::max(0, cur - 1); p <= cur + 1; ++p) {
+            if (p >= source_->pageCount()) break;
+            (void)source_->glyphs(p);
+        }
     }
 
     source_->endVisibleFrame();

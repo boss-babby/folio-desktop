@@ -79,7 +79,7 @@ bool SkiaGpuTarget::initialise(platform::IGlContext& gl, std::string* error) {
 #if defined(__ANDROID__)
     impl_->context->setResourceCacheLimit(32u * 1024u * 1024u);
 #else
-    impl_->context->setResourceCacheLimit(64u * 1024u * 1024u);
+    impl_->context->setResourceCacheLimit(40u * 1024u * 1024u);
 #endif
 
     impl_->stencil = gl.stencilBits();

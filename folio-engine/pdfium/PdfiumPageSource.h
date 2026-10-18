@@ -152,9 +152,13 @@ public:
     void beginVisibleFrame();
     void endVisibleFrame() override;
     void setVisibleThumbnailRange(int first, int last) override;
+    void setVisibleGridRange(int first, int last, int bufferFirst,
+                             int bufferLast, int pixelW, int pixelH) override;
     /// One-shot idle pruning: retain only images touched by the last frame.
     void trimIdle();
-    /// Inactive tab or minimise: drop *all* pixels/text, keep the document.
+    /// Inactive tab: keep at most one bounded screenshot-sized preview.
+    void parkVisualCaches(int page, bool retainNearby = false);
+    /// Minimise/close: drop *all* pixels/text, keep the document.
     void suspendVisualCaches();
     void setWakeCallback(std::function<void()> wake) { worker_->setWakeCallback(std::move(wake)); }
     [[nodiscard]] bool busy() const { return worker_->busy(); }
@@ -203,6 +207,14 @@ private:
 
     std::unique_ptr<PdfiumWorker> worker_;
     int         pageCount_ = 0;
+    int         gridFirst_ = -1, gridLast_ = -1;
+    int         gridBufferFirst_ = -1, gridBufferLast_ = -1;
+    int         gridPixelW_ = 0, gridPixelH_ = 0;
+    [[nodiscard]] bool gridBuffered(int page) const noexcept {
+        return gridBufferFirst_ >= 0 && page >= gridBufferFirst_ &&
+               page <= gridBufferLast_;
+    }
+    void queueGridBuffer();
     std::vector<OutlineEntry> outline_;
     unsigned lastOutlineRevision_ = 0;
     unsigned lastGeometryRevision_ = 0;

@@ -871,6 +871,10 @@ void PdfiumPageSource::parkVisualCaches(int page, bool retainNearby) {
         for (int p : {page - 1, page + 1, page + 2})
             if (p >= 0 && p < pageCount_) adjacentPreviewQueued_.insert(p);
     text_.clear(); textRequested_.clear(); uiGlyphs_.clear();
+    // Notes and imported marks are re-indexed on tab activation. Keeping
+    // parsed annotations for every visited page in every inactive source
+    // can dominate RAM even after all its visible pixels have been dropped.
+    annotations_.clear();
     requestedAnnotations_.clear();
     stats_.pages = cache_.size();
     stats_.bytes = bytes_;
@@ -893,6 +897,7 @@ void PdfiumPageSource::suspendVisualCaches() {
     text_.clear();
     textRequested_.clear();
     uiGlyphs_.clear();
+    annotations_.clear();
     requestedAnnotations_.clear();
     stats_.pages = stats_.bytes = 0;
 }

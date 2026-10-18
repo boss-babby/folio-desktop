@@ -8,6 +8,7 @@
 #include <ctime>
 #include <filesystem>
 #include <tuple>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace folio::ui {
@@ -355,12 +356,16 @@ void WelcomeScreen::rebuildGrid(double now) {
             return a->title < b->title;
         });
     } else if (sortSeg_->selected() == 2) {
-        auto size = [](const RecentDoc* d) {
+        // Do not stat a potentially slow storage provider on EVERY sort
+        // comparison. A missing file is size zero, not uintmax_t(-1).
+        std::unordered_map<std::string, std::uintmax_t> sizes;
+        for (const RecentDoc* entry : entries) {
             std::error_code ec;
-            return std::filesystem::file_size(d->path, ec);
-        };
+            const auto bytes = std::filesystem::file_size(entry->path, ec);
+            sizes[entry->path] = ec ? 0u : bytes;
+        }
         std::sort(entries.begin(), entries.end(), [&](const RecentDoc* a, const RecentDoc* b) {
-            return size(a) > size(b);
+            return sizes.at(a->path) > sizes.at(b->path);
         });
     }
     int shown = 0;

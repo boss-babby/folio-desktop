@@ -196,34 +196,35 @@ inline constexpr int tooltip = 180;
 inline constexpr int hoverFast = 200;
 inline constexpr int hover = 250;
 inline constexpr int toast = 250;
-inline constexpr int paneSwitch = 300;
+inline constexpr int paneSwitch = 160;
 inline constexpr int modeChevron = 300;
 inline constexpr int toggleKnob = 300;
 inline constexpr int tabClose = 300;
 inline constexpr int thumbDelete = 300;
-inline constexpr int panelCollapse = 340;
-inline constexpr int panelReveal = 340;
+inline constexpr int panelCollapse = 180;
+inline constexpr int panelReveal = 180;
 inline constexpr int tabOpen = 350;
 inline constexpr int toolLabelGrow = 350;
 inline constexpr int pageRotate = 500;
 inline constexpr int pageWidth = 400;
+inline constexpr int desktopZoom = 150;
 inline constexpr int annotPlace = 400;
 inline constexpr int popoverReveal = 460;
-inline constexpr int screenSwap = 500;
-inline constexpr int pageEnter = 500;
-inline constexpr int focusMode = 500;
+inline constexpr int screenSwap = 220;
+inline constexpr int pageEnter = 220;
+inline constexpr int focusMode = 220;
 inline constexpr int progressBar = 500;
 inline constexpr int themeIconSpin = 600;
 inline constexpr int themeTransition = 760;
-inline constexpr int heroBarFill = 900;
+inline constexpr int heroBarFill = 160;
 }  // namespace dur
 
 namespace delay {
 inline constexpr int tooltipHover = 380;
 inline constexpr int railFadeIn = 160;
-inline constexpr int recentCardBase = 80;
-inline constexpr int recentCardStep = 50;
-inline constexpr int pageEnterStep = 40;
+inline constexpr int recentCardBase = 20;
+inline constexpr int recentCardStep = 12;
+inline constexpr int pageEnterStep = 14;
 inline constexpr int autoDismiss_toast = 1700;
 }  // namespace delay
 

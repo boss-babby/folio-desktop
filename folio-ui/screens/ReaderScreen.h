@@ -197,6 +197,7 @@ private:
 #endif
     AppState& state_;
     bool layoutWasAnimating_ = false;
+    bool panelLayoutDirty_ = false; // state changed even if next frame is late
 
     // title bar
     TabBar* tabs_ = nullptr;

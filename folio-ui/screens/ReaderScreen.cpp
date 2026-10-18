@@ -582,6 +582,7 @@ void ReaderScreen::togglePhoneSheet(bool left) {
     state_.rightPanelCollapsed = !(!left && wantOpen);
     leftPanel_->setCollapsed(state_.leftPanelCollapsed, now());
     rightPanel_->setCollapsed(state_.rightPanelCollapsed, now());
+    panelLayoutDirty_ = true;
     syncPhoneFabs();
 }
 
@@ -1428,12 +1429,14 @@ void ReaderScreen::toggleLeftPanel() {
     state_.leftPanelCollapsed = !state_.leftPanelCollapsed;
     leftPanel_->setCollapsed(state_.leftPanelCollapsed, now());
     leftToggle_->toggled = !state_.leftPanelCollapsed;
+    panelLayoutDirty_ = true;
 }
 
 void ReaderScreen::toggleRightPanel() {
     state_.rightPanelCollapsed = !state_.rightPanelCollapsed;
     rightPanel_->setCollapsed(state_.rightPanelCollapsed, now());
     rightToggle_->toggled = !state_.rightPanelCollapsed;
+    panelLayoutDirty_ = true;
 }
 
 void ReaderScreen::buildPill() {
@@ -3400,11 +3403,13 @@ void ReaderScreen::handleOutsideClick(Point windowPoint, double now) {
         if (outside(leftPanel_)) {
             state_.leftPanelCollapsed = true;
             leftPanel_->setCollapsed(true, now);
+            panelLayoutDirty_ = true;
             syncPhoneFabs();
         }
         if (outside(rightPanel_)) {
             state_.rightPanelCollapsed = true;
             rightPanel_->setCollapsed(true, now);
+            panelLayoutDirty_ = true;
             syncPhoneFabs();
         }
     }
@@ -3511,6 +3516,7 @@ bool ReaderScreen::onKey(const KeyEvent& e) {
             state_.leftPanelCollapsed = state_.rightPanelCollapsed = true;
             leftPanel_->setCollapsed(true, now());
             rightPanel_->setCollapsed(true, now());
+            panelLayoutDirty_ = true;
             syncPhoneFabs();
             return true;
         }
@@ -4353,7 +4359,11 @@ void ReaderScreen::onPaint(IPaintTarget& t, const PaintCtx& ctx) {
     // on every page-scroll frame made opening the phone sheet noticeably lag.
     const bool moving = focusT_.active(ctx.now) || leftPanel_->animating(ctx.now) ||
                         rightPanel_->animating(ctx.now);
-    if (moving || layoutWasAnimating_) self->onLayout();
+    // A short transition can finish between input and the next frame
+    // (backgrounded window, busy GPU, unit-test clock jump). Consume one
+    // final geometry update even when active(now) is already false.
+    if (moving || layoutWasAnimating_ || panelLayoutDirty_) self->onLayout();
+    self->panelLayoutDirty_ = false;
     self->layoutWasAnimating_ = moving;
 
 #if FOLIO_HAVE_PDFIUM_SOURCE

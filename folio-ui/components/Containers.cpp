@@ -305,6 +305,12 @@ SidePanel::SidePanel(Side s)
       expanded_(s == Side::Left ? tokens::size::panelLeft
                                 : tokens::size::panelRight) {
     debugName = s == Side::Left ? "SidePanel(L)" : "SidePanel(R)";
+    // Children are laid out at the final expanded width so opening doesn't
+    // reflow text/thumbnail rows. Clip those children to the *animated*
+    // frame: otherwise pages paint before the panel arrives and linger in
+    // the canvas after its edge has passed them on collapse.
+    clipsContent = true;
+    clipSelfPaint = false; // preserve CardView's outside elevation/shadow
 }
 
 void SidePanel::setCollapsedImmediately(bool c) noexcept {
@@ -630,8 +636,10 @@ RecentCard::RecentCard(std::string t, std::string m, int accent)
 }
 
 void RecentCard::enter(double now, int indexInGrid) {
+    // Bound the stagger: the last card in a full library should never take
+    // a second to appear after a sort. Preserve a little row-by-row motion.
     const int delay = tokens::delay::recentCardBase +
-                      tokens::delay::recentCardStep * indexInGrid;
+                      tokens::delay::recentCardStep * std::min(indexInGrid, 8);
     enter_.start(now, tokens::dur::pageEnter, delay, Curve::OutCubic);
     // The progress bar fills after the card has landed.
     barDelay_ = now + (delay + tokens::dur::pageEnter) / 1000.0;
@@ -676,7 +684,8 @@ bool RecentCard::onPointer(const PointerEvent& e) {
 bool RecentCard::animating(double now) const {
     return (pressStart_ >= 0.0 && !menuOpened_) ||
            hoverT_.active(now) || enter_.active(now) ||
-           (now - barDelay_) * 1000.0 < tokens::dur::heroBarFill;
+           (progress > 0.f &&
+            (now - barDelay_) * 1000.0 < tokens::dur::heroBarFill);
 }
 
 void RecentCard::onPaint(IPaintTarget& t, const PaintCtx& ctx) {
@@ -743,7 +752,7 @@ void RecentCard::onPaint(IPaintTarget& t, const PaintCtx& ctx) {
                     styleFor(tokens::type_small, ctx.pal.muted),
                     folio::render::TextAlign::Left);
 
-    // Reading-progress bar, filling over 900 ms once the card has landed.
+    // Reading-progress bar fills briefly after the card has landed.
     if (progress > 0.f) {
         const float fill =
             clamp01(static_cast<float>((ctx.now - barDelay_) * 1000.0 /

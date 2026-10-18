@@ -159,6 +159,10 @@ public:
     /// This is CSS `overflow:hidden` on the element, which is what the
     /// prototype specifies for .panel, .pane and #cv.
     bool clipsContent = false;
+    // A surface may cast a shadow beyond its own frame while its children
+    // must stay inside the animated panel edge. Other clips still include
+    // the owner's paint by default (scroll views, pages and popovers).
+    bool clipSelfPaint = true;
 
     /// Shape of that clip. The default is the widget's own bounds; a
     /// popover overrides it with a growing circle to get a circular reveal.

@@ -74,6 +74,23 @@ FOLIO_TEST_MAIN("PDFium source zoom and eviction") {
     if (!source.isOpen()) return;
     check(source.pageCount() == 3 && source.pageSize(0).w == 200.f,
           "open publishes page count and first page geometry");
+    bool loadedAnnotations = false;
+    for (int i = 0; i < 200 && !loadedAnnotations; ++i) {
+        source.tick();
+        loadedAnnotations = source.annotationsForPage(0) != nullptr;
+        if (!loadedAnnotations) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    check(loadedAnnotations, "imported annotation metadata can be indexed on demand");
+    source.parkVisualCaches(0);
+    check(source.annotationsForPage(0) == nullptr,
+          "parking a tab drops indexed imported annotations as well as visual pixels");
+    loadedAnnotations = false;
+    for (int i = 0; i < 200 && !loadedAnnotations; ++i) {
+        source.tick();
+        loadedAnnotations = source.annotationsForPage(0) != nullptr;
+        if (!loadedAnnotations) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    check(loadedAnnotations, "returning to a parked tab can re-index imported marks");
     check(source.geometryRevision() == 0 && source.pageSize(1).w == 200.f,
           "distant geometry is provisional rather than eagerly scanned");
     source.setFocusPage(0);

@@ -70,6 +70,31 @@ FOLIO_TEST_MAIN("retained chrome redraw") {
     app.paint(target, 2.0, 1.f, true);
     app.paint(target, 3.0, 1.f, true);
 
+    // A screen change should release the previous full-screen opacity layer
+    // after 220 ms, not keep painting two screens for half a second.
+    auto navSurface = SkSurfaces::Raster(SkImageInfo::Make(
+        1200, 800, kBGRA_8888_SkColorType, kPremul_SkAlphaType));
+    check(navSurface != nullptr, "transition regression has its own render surface");
+    if (!navSurface) return;
+    skia::SkiaPaintTarget navTarget(navSurface->getCanvas());
+    FolioApp navigation(1200.f, 800.f);
+    navigation.showScreen(Screen::Reader, 1.0);
+    navigation.paint(navTarget, 1.23, 1.f, true);
+    ReaderScreen* navigationReader = nullptr;
+    WelcomeScreen* navigationHome = nullptr;
+    navigation.root().forEach([&](Widget& w) {
+        if (auto* r = dynamic_cast<ReaderScreen*>(&w)) navigationReader = r;
+        if (auto* h = dynamic_cast<WelcomeScreen*>(&w)) navigationHome = h;
+    });
+    check(navigationReader && navigationHome && navigationReader->visible &&
+          !navigationHome->visible,
+          "home-to-reader fade releases home within 220 ms");
+    navigation.showScreen(Screen::Welcome, 2.0);
+    navigation.paint(navTarget, 2.23, 1.f, true);
+    check(navigationReader && navigationHome && navigationHome->visible &&
+          !navigationReader->visible,
+          "reader-to-home fade releases reader within 220 ms");
+
     Button* close = nullptr;
     app.root().forEach([&](Widget& w) {
         if (auto* b = dynamic_cast<Button*>(&w);
@@ -148,6 +173,60 @@ FOLIO_TEST_MAIN("retained chrome redraw") {
               d.visible.bottom() <= d.dest.bottom() &&
               d.visible.h <= stage.frame.h && d.visible.h < d.dest.h,
               "stage passes only the on-screen portion of a high-zoom page");
+
+    section("short desktop zoom and panel-driven fit reuse a stable raster scale");
+    auto zoomProbe = std::make_shared<ViewportProbe>();
+    PageStage zoomStage;
+    zoomStage.setFrame(0.f, 0.f, 480.f, 640.f);
+    zoomStage.setSource(zoomProbe, 10.0);
+    zoomStage.paintTree(target, PaintCtx{ctx.pal, 10.5, 1.f});
+    zoomProbe->draws.clear();
+    zoomStage.setZoom(2.f, 11.0);
+    zoomStage.paintTree(target, PaintCtx{ctx.pal, 11.04, 1.f});
+    check(!zoomProbe->draws.empty() &&
+          zoomProbe->draws.front().dest.w > 700.f,
+          "desktop zoom makes perceptible progress in the first 40 ms");
+    zoomProbe->draws.clear();
+    zoomStage.paintTree(target, PaintCtx{ctx.pal, 11.16, 1.f});
+    check(!zoomStage.animating(11.16) && !zoomProbe->draws.empty() &&
+          zoomProbe->draws.front().dest.w > 1200.f,
+          "desktop zoom completes in 150 ms without a 400 ms tail");
+    zoomStage.setZoomMode(ZoomMode::FitWidth, 12.0);
+    zoomProbe->draws.clear();
+    zoomStage.paintTree(target, PaintCtx{ctx.pal, 12.2, 1.f});
+    zoomStage.setFrame(0.f, 0.f, 430.f, 640.f);
+    zoomProbe->draws.clear();
+    zoomStage.paintTree(target, PaintCtx{ctx.pal, 12.22, 1.f});
+    check(!zoomProbe->draws.empty() &&
+          std::fabs(zoomProbe->draws.front().dest.w - 374.f) < 2.f &&
+          !zoomStage.animating(12.22),
+          "Fit width follows an animated desktop panel without lagging zoom tail");
+
+    section("panel content stays inside the moving edge on a real Skia surface");
+    struct OutsideChild : Widget {
+        void onPaint(IPaintTarget& paint, const PaintCtx&) override {
+            paint.fillRect({0.f, 0.f, 190.f, 44.f}, Color{255, 0, 255, 255});
+        }
+    };
+    auto panelSurface = SkSurfaces::Raster(SkImageInfo::Make(
+        280, 200, kBGRA_8888_SkColorType, kPremul_SkAlphaType));
+    check(panelSurface != nullptr, "pixel-level panel clip target exists");
+    if (panelSurface) {
+        skia::SkiaPaintTarget panelTarget(panelSurface->getCanvas());
+        panelTarget.clear(Color{16, 28, 51, 255});
+        SidePanel smallPanel(SidePanel::Side::Left);
+        smallPanel.setFrame(0.f, 0.f, 70.f, 160.f);
+        auto* bleed = smallPanel.emplace<OutsideChild>();
+        bleed->setFrame(10.f, 30.f, 190.f, 44.f);
+        smallPanel.paintTree(panelTarget, PaintCtx{ctx.pal, 13., 1.f});
+        SkPixmap panelPixels;
+        if (panelSurface->peekPixels(&panelPixels)) {
+            const auto inside = *panelPixels.addr32(20, 45);
+            const auto outside = *panelPixels.addr32(150, 45);
+            check(inside != outside && outside == 0xff101c33u,
+                  "thumbnail-like child is clipped at panel edge, not drawn on the PDF");
+        }
+    }
 
     // At minimum zoom the viewport midpoint lands on the second, NARROW
     // page. Increasing zoom makes the first page wider than the viewport

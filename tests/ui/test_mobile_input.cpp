@@ -26,6 +26,14 @@ struct MixedPages final : IPageSource {
     }
     void drawPage(IPaintTarget&, int, const Rect&, float, PageTheme) override {}
 };
+struct LongLayoutPages final : IPageSource {
+    int pageCount() const override { return 24; }
+    PageSizePt pageSize(int i) const override {
+        return i % 5 == 0 ? PageSizePt{792.f, 450.f}
+                          : PageSizePt{612.f, 792.f};
+    }
+    void drawPage(IPaintTarget&, int, const Rect&, float, PageTheme) override {}
+};
 struct GridProbe final : IPageSource {
     struct Paint { int page; Rect dest; float scale; };
     std::vector<Paint> paints;
@@ -96,6 +104,8 @@ struct GesturePaint final : IPaintTarget {
     int layers = 0;
     std::vector<float> rotations;
     std::vector<Rect> revealClips;
+    std::vector<Rect> panelClips;
+    std::vector<std::string> paintEvents;
     struct Transform { float x = 0.f, y = 0.f, sx = 1.f, sy = 1.f; } transform;
     std::vector<Transform> stack;
     std::vector<Point> iconCentres;
@@ -107,7 +117,11 @@ struct GesturePaint final : IPaintTarget {
     void scale(float x, float y) override {
         transform.sx *= x; transform.sy *= y;
     }
-    void rotateDegrees(float angle) override { rotations.push_back(angle); } void clipRect(const Rect&, bool) override {}
+    void rotateDegrees(float angle) override { rotations.push_back(angle); }
+    void clipRect(const Rect& r, bool) override {
+        panelClips.push_back(r);
+        paintEvents.push_back("clip");
+    }
     void clipRoundedRect(const Rect& r, const Corners&, bool) override {
         if (std::fabs(r.w - r.h) < .02f &&
             std::fabs(r.x + r.w * .5f - 190.f) < .02f &&
@@ -122,7 +136,9 @@ struct GesturePaint final : IPaintTarget {
     void strokeRoundedRect(const Rect& r, const Corners&, const Color&, float) override {
         roundedStrokes.push_back(r);
     }
-    void drawShadow(const Rect&, const Corners&, const Shadow&) override {}
+    void drawShadow(const Rect&, const Corners&, const Shadow&) override {
+        paintEvents.push_back("shadow");
+    }
     void fillCircle(const Point&, float, const Color&) override { ++circles; }
     void drawLine(const Point&, const Point&, const Color&, float) override {}
     void fillRectVerticalGradient(const Rect&, const Color&, const Color&) override {}
@@ -173,6 +189,35 @@ FOLIO_TEST_MAIN("mobile input and layouts") {
     check(list->scrollY() >= 59.f, "vertical drag scrolls its ancestor");
     check(card->cancels == 1, "drag cancels the child's press");
 
+    section("panel edge clips thumbnail children, not the card shadow");
+    SidePanel panel(SidePanel::Side::Left);
+    panel.setExpandedWidth(268.f, 0.0);
+    panel.setCollapsedImmediately(true);
+    panel.setCollapsed(false, 1.0);
+    const float panelMid = panel.currentWidth(1.09);
+    check(panel.clipsContent && !panel.clipSelfPaint &&
+          panelMid > tokens::size::panelRailCollapsed && panelMid < 268.f &&
+          panel.contentAlpha(1.09) > .05f && panel.contentAlpha(1.09) < .95f,
+          "body fade and clipped edge advance together at panel midpoint");
+    panel.setFrame(0.f, 0.f, panelMid, 360.f);
+    GesturePaint panelPaint;
+    panel.paintTree(panelPaint, {tokens::kLight, 1.09, 1.f});
+    const auto shadow = std::find(panelPaint.paintEvents.begin(),
+                                  panelPaint.paintEvents.end(), "shadow");
+    const auto clip = std::find(panelPaint.paintEvents.begin(),
+                                panelPaint.paintEvents.end(), "clip");
+    check(shadow != panelPaint.paintEvents.end() &&
+          clip != panelPaint.paintEvents.end() && shadow < clip &&
+          std::any_of(panelPaint.panelClips.begin(), panelPaint.panelClips.end(),
+              [panelMid](const Rect& r) { return std::fabs(r.w - panelMid) < .1f; }),
+          "shadow stays outside, thumbnails cannot escape animated panel frame");
+    panel.setCollapsed(true, 1.1);
+    const float panelClosing = panel.currentWidth(1.19);
+    check(panelClosing < panelMid &&
+          panel.contentAlpha(1.19) < panel.contentAlpha(1.09) &&
+          !panel.animating(1.3),
+          "collapse hides body in lockstep and finishes within 180 ms");
+
     section("Home card hold and mouse context do not open the document");
     RecentCard homeCard("Name.pdf", "Offline copy", 0);
     homeCard.setFrame(0, 0, 210, 196);
@@ -194,6 +239,16 @@ FOLIO_TEST_MAIN("mobile input and layouts") {
     homeCard.onPointer(right);
     check(cardOpens == 1 && cardMenus == 2,
           "right-click opens the menu without also opening the PDF");
+
+    section("library sort settles even with twenty cards and no progress bar");
+    RecentCard sortedCard("Newest", "Offline copy", 0);
+    sortedCard.enter(20., 19);
+    check(sortedCard.animating(20.2) && !sortedCard.animating(20.36),
+          "last sorted card lands in under 360 ms without phantom idle frames");
+    sortedCard.progress = .6f;
+    sortedCard.enter(21., 19);
+    check(!sortedCard.animating(21.52),
+          "reading progress finishes within half a second of library sort");
 
     section("reader PDF right-click and pen hold share the all-device radial menu");
     PageStage context;
@@ -407,6 +462,41 @@ FOLIO_TEST_MAIN("mobile input and layouts") {
     grid.onPaint(gridPaint, {tokens::kLight, 2.42, 2.f});
     check(grid.scrollY() > wheelY + 100.f,
           "consecutive wheel events accumulate instead of restarting a slow ease-in");
+
+    section("switching single, continuous, spread and grid retains the exact page");
+    PageStage modes;
+    modes.setFrame(0.f, 0.f, 390.f, 640.f);
+    modes.setSource(std::make_shared<LongLayoutPages>(), 0.0);
+    modes.setLayout(LayoutMode::Single, 0.0);
+    modes.goToPage(18, 0.0); // right-hand page in TwoUp, far beyond page one
+    modes.onPaint(gridPaint, {tokens::kLight, 1., 1.f});
+    check(modes.currentPage() == 18, "single-page focus begins on page eighteen");
+    modes.setLayout(LayoutMode::Continuous, 1.1);
+    modes.onPaint(gridPaint, {tokens::kLight, 1.2, 1.f});
+    int kept = -1;
+    check(modes.currentPage() == 18 && modes.scrollY() > 3000.f &&
+          modes.hitPage({195.f, 211.f}, &kept, nullptr) && kept == 17,
+          "single-to-continuous scroll anchors page eighteen instead of page one");
+    modes.setLayout(LayoutMode::TwoUp, 1.3);
+    modes.onPaint(gridPaint, {tokens::kLight, 1.5, 1.f});
+    kept = -1;
+    check(modes.currentPage() == 18 && modes.scrollX() > 300.f &&
+          modes.hitPage({195.f, 211.f}, &kept, nullptr) && kept == 17,
+          "two-up centres the right-hand page rather than hiding it horizontally");
+    modes.setLayout(LayoutMode::Grid, 1.6);
+    modes.onPaint(gridPaint, {tokens::kLight, 1.8, 1.f});
+    check(modes.currentPage() == 18 && modes.scrollY() > 500.f,
+          "multi-page grid opens at the current row rather than its first row");
+    modes.setLayout(LayoutMode::Continuous, 1.9);
+    modes.onPaint(gridPaint, {tokens::kLight, 2., 1.f});
+    kept = -1;
+    check(modes.currentPage() == 18 &&
+          modes.hitPage({195.f, 211.f}, &kept, nullptr) && kept == 17,
+          "grid-to-reading restores the same focused page");
+    modes.setLayout(LayoutMode::Single, 2.1);
+    modes.onPaint(gridPaint, {tokens::kLight, 2.3, 1.f});
+    check(modes.currentPage() == 18,
+          "round-trip through all layouts keeps selected page and skips entrance replay");
 
     section("tab view-state snapshot restores exact zoom, page and XY position");
     PageStage savedStage;

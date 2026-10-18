@@ -354,7 +354,14 @@ void PageStage::setZoom(float z, double now) {
     captureZoomAnchor();
     zoomMode_ = ZoomMode::Free;
     zoomTarget_ = std::clamp(z, kMinZoom, kMaxZoom);
+#if defined(__ANDROID__)
     zoomAnim_.animateTo(zoomTarget_, tokens::dur::pageWidth, now);
+#else
+    // Desktop wheel/buttons should never drag a 400ms easing tail behind
+    // each detent. Reuse the resident tiles until the short motion settles.
+    zoomAnim_.animateTo(zoomTarget_, tokens::dur::desktopZoom, now,
+                        Curve::OutCubic);
+#endif
 }
 
 void PageStage::setZoomMode(ZoomMode m, double now) {
@@ -363,7 +370,12 @@ void PageStage::setZoomMode(ZoomMode m, double now) {
     zoomMode_ = m;
     if (m == ZoomMode::Free) return;
     zoomTarget_ = fitScale(m == ZoomMode::FitWidth);
+#if defined(__ANDROID__)
     zoomAnim_.animateTo(zoomTarget_, tokens::dur::pageWidth, now);
+#else
+    zoomAnim_.animateTo(zoomTarget_, tokens::dur::desktopZoom, now,
+                        Curve::OutCubic);
+#endif
 }
 
 void PageStage::snapZoomToTarget(double now) {
@@ -422,10 +434,40 @@ void PageStage::restoreViewState(const ViewState& v, double now) {
 
 void PageStage::setLayout(LayoutMode m, double now) {
     if (m == layout_) return;
+    // Scroll coordinates belong to a particular layout. Reusing the old
+    // absolute Y after Single -> Continuous/Grid lands at page one; reusing
+    // X after Single -> TwoUp can put the chosen right-hand page offscreen.
+    // Anchor the *current page* (not the top-left page of a spread) and its
+    // visible position before rebuilding the page geometry.
+    const int wanted = current_;
+    constexpr float viewY = .33f;
+    constexpr float viewX = .5f;
+    float pageY = 0.f, pageX = .5f;
+    for (const Placed& p : placed_) if (p.index == wanted) {
+        pageY = std::clamp((scrollY_ + frame.h * viewY - p.rect.y) /
+                               std::max(1.f, p.rect.h), 0.f, 1.f);
+        pageX = std::clamp((scrollX_ + frame.w * viewX - p.rect.x) /
+                               std::max(1.f, p.rect.w), 0.f, 1.f);
+        break;
+    }
+    smoothing_ = false;
+    velocity_ = overscrollY_ = overscrollVelocity_ = 0.f;
     layout_ = m;
     lastLayoutW_ = 0.f;
     if (zoomMode_ != ZoomMode::Free) setZoomMode(zoomMode_, now);
-    replayEntrance(now);
+    // A layout switch is not a fresh PDF open. Replaying the staggered page
+    // entrance temporarily hides the very page the user was reading.
+    entrance_.clear();
+    relayout(now);
+    current_ = wanted;
+    anchorPage_ = wanted;
+    anchorFrac_ = m == LayoutMode::Grid ? 0.f : pageY;
+    anchorFracX_ = pageX;
+    anchorViewFrac_ = m == LayoutMode::Grid ? 0.f : viewY;
+    anchorViewFracX_ = viewX;
+    anchorValid_ = true; // fit animation can continue without a later jump
+    applyZoomAnchor();
+    if (source_) source_->setFocusPage(current_);
 }
 
 void PageStage::rotate(int delta, double now) {
@@ -719,10 +761,19 @@ bool PageStage::handleScrollbar(const PointerEvent& e) {
 
 void PageStage::updateCurrentFromScroll() {
     if (placed_.empty() || layout_ == LayoutMode::Single) return;
+    // A spread/grid row may contain several simultaneously visible pages.
+    // Keep the explicitly focused right-hand page or grid cell while the
+    // viewport probe is still inside that page; never silently relabel it
+    // as the first/left page of the same row after a layout switch.
+    const float probe = scrollY_ + (layout_ == LayoutMode::Grid
+        ? std::min(frame.h * .1f, 40.f) : frame.h * .33f);
+    if (layout_ == LayoutMode::TwoUp || layout_ == LayoutMode::Grid)
+        for (const Placed& p : placed_)
+            if (p.index == current_ && probe >= p.rect.y &&
+                probe < p.rect.bottom()) return;
     // The current page is the one covering the viewport's upper third - a
     // more stable choice than "topmost visible", which flickers between two
     // pages at a boundary.
-    const float probe = scrollY_ + frame.h * 0.33f;
     int best = current_;
     for (const Placed& p : placed_) {
         if (probe >= p.rect.y && probe < p.rect.bottom()) { best = p.index; break; }
@@ -3407,14 +3458,20 @@ void PageStage::onPaint(IPaintTarget& t, const PaintCtx& ctx) {
     // panel collapsing, the window resizing, focus mode engaging - the
     // promise has to be re-honoured, or the space the panel gave back just
     // becomes dead grey margin beside a page that stayed the same size.
-    if (std::fabs(b.w - lastFitW_) > 0.5f) {
+    const bool viewportWidthMoving = std::fabs(b.w - lastFitW_) > 0.5f;
+    if (viewportWidthMoving) {
         self->lastFitW_ = b.w;
         if (zoomMode_ != ZoomMode::Free) {
             const float fs = fitScale(zoomMode_ == ZoomMode::FitWidth);
             if (std::fabs(fs - zoomTarget_) > 1e-4f) {
                 self->captureZoomAnchor();
                 self->zoomTarget_ = fs;
-                self->zoomAnim_.animateTo(fs, tokens::dur::pageWidth, ctx.now);
+                // A moving side panel supplies the animation already. A new
+                // 400ms fit zoom for EVERY panel-width frame continually
+                // postponed its finish and queued intermediate DPI work.
+                // Follow the actual viewport now; hold the old raster scale
+                // until geometry stops, then sharpen once.
+                self->zoomAnim_.reset(fs);
             }
         }
     }
@@ -3427,7 +3484,8 @@ void PageStage::onPaint(IPaintTarget& t, const PaintCtx& ctx) {
     // Hold the raster scale steady for the duration of a zoom or rotation,
     // then snap it to the real scale when the animation stops. This is the
     // "idle render": expensive work happens when nothing is moving.
-    const bool scaleMoving = zoomAnim_.active(ctx.now) || rotationAnim_.active(ctx.now);
+    const bool scaleMoving = zoomAnim_.active(ctx.now) ||
+                             rotationAnim_.active(ctx.now) || viewportWidthMoving;
     if (!scaleMoving || rasterScale_ <= 0.f) self->rasterScale_ = scale;
 
     const bool scaleChanged = std::fabs(scale - lastLayoutScale_) > 1e-4f;

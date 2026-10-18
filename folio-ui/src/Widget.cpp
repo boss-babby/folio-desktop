@@ -132,12 +132,16 @@ void Widget::paintTree(IPaintTarget& t, const PaintCtx& ctx) {
 
     // The clip has to cover onPaint too, not just the children: list rows
     // and pages are drawn by the container itself.
-    if (clipsContent) {
+    if (clipsContent && clipSelfPaint) {
         t.save();
         applyContentClip(t, ctx);
     }
 
     onPaint(t, ctx);
+    if (clipsContent && !clipSelfPaint) {
+        t.save();
+        applyContentClip(t, ctx);
+    }
     ensureChildOrder();
     for (auto& c : children_) c->paintTree(t, ctx);
     onPaintOverlay(t, ctx);

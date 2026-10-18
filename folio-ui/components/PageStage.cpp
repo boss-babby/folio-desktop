@@ -357,9 +357,10 @@ void PageStage::setZoom(float z, double now) {
 #if defined(__ANDROID__)
     zoomAnim_.animateTo(zoomTarget_, tokens::dur::pageWidth, now);
 #else
-    // Desktop wheel/buttons should never drag a 400ms easing tail behind
-    // each detent. Reuse the resident tiles until the short motion settles.
-    zoomAnim_.animateTo(zoomTarget_, tokens::dur::desktopZoom, now,
+    // Desktop wheel/buttons use the existing 150ms input-feedback duration,
+    // rather than a 400ms easing tail behind each detent. Reuse the resident
+    // tiles until the short motion settles.
+    zoomAnim_.animateTo(zoomTarget_, tokens::dur::pressScale, now,
                         Curve::OutCubic);
 #endif
 }
@@ -373,7 +374,7 @@ void PageStage::setZoomMode(ZoomMode m, double now) {
 #if defined(__ANDROID__)
     zoomAnim_.animateTo(zoomTarget_, tokens::dur::pageWidth, now);
 #else
-    zoomAnim_.animateTo(zoomTarget_, tokens::dur::desktopZoom, now,
+    zoomAnim_.animateTo(zoomTarget_, tokens::dur::pressScale, now,
                         Curve::OutCubic);
 #endif
 }

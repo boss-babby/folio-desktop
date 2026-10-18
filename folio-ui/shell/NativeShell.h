@@ -12,6 +12,7 @@ namespace folio::ui {
 struct NativeShellOptions {
     int width = 1440;
     int height = 900;
+    bool startMaximised = true; // desktop: taskbar-safe; --size opts out
     /// Skip Ganesh and render on the CPU. Useful for bisecting a GPU bug and
     /// for machines whose drivers cannot give us a GL 3.3 context.
     bool forceSoftware = false;

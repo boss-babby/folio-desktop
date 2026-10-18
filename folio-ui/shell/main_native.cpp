@@ -9,9 +9,54 @@
 #if defined(_WIN32)
 #  include <windows.h>
 #  include <shellapi.h>
+#  include <dbghelp.h>
+#  include <cwchar>
 #endif
 
 namespace {
+#if defined(_WIN32)
+// Event Viewer's "unknown module, offset -8" cannot identify an access
+// violation. Keep a small *local* stack/module dump for the next crash, never
+// send it anywhere automatically. A dump can contain PDF text; users must
+// share it privately and only with their consent.
+LONG WINAPI saveCrashDump(EXCEPTION_POINTERS* exception) {
+    static volatile LONG writing = 0;
+    if (InterlockedExchange(&writing, 1) != 0) return EXCEPTION_CONTINUE_SEARCH;
+    wchar_t dir[MAX_PATH]{};
+    const DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", dir, MAX_PATH - 80);
+    if (n == 0 || n >= MAX_PATH - 80) return EXCEPTION_CONTINUE_SEARCH;
+    if (wcscat_s(dir, L"\\Folio") != 0) return EXCEPTION_CONTINUE_SEARCH;
+    CreateDirectoryW(dir, nullptr);
+    if (wcscat_s(dir, L"\\crashes") != 0) return EXCEPTION_CONTINUE_SEARCH;
+    CreateDirectoryW(dir, nullptr);
+    wchar_t file[MAX_PATH]{};
+    if (swprintf_s(file, L"%ls\\folio-%lu-%llu.dmp", dir,
+                   GetCurrentProcessId(),
+                   static_cast<unsigned long long>(GetTickCount64())) < 0)
+        return EXCEPTION_CONTINUE_SEARCH;
+    const HANDLE output = CreateFileW(file, GENERIC_WRITE, FILE_SHARE_READ,
+                                      nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (output != INVALID_HANDLE_VALUE) {
+        if (HMODULE dbghelp = LoadLibraryW(L"dbghelp.dll")) {
+            using WriteDump = decltype(&MiniDumpWriteDump);
+            const auto writeDump = reinterpret_cast<WriteDump>(
+                GetProcAddress(dbghelp, "MiniDumpWriteDump"));
+            if (writeDump) {
+                MINIDUMP_EXCEPTION_INFORMATION details{};
+                details.ThreadId = GetCurrentThreadId();
+                details.ExceptionPointers = exception;
+                details.ClientPointers = FALSE;
+                writeDump(GetCurrentProcess(), GetCurrentProcessId(), output,
+                          MiniDumpNormal, &details, nullptr, nullptr);
+            }
+            FreeLibrary(dbghelp);
+        }
+        CloseHandle(output);
+    }
+    return EXCEPTION_CONTINUE_SEARCH; // keep Windows Error Reporting active
+}
+#endif
+
 int run(std::vector<std::string> args) {
     folio::ui::NativeShellOptions opts;
     for (std::size_t i = 1; i < args.size(); ++i) {
@@ -23,6 +68,7 @@ int run(std::vector<std::string> args) {
             if (std::sscanf(args[++i].c_str(), "%dx%d", &w, &h) == 2 && w > 0 && h > 0) {
                 opts.width = w;
                 opts.height = h;
+                opts.startMaximised = false;
             }
         } else if (a == "--help" || a == "-h") {
 #if defined(_WIN32)
@@ -49,6 +95,7 @@ int run(std::vector<std::string> args) {
 
 #if defined(_WIN32)
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
+    SetUnhandledExceptionFilter(&saveCrashDump);
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     if (!argv) return 1;

@@ -50,6 +50,7 @@
 #include <GL/gl.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
 #include <deque>
 #include <string>
@@ -74,6 +75,11 @@ constexpr int kWglContextMajorVersionArb = 0x2091;
 constexpr int kWglContextMinorVersionArb = 0x2092;
 constexpr int kWglContextProfileMaskArb = 0x9126;
 constexpr int kWglContextCoreProfileBit = 0x00000001;
+
+bool validWglProc(PROC p) noexcept {
+    const auto v = reinterpret_cast<std::uintptr_t>(p);
+    return p && v != 1 && v != 2 && v != 3 && v != ~std::uintptr_t{0};
+}
 
 std::wstring toWide(std::string_view utf8) {
     if (utf8.empty()) return {};
@@ -206,8 +212,10 @@ public:
         // Upgrade to a 3.3 core context when the driver offers one. Ganesh
         // is happy with the compatibility context too, so a failure here is
         // not fatal - it just means an older driver.
-        auto createAttribs = reinterpret_cast<PFNWGLCREATECONTEXTATTRIBSARB>(
-            wglGetProcAddress("wglCreateContextAttribsARB"));
+        const PROC contextProc = wglGetProcAddress("wglCreateContextAttribsARB");
+        auto createAttribs = validWglProc(contextProc)
+            ? reinterpret_cast<PFNWGLCREATECONTEXTATTRIBSARB>(contextProc)
+            : nullptr;
         if (createAttribs) {
             const int attribs[] = {kWglContextMajorVersionArb, 3,
                                    kWglContextMinorVersionArb, 3,
@@ -222,15 +230,29 @@ public:
         }
         if (!rc_) rc_ = legacy;
 
-        swapInterval_ = reinterpret_cast<PFNWGLSWAPINTERVALEXT>(
-            wglGetProcAddress("wglSwapIntervalEXT"));
+        const PROC swapProc = wglGetProcAddress("wglSwapIntervalEXT");
+        swapInterval_ = validWglProc(swapProc)
+            ? reinterpret_cast<PFNWGLSWAPINTERVALEXT>(swapProc)
+            : nullptr;
         gl_ = GetModuleHandleW(L"opengl32.dll");
         return true;
     }
 
-    ~WglContext() override {
-        if (rc_) { wglMakeCurrent(nullptr, nullptr); wglDeleteContext(rc_); }
+    ~WglContext() override { shutdown(); }
+
+    void shutdown() noexcept {
+        if (rc_) {
+            wglMakeCurrent(nullptr, nullptr);
+            wglDeleteContext(rc_);
+            rc_ = nullptr;
+        }
+        // Release the DC while its HWND is still alive. The window owner
+        // calls this BEFORE DestroyWindow; member destruction comes later.
         if (hdc_ && hwnd_) ReleaseDC(hwnd_, hdc_);
+        hdc_ = nullptr;
+        hwnd_ = nullptr;
+        gl_ = nullptr;
+        swapInterval_ = nullptr;
     }
 
     void makeCurrent() override { wglMakeCurrent(hdc_, rc_); }
@@ -240,11 +262,12 @@ public:
     }
 
     [[nodiscard]] ProcAddress procAddress(const char* name) const override {
-        // wglGetProcAddress only resolves extensions; the GL 1.1 core that
-        // ships in opengl32.dll has to come from GetProcAddress, and Skia
-        // asks for both kinds.
-        if (auto p = reinterpret_cast<ProcAddress>(wglGetProcAddress(name)))
-            return p;
+        // WGL can return 1, 2, 3 or -1 for an unsupported entry point.
+        // These are NOT callable pointers: handing one to Skia can turn an
+        // ordinary missing GL extension into an access-violation crash.
+        // GL 1.1 core entry points instead live in opengl32.dll.
+        const auto p = wglGetProcAddress(name);
+        if (validWglProc(p)) return reinterpret_cast<ProcAddress>(p);
         if (gl_)
             return reinterpret_cast<ProcAddress>(GetProcAddress(gl_, name));
         return nullptr;
@@ -367,17 +390,16 @@ LRESULT Win32Window::wndProc(UINT msg, WPARAM wp, LPARAM lp) {
             // menu) but give the whole window over to the client area.
             auto* p = reinterpret_cast<NCCALCSIZE_PARAMS*>(lp);
             if (IsZoomed(hwnd_)) {
-                // A maximised WS_OVERLAPPEDWINDOW is deliberately larger
-                // than the monitor by the frame thickness. Without this
-                // inset the top of Folio's own title bar sits off-screen.
-                const int fx = GetSystemMetrics(SM_CXSIZEFRAME) +
-                               GetSystemMetrics(SM_CXPADDEDBORDER);
-                const int fy = GetSystemMetrics(SM_CYSIZEFRAME) +
-                               GetSystemMetrics(SM_CXPADDEDBORDER);
-                p->rgrc[0].left += fx;
-                p->rgrc[0].right -= fx;
-                p->rgrc[0].top += fy;
-                p->rgrc[0].bottom -= fy;
+                // Maximised overlapped windows extend beyond the monitor by
+                // a DPI-dependent invisible frame. SystemMetrics uses the
+                // *system* DPI, not necessarily this monitor's DPI; guessing
+                // that border clipped the title bar and close button on
+                // mixed-DPI screens. Client coordinates must be the actual
+                // monitor WORK area (also leaves the taskbar visible).
+                MONITORINFO mi{sizeof(mi)};
+                if (GetMonitorInfoW(MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST),
+                                    &mi))
+                    p->rgrc[0] = mi.rcWork;
             }
             return 0;
         }
@@ -677,21 +699,34 @@ bool Win32Window::create(const WindowDesc& desc, std::string* error) {
     }
 
     updateScale();
-    if (scale_ != 1.f) {
-        // CW_USEDEFAULT sized us in pixels at the default DPI; resize so the
-        // logical size the caller asked for is what they get.
-        SetWindowPos(hwnd_, nullptr, 0, 0,
-                     static_cast<int>(desc.width * scale_),
-                     static_cast<int>(desc.height * scale_),
-                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    // Keep the RESTORED window inside the current monitor work area. The
+    // default 1440x900 did not fit a 1366x768 laptop and hid the rightmost
+    // close button and bottom content off-screen even before maximising.
+    MONITORINFO mi{sizeof(mi)};
+    if (GetMonitorInfoW(MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST), &mi)) {
+        constexpr int margin = 24;
+        const int workW = mi.rcWork.right - mi.rcWork.left;
+        const int workH = mi.rcWork.bottom - mi.rcWork.top;
+        minW_ = std::min(minW_, std::max(1, static_cast<int>((workW - 16) / scale_)));
+        minH_ = std::min(minH_, std::max(1, static_cast<int>((workH - 16) / scale_)));
+        const int w = std::max(1, std::min(static_cast<int>(desc.width * scale_),
+                                           std::max(1, workW - margin * 2)));
+        const int h = std::max(1, std::min(static_cast<int>(desc.height * scale_),
+                                           std::max(1, workH - margin * 2)));
+        SetWindowPos(hwnd_, nullptr,
+                     mi.rcWork.left + (workW - w) / 2,
+                     mi.rcWork.top + (workH - h) / 2,
+                     w, h, SWP_NOZORDER | SWP_NOACTIVATE);
     }
-    // Tell the DWM the frame changed, or the removed non-client area is not
-    // recalculated until the first manual resize.
+    // Tell DWM the client area has no native frame. On first launch show the
+    // custom chrome maximised within the WORK area, never true fullscreen;
+    // Restore returns to the centred, draggable and resizable window above.
     SetWindowPos(hwnd_, nullptr, 0, 0, 0, 0,
                  SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
                      SWP_NOACTIVATE);
 
     if (!gl_.create(hwnd_, error)) {
+        gl_.shutdown();
         DestroyWindow(hwnd_);
         hwnd_ = nullptr;
         g_window = nullptr;
@@ -704,12 +739,21 @@ bool Win32Window::create(const WindowDesc& desc, std::string* error) {
     h_ = rc.bottom - rc.top;
 
     cursor_ = LoadCursorW(nullptr, IDC_ARROW);
-    ShowWindow(hwnd_, SW_SHOW);
+    ShowWindow(hwnd_, desc.startMaximised ? SW_SHOWMAXIMIZED : SW_SHOW);
+    // Recalculate non-client geometry after ShowWindow so maximised clients
+    // use rcWork rather than cached pre-maximise insets.
+    SetWindowPos(hwnd_, nullptr, 0, 0, 0, 0,
+                 SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                     SWP_NOACTIVATE);
+    GetClientRect(hwnd_, &rc);
+    w_ = rc.right - rc.left;
+    h_ = rc.bottom - rc.top;
     UpdateWindow(hwnd_);
     return true;
 }
 
 Win32Window::~Win32Window() {
+    gl_.shutdown(); // a DC must be released before DestroyWindow(HWND)
     if (hwnd_) DestroyWindow(hwnd_);
     if (g_window == this) g_window = nullptr;
 }

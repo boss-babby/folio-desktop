@@ -197,6 +197,9 @@ struct WindowDesc {
     int height = 900;
     int minWidth = 880;
     int minHeight = 560;
+    /// Desktop startup may fill the monitor work area without hiding taskbar.
+    /// A caller-specified --size can leave this false to open restored.
+    bool startMaximised = false;
     /// Folio always wants this false - see the note at the top of the file.
     bool systemDecorations = false;
 };

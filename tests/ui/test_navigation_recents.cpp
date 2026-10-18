@@ -19,6 +19,32 @@ using namespace folio::ui;
 using namespace folio::test;
 
 FOLIO_TEST_MAIN("navigation and persistent recents") {
+    section("integrated desktop title bar moves only from empty chrome");
+    {
+        FolioApp dragApp(1024.f, 720.f);
+        int moves = 0, toggles = 0;
+        FolioApp::HostServices titleHost;
+        titleHost.beginDragMove = [&] { ++moves; };
+        titleHost.toggleMaximise = [&] { ++toggles; };
+        titleHost.isMaximised = [&] { return toggles % 2 != 0; };
+        dragApp.setHostServices(std::move(titleHost));
+        PointerEvent title{};
+        title.phase = PointerPhase::Down;
+        title.button = MouseButton::Left;
+        title.pos = title.windowPos = {200.f, 20.f};
+        title.timestamp = 1.0;
+        dragApp.pointer(title);
+        check(moves == 1, "empty library title bar starts a native window drag");
+        title.clickCount = 2;
+        title.timestamp = 1.1;
+        dragApp.pointer(title);
+        check(toggles == 1, "double-click on empty title bar toggles maximise");
+        title.clickCount = 1;
+        title.windowPos = title.pos = {1024.f - 21.f, 20.f};
+        dragApp.pointer(title);
+        check(moves == 1, "close button never initiates a window drag");
+    }
+
     section("expanded Pages and Outline change actual left-panel content");
     FolioApp app(1440.f, 900.f);
     app.showScreen(Screen::Reader, 1.0);
@@ -213,13 +239,25 @@ FOLIO_TEST_MAIN("navigation and persistent recents") {
           "opened PDF path survives restart");
     check(reloaded.recents.front().progress > 0.4f,
           "real last-page progress survives restart");
+#if !defined(__ANDROID__)
+    check(reloaded.recents.front().meta.find("Original file") != std::string::npos &&
+          reloaded.recents.front().meta.find("Offline copy") == std::string::npos,
+          "desktop never claims an automatic offline PDF copy");
+#endif
     Button* manageStorage = nullptr;
     Button* documentStorage = nullptr;
     Popover* storageChooser = nullptr;
+#if defined(__ANDROID__)
+    const std::string manageLabel = "Manage each PDF's storage...";
+    const std::string documentLabel = "a real PDF.pdf · Keep copy";
+#else
+    const std::string manageLabel = "Manage library files...";
+    const std::string documentLabel = "a real PDF.pdf · Original file";
+#endif
     restoredPhone.root().forEach([&](Widget& w) {
         if (auto* b = dynamic_cast<Button*>(&w)) {
-            if (b->label == "Manage each PDF's storage...") manageStorage = b;
-            if (b->label.find("a real PDF.pdf · Keep copy") == 0) documentStorage = b;
+            if (b->label == manageLabel) manageStorage = b;
+            if (b->label.find(documentLabel) == 0) documentStorage = b;
         }
         if (auto* p = dynamic_cast<Popover*>(&w); p && p->frame.w == 312.f &&
             p->frame.h == 360.f) storageChooser = p;
@@ -230,7 +268,7 @@ FOLIO_TEST_MAIN("navigation and persistent recents") {
         manageStorage->onClick();
         restoredPhone.root().forEach([&](Widget& w) {
             if (auto* b = dynamic_cast<Button*>(&w);
-                b && b->label.find("a real PDF.pdf · Keep copy") == 0)
+                b && b->label.find(documentLabel) == 0)
                 documentStorage = b;
         });
         check(storageChooser->isOpen() && documentStorage,

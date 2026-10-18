@@ -175,6 +175,7 @@ void FolioApp::setHostServices(HostServices s) {
          {welcome_ ? welcome_->windowControls() : nullptr,
           reader_ ? reader_->windowControls() : nullptr}) {
         if (!wc) continue;
+        if (host_.isMaximised) wc->maximised = host_.isMaximised();
         if (host_.minimise) wc->onMinimise = host_.minimise;
         if (host_.toggleMaximise) {
             auto toggle = host_.toggleMaximise;
@@ -334,6 +335,27 @@ void FolioApp::showScreen(Screen s, double now) {
 bool FolioApp::pointer(const PointerEvent& e) {
     lastNow_ = e.timestamp;
     Widget::setClock(e.timestamp);
+    // The native Windows frame is intentionally hidden behind this UI. An
+    // empty part of the integrated title bar is still a real drag handle;
+    // never steal a tab, home button, window control or an open popover.
+    // The host performs the OS move/resize loop (Snap still works).
+    if (host_.beginDragMove && e.pointerType == PointerType::Mouse &&
+        e.phase == PointerPhase::Down && e.button == MouseButton::Left &&
+        e.windowPos.y >= 6.f && e.windowPos.y < tokens::size::titleBar &&
+        !openDlg_->isOpen() &&
+        !(target_ == Screen::Reader && state_.focusMode) &&
+        root_.hitTest(e.windowPos, 0.f) == nullptr) {
+        if (e.clickCount >= 2 && host_.toggleMaximise) {
+            host_.toggleMaximise();
+            for (WindowControls* wc : {welcome_->windowControls(),
+                                       reader_->windowControls()})
+                if (wc && host_.isMaximised) wc->maximised = host_.isMaximised();
+        } else {
+            host_.beginDragMove();
+        }
+        fullRepaint_ = true;
+        return true;
+    }
     // Do not wake the renderer for mouse moves within a stationary widget;
     // a 1000 Hz mouse otherwise repaints the entire GL framebuffer at 1000 Hz.
     // A hover transition or a consumed drag still needs a frame.

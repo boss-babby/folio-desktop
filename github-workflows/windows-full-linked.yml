@@ -1,0 +1,62 @@
+name: Folio Windows FULL (PDFium + Skia)
+
+# Canonical template lives here, separate from Android and Office-format work.
+# GitHub Actions only executes a COPY committed to .github/workflows/ on GitHub.
+# This job is manual-only so it will not duplicate release-windows.yml CI.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: folio-windows-full-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-windows-x64:
+    name: MSVC x64 / PDFium + Skia / annotations + Save As / CTest / ZIP
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - name: Check out this commit
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Check full-build prerequisites
+        shell: pwsh
+        run: |
+          if ($env:RUNNER_OS -ne 'Windows') { throw 'A real Windows runner is required' }
+          if (-not (Test-Path 'tools/build-windows-clean.ps1')) { throw 'Missing full Windows build script' }
+          if (-not (Test-Path 'tools/bootstrap-deps.ps1')) { throw 'Missing pinned PDFium/Skia bootstrap' }
+          cmake --version
+          if ($LASTEXITCODE -ne 0) { throw 'CMake is missing' }
+          # The script checks the actual VS/Win32 CMake configuration,
+          # PDFium and Skia libraries, required tests, PE GUI subsystem,
+          # bundled DLL/fonts and ZIP integrity. It stages dependencies,
+          # objects and tests in a unique Windows TEMP directory.
+
+      - name: Build the real GUI, run all tests and package only on success
+        shell: pwsh
+        run: |
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass `
+            -File tools/build-windows-clean.ps1 `
+            -Compiler MSVC `
+            -OutputPath (Join-Path $env:GITHUB_WORKSPACE 'Folio-windows-full-x64.zip')
+          if ($LASTEXITCODE -ne 0) { throw 'Full Windows build, tests or package check failed' }
+          $zip = Join-Path $env:GITHUB_WORKSPACE 'Folio-windows-full-x64.zip'
+          if (-not (Test-Path -LiteralPath $zip -PathType Leaf)) { throw 'Verified ZIP was not produced' }
+          $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  Folio-windows-full-x64.zip" | Set-Content -Path 'Folio-windows-full-x64.sha256' -Encoding ascii
+          Write-Host "SHA-256: $hash"
+
+      - name: Upload verified portable Windows build and checksum
+        uses: actions/upload-artifact@v4
+        with:
+          name: Folio-windows-full-x64
+          path: |
+            Folio-windows-full-x64.zip
+            Folio-windows-full-x64.sha256
+          if-no-files-found: error
+          retention-days: 30

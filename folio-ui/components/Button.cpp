@@ -152,7 +152,7 @@ void Button::onPaint(IPaintTarget& t, const PaintCtx& ctx) {
                                                         : tokens::space::gap;
     const auto ts = styleFor(compact ? tokens::type_small : tokens::type_body, fg);
     const float iconSz = (style == ButtonStyle::Window || style == ButtonStyle::Close)
-                             ? tokens::icon::sizeSmall
+                             ? (compact ? 11.f : tokens::icon::sizeSmall)
                              : tokens::icon::size;
 
     if (isWidthSample) {

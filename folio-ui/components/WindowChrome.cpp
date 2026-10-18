@@ -69,6 +69,11 @@ WindowControls::WindowControls(WindowPlatform plat) : plat_(plat) {
     close_ = emplace<Button>("", "close", ButtonStyle::Close);
     close_->debugName = "win.close";
     close_->onClick = [this] { if (onClose) onClose(); };
+    if (plat_ == WindowPlatform::Windows) {
+        // Keep the full-height, easy-to-hit caption buttons but make their
+        // drawn glyphs small and quiet like native Windows controls.
+        min_->compact = max_->compact = close_->compact = true;
+    }
 }
 
 float WindowControls::preferredWidth() const {

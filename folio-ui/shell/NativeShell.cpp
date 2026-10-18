@@ -230,6 +230,7 @@ int runNativeShell(const NativeShellOptions& opts) {
     desc.title = "Folio";
     desc.width = opts.width;
     desc.height = opts.height;
+    desc.startMaximised = opts.startMaximised;
 
     std::string err;
     auto window = plat::createWindow(desc, &err);
@@ -259,6 +260,19 @@ int runNativeShell(const NativeShellOptions& opts) {
 
     const std::string assetDir =
         opts.assetDir.empty() ? resolveAssetDir() : opts.assetDir;
+#if defined(_WIN32)
+    // A copied Folio.exe without its ZIP's assets can initially draw using
+    // host fonts, disguising an incomplete installation until PDF export or
+    // another feature needs the bundled fonts. Explain the broken layout.
+    if (!std::filesystem::is_regular_file(
+            std::filesystem::u8path(assetDir) / "fonts" / "DMSans-Variable.ttf")) {
+        MessageBoxW(nullptr,
+                    L"Folio's bundled fonts are missing. Extract the WHOLE "
+                    L"Windows ZIP and run Folio.exe beside pdfium.dll and "
+                    L"the assets folder; do not move only the EXE.",
+                    L"Incomplete Folio folder", MB_OK | MB_ICONWARNING);
+    }
+#endif
     render::skia::SkiaTextSystem::instance().initialise(assetDir + "/fonts");
 #if FOLIO_HAVE_PDFIUM_SOURCE
     engine::setPdfiumExportFontDirectory(assetDir + "/fonts");

@@ -143,8 +143,15 @@ RecentDoc recentFromPath(const std::string& path, int pages, int page) {
     r.pages = std::max(1, pages);
     const int current = std::clamp(page, 1, r.pages);
     r.progress = static_cast<float>(current - 1) / static_cast<float>(r.pages);
-    r.meta = std::to_string(r.pages) + " pages  ·  page " + std::to_string(current) +
-             (r.linked ? " · Source only" : " · Offline copy");
+    r.meta = std::to_string(r.pages) + " pages  ·  page " + std::to_string(current);
+#if defined(__ANDROID__)
+    r.meta += r.linked ? " · Source only" : " · Offline copy";
+#else
+    // Desktop opens the original filesystem path; it does NOT retain an
+    // automatic private PDF copy. Do not promise an offline copy that isn't
+    // there (the Folio annotation sidecar is stored separately).
+    r.meta += " · Original file";
+#endif
     return r;
 }
 }

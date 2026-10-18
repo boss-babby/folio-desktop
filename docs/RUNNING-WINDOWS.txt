@@ -8,9 +8,21 @@ Contents
     documents\     sample PDFs
 
 Running
-    Double-click Folio.exe. Keep the four items together - the exe looks
-    for assets\fonts next to itself, and Windows looks for pdfium.dll in
-    the same folder.
+    Extract the WHOLE ZIP into a folder, then double-click Folio.exe there.
+    Do not move Folio.exe alone to Pictures/Desktop: pdfium.dll and assets\fonts
+    must remain beside it. The integrated title bar starts maximised inside
+    the monitor work area (the taskbar stays visible); Restore returns to a
+    centred, resizable window. Drag its empty title bar/wordmark to move it;
+    double-click there to toggle maximisation.
+
+Troubleshooting an access violation
+    Run Folio.exe --software from PowerShell in the extracted ZIP folder. If
+    only the GPU version crashes, report that difference and your graphics
+    driver model. Folio attempts to save a local crash minidump under
+    %LOCALAPPDATA%\Folio\crashes\ on Windows. Dumps can include PDF text:
+    do not post one publicly; share privately only if you choose. Send the
+    exception code and whether --software also crashes. A passing CI test
+    suite cannot prove that a particular graphics driver/PDF will not crash.
 
 If SmartScreen blocks it
     The binary is unsigned, so "Windows protected your PC" is expected.
@@ -25,4 +37,6 @@ Known limitations in this build
       underlines, strikeouts, ink, notes, boxes and ellipses).
       Free text, stamps and signatures are refused rather than dropped.
       Save As does not rewrite the original; page-tree edits still need
-      PoDoFo. Edits not saved to a PDF remain session-only.
+      PoDoFo. Folio annotations persist in the private app-state sidecar even
+      if no exported PDF has been created. Desktop opens the ORIGINAL PDF
+      path and does not automatically keep a second offline PDF copy.

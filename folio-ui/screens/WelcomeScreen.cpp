@@ -235,7 +235,11 @@ void WelcomeScreen::buildMain() {
     }
 #endif
     auto* manage = settingsHost_->emplace<Button>(
+#if defined(__ANDROID__)
         "Manage each PDF's storage...", "folder-open", ButtonStyle::ListItem);
+#else
+        "Manage library files...", "folder-open", ButtonStyle::ListItem);
+#endif
     manage->onClick = [this] { openStorageList(); };
     settingsChoices_.push_back(manage);
 
@@ -267,7 +271,11 @@ void WelcomeScreen::refreshStorageList() {
     for (const RecentDoc& doc : state_.recents) {
         const std::string path = doc.path;
         auto* row = storageHost_->emplace<Button>(
+#if defined(__ANDROID__)
             doc.title + (doc.linked ? " · Source only" : " · Keep copy"),
+#else
+            doc.title + " · Original file",
+#endif
             "file-text", ButtonStyle::ListItem);
         row->onClick = [this, path, row] {
             const Point anchor = row->toWindow({row->frame.w * .5f, row->frame.h});
@@ -308,9 +316,15 @@ void WelcomeScreen::openCardMenu(const std::string& path, Point anchor, RecentCa
     menuChoices_[2]->enabled = false;
     menuChoices_[3]->enabled = false;
 #endif
+#if defined(__ANDROID__)
     menuChoices_[1]->label = linked ? "Keep offline copy" : "Offline copy retained";
     menuChoices_[2]->label = linked ? "Source only (active)" : "Use source only...";
     menuChoices_[3]->label = linked ? "Relink source PDF..." : "Relink unavailable PDF";
+#else
+    menuChoices_[1]->label = "No private PDF copy";
+    menuChoices_[2]->label = "Original file (active)";
+    menuChoices_[3]->label = "Relink not available";
+#endif
     cardMenu_->open(anchor, now());
 }
 

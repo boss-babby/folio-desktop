@@ -4,12 +4,34 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+#include <mutex>
 
 namespace folio::ui {
+namespace {
+// A screen can replace rows while the mouse still hovers/captures one of
+// them. Previously the router held the deleted raw Widget* until the next
+// click and dispatched a virtual Leave/Up into freed memory. Observing the
+// actual destructor covers every dynamically rebuilt list, not just recents.
+// The registry is process-lifetime so static widget teardown remains safe.
+struct RouterRegistry {
+    std::mutex mutex;
+    std::vector<EventRouter*> routers;
+};
+RouterRegistry& routerRegistry() {
+    static auto* registry = new RouterRegistry;
+    return *registry;
+}
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // Widget
 // ---------------------------------------------------------------------------
+
+Widget::~Widget() {
+    auto& registry = routerRegistry();
+    std::lock_guard lock(registry.mutex);
+    for (auto* router : registry.routers) router->forget(this);
+}
 
 Widget* Widget::adopt(std::unique_ptr<Widget> child) {
     if (!child) return nullptr;
@@ -164,6 +186,19 @@ void Widget::forEach(const std::function<void(Widget&)>& fn) {
 // EventRouter
 // ---------------------------------------------------------------------------
 
+EventRouter::EventRouter() {
+    auto& registry = routerRegistry();
+    std::lock_guard lock(registry.mutex);
+    registry.routers.push_back(this);
+}
+
+EventRouter::~EventRouter() {
+    auto& registry = routerRegistry();
+    std::lock_guard lock(registry.mutex);
+    auto& routers = registry.routers;
+    routers.erase(std::remove(routers.begin(), routers.end(), this), routers.end());
+}
+
 PointerEvent EventRouter::localise(const PointerEvent& e, Widget& target) {
     PointerEvent out = e;
     const Point origin = target.toWindow(Point{0.f, 0.f});
@@ -218,26 +253,33 @@ bool EventRouter::dispatchPointer(Widget& root, const PointerEvent& windowEvent)
     // separate cancellation to every captured finger before discarding them;
     // otherwise PageStage's gesture tracker keeps phantom contacts forever.
     if (e.phase == PointerPhase::Cancel) {
-        for (const auto& [id, hold] : touches_) {
-            if (!hold.target) continue;
+        // Callbacks may destroy their targets; remove captures FIRST so the
+        // destructor observer cannot invalidate this iteration.
+        while (!touches_.empty()) {
+            auto it = touches_.begin();
+            Widget* target = it->second.target;
+            const PointerId id = it->first;
+            touches_.erase(it);
+            if (!target) continue;
             PointerEvent cancel = e;
             cancel.pointerId = id;
             cancel.pointerType = PointerType::Touch;
-            hold.target->onPointer(localise(cancel, *hold.target));
-            hold.target->pressed = false;
+            target->pressed = false;
+            target->onPointer(localise(cancel, *target));
         }
-        touches_.clear();
         if (hover_) {
+            Widget* previous = hover_;
+            hover_ = nullptr;
             PointerEvent leave = e;
             leave.phase = PointerPhase::Leave;
-            hover_->hovered = false;
-            hover_->onPointer(localise(leave, *hover_));
-            hover_ = nullptr;
+            previous->hovered = false;
+            previous->onPointer(localise(leave, *previous));
         }
         if (capture_) {
-            capture_->onPointer(localise(e, *capture_));
-            capture_->pressed = false;
+            Widget* previous = capture_;
             capture_ = nullptr;
+            previous->pressed = false;
+            previous->onPointer(localise(e, *previous));
         }
         return true;
     }
@@ -285,22 +327,29 @@ bool EventRouter::dispatchPointer(Widget& root, const PointerEvent& windowEvent)
         }
         Widget* target = hold.target;
         if (!target) { touches_.erase(it); return false; }
-        const bool consumed = target->onPointer(localise(e, *target));
         if (e.phase == PointerPhase::Up) {
-            target->pressed = false;
+            // A card/menu callback may remove its widget on release. Erase
+            // capture and clear pressed while the pointer is still live.
             touches_.erase(it);
+            target->pressed = false;
         }
-        return consumed;
+        return target->onPointer(localise(e, *target));
     }
 
     // --- captured drag ----------------------------------------------------
     if (capture_) {
         Widget* target = capture_;
         PointerEvent le = localise(e, *target);
-        const bool consumed = target->onPointer(le);
-        if (e.phase == PointerPhase::Up) {
-            target->pressed = false;
+        const bool released = e.phase == PointerPhase::Up;
+        if (released) {
+            // An Up callback may delete its own row (Remove, tab close, or
+            // library rebuild). Drop capture *before* calling into it; never
+            // dereference target after the callback returns.
             capture_ = nullptr;
+            target->pressed = false;
+        }
+        const bool consumed = target->onPointer(le);
+        if (released) {
             // Re-evaluate hover: the pointer may have been released somewhere
             // else entirely.
             Widget* under = root.hitTest(e.windowPos, minTarget);

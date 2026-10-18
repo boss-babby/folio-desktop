@@ -73,7 +73,7 @@ struct PaintCtx {
 class Widget {
 public:
     Widget() = default;
-    virtual ~Widget() = default;
+    virtual ~Widget(); // notifies live event routers before pointer targets disappear
     Widget(const Widget&) = delete;
     Widget& operator=(const Widget&) = delete;
 
@@ -277,6 +277,11 @@ private:
 /// every first-draft UI gets wrong.
 class EventRouter {
 public:
+    EventRouter();
+    ~EventRouter();
+    EventRouter(const EventRouter&) = delete;
+    EventRouter& operator=(const EventRouter&) = delete;
+
     /// Smallest tappable edge length, in logical px, applied to touch
     /// input only. 44 is the figure Apple, Google (48 dp) and Microsoft
     /// all converge on; it is a field rather than a constant so a test

@@ -1,5 +1,27 @@
 # Windows chrome and access-violation triage
 
+## Follow-up: PDF opens, then first mouse click crashes in GPU and software modes
+
+The new reproduction sequence exposes a concrete UI use-after-free independent
+of the renderer. `FolioApp::recordOpen()` marks recents dirty; the next paint
+rebuilds the Home card grid while the pointer router may still be hovering or
+capturing the clicked RecentCard. The card is destroyed, but the router kept
+its raw pointer. The next mouse event then dispatched a virtual Leave/Up to
+freed memory. This matches the crash on the *first click after opening a PDF*
+and explains why both rendering modes fail. The Event Viewer exception code
+alone did not prove the stack, so the new Windows build still needs an actual
+on-device check.
+
+`Widget::~Widget()` now notifies registered event routers when a target is
+destroyed, clearing hover, capture, focus and touch references. Mouse and
+touch release paths drop capture before invoking callbacks that may delete
+their own widgets. `FolioApp::pointer()` snapshots the old hover damage before
+dispatch rather than dereferencing the old widget afterward. A regression
+opens a real PDF, rebuilds the hovered recents grid, and clicks the reader;
+AddressSanitizer passes. Linux/PDFium/no-Skia AddressSanitizer tests pass
+14/14 when excluding `engine.pdfium.export`, which requires the Skia shaping
+font backend and is unavailable in that deliberately no-Skia test lane.
+
 ## What was reproduced from source/screenshot
 
 - The 1440 × 900 default window was created at that size even on a smaller laptop; its right and bottom edges (including the Close button) could be outside the visible monitor.

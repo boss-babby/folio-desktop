@@ -19,6 +19,48 @@ using namespace folio::ui;
 using namespace folio::test;
 
 FOLIO_TEST_MAIN("navigation and persistent recents") {
+    section("destroyed hover/capture targets never receive a later PDF click");
+    {
+        Widget root;
+        root.setFrame(0.f, 0.f, 800.f, 600.f);
+        Widget* rows = root.emplace<Widget>();
+        rows->setFrame(0.f, 0.f, 800.f, 600.f);
+        Button* card = rows->emplace<Button>("recent PDF", "", ButtonStyle::Card);
+        card->setFrame(20.f, 60.f, 200.f, 180.f);
+        EventRouter events;
+        PointerEvent mouse{};
+        mouse.pos = mouse.windowPos = {40.f, 80.f};
+        mouse.phase = PointerPhase::Move;
+        events.dispatchPointer(root, mouse);
+        check(events.hovered() == card, "recent card owns mouse hover");
+        mouse.phase = PointerPhase::Down;
+        mouse.button = MouseButton::Left;
+        events.dispatchPointer(root, mouse);
+        check(events.focused() == card, "recent card owns pointer capture/focus");
+        // A recents refresh after opening a PDF destroys its card BEFORE
+        // the next native pointer event arrives. This used to leave a raw
+        // pointer in hover/capture and AV on the first click anywhere.
+        rows->removeAllChildren();
+        check(!events.hovered() && !events.focused(),
+              "row destruction invalidates hover and keyboard focus");
+        mouse.phase = PointerPhase::Up;
+        events.dispatchPointer(root, mouse);
+        auto* next = rows->emplace<Button>("reader control", "", ButtonStyle::Icon);
+        next->setFrame(20.f, 60.f, 200.f, 180.f);
+        mouse.phase = PointerPhase::Down;
+        events.dispatchPointer(root, mouse);
+        mouse.phase = PointerPhase::Up;
+        events.dispatchPointer(root, mouse);
+        check(events.hovered() == next, "subsequent reader click hits only the live control");
+        next->onClick = [&] { rows->removeAllChildren(); };
+        mouse.phase = PointerPhase::Down;
+        events.dispatchPointer(root, mouse);
+        mouse.phase = PointerPhase::Up;
+        events.dispatchPointer(root, mouse);
+        check(!events.hovered() && !events.focused(),
+              "a button may destroy itself on mouse release without leaving a dangling capture");
+    }
+
     section("integrated desktop title bar moves only from empty chrome");
     {
         FolioApp dragApp(1024.f, 720.f);
@@ -628,6 +670,57 @@ FOLIO_TEST_MAIN("navigation and persistent recents") {
           "portrait thumbnail list stops before the sheet footer and gesture bar");
 
 #if FOLIO_HAVE_PDFIUM_SOURCE
+    section("first click after opening a real PDF survives recents rebuild");
+    {
+        const fs::path actualPdf = fs::path(FOLIO_TEST_DATA_DIR) / "folio-test.pdf";
+        const fs::path recents = fs::temp_directory_path() / "folio-first-click-recents.txt";
+        fs::remove(recents);
+        {
+            FolioApp clicked(1200.f, 800.f);
+            clicked.loadRecents(recents.string());
+            clicked.state().rememberDocument(actualPdf.string(), 1, 1);
+            WelcomeScreen* welcome = nullptr;
+            ReaderScreen* reader = nullptr;
+            clicked.root().forEach([&](Widget& w) {
+                if (auto* s = dynamic_cast<WelcomeScreen*>(&w)) welcome = s;
+                if (auto* s = dynamic_cast<ReaderScreen*>(&w)) reader = s;
+            });
+            check(welcome && reader, "both screens exist before PDF open");
+            if (welcome && reader) {
+                welcome->refreshRecents(1.0);
+                RecentCard* card = nullptr;
+                clicked.root().forEach([&](Widget& w) {
+                    if (auto* c = dynamic_cast<RecentCard*>(&w)) card = c;
+                });
+                check(card != nullptr, "real PDF appears in recent cards");
+                if (card) {
+                    PointerEvent mouse{};
+                    mouse.phase = PointerPhase::Move;
+                    mouse.pos = mouse.windowPos = card->toWindow({40.f, 40.f});
+                    mouse.timestamp = 1.0;
+                    clicked.pointer(mouse); // hover a soon-to-be-destroyed card
+                    check(reader->openFile(actualPdf.string(), 2.0),
+                          "real PDF prepares for reader view");
+                    clicked.showScreen(Screen::Reader, 2.0);
+                    // This is what FolioApp::paint does on recentsDirty_ after
+                    // opening the file, while the old card is still hovered.
+                    welcome->refreshRecents(2.0);
+                    mouse.pos = mouse.windowPos = {600.f, 480.f};
+                    mouse.timestamp = 2.1;
+                    mouse.phase = PointerPhase::Down;
+                    mouse.button = MouseButton::Left;
+                    clicked.pointer(mouse);
+                    mouse.phase = PointerPhase::Up;
+                    mouse.timestamp = 2.2;
+                    clicked.pointer(mouse);
+                    check(reader->stage()->source() != nullptr,
+                          "PDF remains open after first reader click");
+                }
+            }
+        }
+        fs::remove(recents);
+    }
+
     section("selected-text popup stays up while choosing a markup colour");
     app.openFileFromHost(std::string(FOLIO_TEST_DATA_DIR) + "/folio-test.pdf");
     for (int i = 0; i < 500 && app.loadingDocument(); ++i) {

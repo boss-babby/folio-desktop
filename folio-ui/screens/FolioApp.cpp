@@ -368,7 +368,11 @@ bool FolioApp::pointer(const PointerEvent& e) {
     } else if (target_ == Screen::Welcome && e.phase == PointerPhase::Down) {
         welcome_->dismissSettingsIfOutside(e.windowPos, e.timestamp);
     }
-    const Widget* before = router_.hovered();
+    // A pointer handler can rebuild a list and delete the previously hovered
+    // widget. Capture its rectangle now; never inspect that raw pointer after
+    // dispatching a click/move into user callbacks.
+    const Rect beforeDamage = e.phase == PointerPhase::Move && !e.isTouch()
+        ? widgetDamage(router_.hovered()) : Rect{};
     const bool changed = router_.dispatchPointer(root_, e);
     if (changed || e.phase != PointerPhase::Move) {
         forceFrames_ = std::max(forceFrames_, 1);
@@ -379,7 +383,7 @@ bool FolioApp::pointer(const PointerEvent& e) {
             // A page pan/zoom is never classified as thumbOverlayOnly.
             pointerDamage_ = joinDamage(pointerDamage_, widgetDamage(reader_->stage()));
         } else if (e.phase == PointerPhase::Move && !e.isTouch()) {
-            pointerDamage_ = joinDamage(pointerDamage_, widgetDamage(before));
+            pointerDamage_ = joinDamage(pointerDamage_, beforeDamage);
             pointerDamage_ = joinDamage(pointerDamage_, widgetDamage(router_.hovered()));
             if (router_.hovered() && router_.hovered()->isDocumentCanvas())
                 fullRepaint_ = true; // scrollbar or page gesture is not chrome

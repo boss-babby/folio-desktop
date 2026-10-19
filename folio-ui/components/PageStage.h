@@ -99,6 +99,9 @@ public:
     /// Hint that the user is looking at `page`; async sources render
     /// outwards from there.
     virtual void setFocusPage(int /*page*/) {}
+    /// ALL canvas-visible reading pages, inclusive, not just the page at the
+    /// viewport's upper third. -1/-1 when in Grid or no page is visible.
+    virtual void setVisibleReadingPages(int /*first*/, int /*last*/) {}
     /// The open Pages panel's visible range, inclusive. -1/-1 when hidden.
     /// Canvas focus and sidebar focus are independent: a user may scroll
     /// thumbnails to page 90 while reading page 2.
@@ -159,7 +162,8 @@ public:
     [[nodiscard]] bool thumbOverlayOnly(double now) const noexcept;
     [[nodiscard]] Rect damageBounds() const override;
 
-    void setSource(std::shared_ptr<IPageSource> src, double now);
+    void setSource(std::shared_ptr<IPageSource> src, double now,
+                   bool restoringTab = false);
     [[nodiscard]] IPageSource* source() const noexcept { return source_.get(); }
     void setSwitchPreview(std::shared_ptr<const ViewportPreview> preview) {
         switchPreview_ = std::move(preview);
@@ -189,7 +193,19 @@ public:
         int page = 1;
     };
     [[nodiscard]] ViewState captureViewState(double now) const;
-    void restoreViewState(const ViewState& state, double now);
+    struct Placement { int index = 0; Rect rect; };
+    struct LayoutSnapshot {
+        std::vector<Placement> placed;
+        float contentW = 0.f, contentH = 0.f;
+        float viewportW = 0.f, viewportH = 0.f, scale = 0.f, gridSize = 0.f;
+        LayoutMode mode = LayoutMode::Single;
+        int rotation = 0, pageCount = 0;
+        std::uint64_t geometryRevision = 0;
+    };
+    /// Transfers the parked tab's lightweight page geometry, not its raster.
+    [[nodiscard]] LayoutSnapshot takeLayoutSnapshot(double now);
+    void restoreViewState(const ViewState& state, double now,
+                          LayoutSnapshot* cachedLayout = nullptr);
     /// Focus chrome and both page scrollbars have the same visibility gate.
     /// Hiding also disables their otherwise-invisible touch targets.
     void setFocusScrollbarsVisible(bool shown) noexcept {
@@ -247,10 +263,7 @@ public:
     [[nodiscard]] bool animating(double now) const override;
 
 private:
-    struct Placed {
-        int index = 0;
-        Rect rect;      // in content coordinates
-    };
+    using Placed = Placement; // in content coordinates
 
 public:
     // --- annotation editing -------------------------------------------------
@@ -268,6 +281,9 @@ public:
     /// The annotation under the cursor can be picked up with the Select
     /// tool, dragged, and deleted. 0 means nothing is selected.
     [[nodiscard]] std::uint64_t selectedAnnot() const noexcept { return selAnnot_; }
+    /// Anchor a desktop edit toolbar above the selected Folio mark, even
+    /// when its ink path has no annotation box or the page is rotated.
+    [[nodiscard]] bool selectedAnnotWindowAnchor(Point& out) const;
     void selectAnnot(std::uint64_t id) noexcept { selAnnot_ = id; }
     void deselectAnnot() noexcept { selAnnot_ = 0; }
     // --- free text -----------------------------------------------------------

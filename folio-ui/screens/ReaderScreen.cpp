@@ -1554,7 +1554,13 @@ void ReaderScreen::setLayoutMode(int index) {
 void ReaderScreen::closeOtherPopovers(const Popover* keep) {
     for (Popover* p : {toolColorPop_, toolSizePop_, toolOpacityPop_,
                        toolFontPop_, modePop_, findPop_, layoutPop_, zoomPop_,
-                       displayPop_, selPop_, toolOverflowPop_, shapePop_}) {
+                       displayPop_, selPop_, annotPop_, toolOverflowPop_, shapePop_}) {
+        // The selected mark's toolbar and its three option menus form one
+        // interaction; opening a second-tier choice keeps the toolbar up.
+        if (p == annotPop_ && annotPop_->isOpen() &&
+            optTarget_ == OptTarget::Annotation &&
+            (keep == toolColorPop_ || keep == toolSizePop_ ||
+             keep == toolOpacityPop_)) continue;
         // The selection palette and its colour picker form one interaction:
         // opening a colour must not discard the selected-text actions.
         if (p == selPop_ && keep == toolColorPop_ &&
@@ -2064,7 +2070,10 @@ void ReaderScreen::persistAnnotations() {
     if (activeDoc_ < 0 || activeDoc_ >= static_cast<int>(docs_.size())) return;
     const std::string& path = docs_[static_cast<std::size_t>(activeDoc_)].path;
     const std::string file = sidecarPath(path);
-    if (!file.empty()) annots_.saveSidecar(file, path);
+    if (!file.empty() &&
+        lastPersistedAnnotationRevision_ != annots_.revision() &&
+        annots_.saveSidecar(file, path))
+        lastPersistedAnnotationRevision_ = annots_.revision();
 }
 
 void ReaderScreen::commitComment() {
@@ -2099,10 +2108,30 @@ void ReaderScreen::onAnnotPicked(std::uint64_t id, bool fromTouch) {
             commentOriginal_ = commentField_->text;
         }
     }
+    closeAnnotationPopup();
     selectedAnnot_ = id;
     updateRightPanelContext();
     syncToolOptions();
     layoutTree(); // the selected mark collapses Hand/Select immediately
+#if !defined(__ANDROID__) && !defined(__EMSCRIPTEN__)
+    const Annotation* picked = id ? annots_.get(id) : nullptr;
+    if (annotPop_ && picked && picked->sourceIndex < 0 &&
+        !fromTouch && !sheetMode() && stage_->selectedAnnot() == id &&
+        stage_->selectedAnnotWindowAnchor(annotPopAnchor_)) {
+        const bool weight = picked->kind == AnnotKind::Ink ||
+            picked->kind == AnnotKind::Box || picked->kind == AnnotKind::Ellipse ||
+            picked->kind == AnnotKind::Line || picked->kind == AnnotKind::Arrow ||
+            picked->kind == AnnotKind::Stamp || picked->kind == AnnotKind::Signature ||
+            picked->kind == AnnotKind::Text;
+        annotPopBtns_[1]->acceptsPointer = weight;
+        annotPopBtns_[1]->opacity = weight ? 1.f : .36f;
+        annotPopBtns_[0]->isSwatch = true;
+        annotPopBtns_[0]->swatchColor = picked->color;
+        closeOtherPopovers(annotPop_);
+        annotPop_->windowSize = Size2{frame.w, frame.h};
+        annotPop_->open(annotPopAnchor_, now());
+    }
+#endif
 
     // Picking an existing mark is an explicit "I want to change this", and
     // on a phone the options are a sheet away rather than visible in a
@@ -2237,6 +2266,9 @@ void ReaderScreen::buildPopovers() {
     syncSchemeButtons();
 
     buildSelectionPopup();
+#if !defined(__ANDROID__) && !defined(__EMSCRIPTEN__)
+    buildAnnotationPopup();
+#endif
 
     gridSlider_ = displayPop_->emplace<Slider>(tokens::size::gridThumbMin,
                                                tokens::size::gridThumbMax,
@@ -2294,6 +2326,54 @@ void ReaderScreen::buildSelectionPopup() {
         closeSelectionPopup();
     };
     selBtns_.push_back(copy);
+}
+
+void ReaderScreen::buildAnnotationPopup() {
+    annotPop_ = emplace<Popover>();
+    annotPop_->preferAbove = true;
+    annotPop_->setFrame(0.f, 0.f, 172.f, 46.f);
+    static constexpr const char* icons[] = {
+        "", "stroke-weight", "opacity", "trash"};
+    static constexpr const char* tips[] = {
+        "Annotation colour", "Annotation width", "Annotation opacity", "Delete annotation here"};
+    for (int i = 0; i < 4; ++i) {
+        auto* b = annotPop_->emplace<Button>("", icons[i], ButtonStyle::Ghost);
+        b->tooltip = tips[i];
+        b->compact = true;
+        b->setFrame(5.f + i * 41.f, 4.f, 38.f, 38.f);
+        annotPopBtns_[static_cast<std::size_t>(i)] = b;
+    }
+    annotPopBtns_[0]->onClick = [this] {
+        if (!selectedAnnotation()) return;
+        optTarget_ = OptTarget::Annotation;
+        toolColorPop_->setZOrder(zlayer::popover + 1);
+        openOptPopover(toolColorPop_, annotPopBtns_[0]);
+    };
+    annotPopBtns_[1]->onClick = [this] {
+        if (!selectedAnnotation() || !annotPopBtns_[1]->acceptsPointer) return;
+        optTarget_ = OptTarget::Annotation;
+        toolSizePop_->setZOrder(zlayer::popover + 1);
+        openOptPopover(toolSizePop_, annotPopBtns_[1]);
+    };
+    annotPopBtns_[2]->onClick = [this] {
+        if (!selectedAnnotation()) return;
+        optTarget_ = OptTarget::Annotation;
+        toolOpacityPop_->setZOrder(zlayer::popover + 1);
+        openOptPopover(toolOpacityPop_, annotPopBtns_[2]);
+    };
+    annotPopBtns_[3]->onClick = [this] {
+        if (selectedAnnotation()) stage_->deleteSelectedAnnot();
+        closeAnnotationPopup();
+    };
+}
+
+void ReaderScreen::closeAnnotationPopup() {
+    if (!annotPop_) return;
+    if (annotPop_->isOpen()) annotPop_->close(now());
+    if (optTarget_ == OptTarget::Annotation) {
+        for (Popover* p : {toolColorPop_, toolSizePop_, toolOpacityPop_})
+            if (p && p->isOpen()) p->close(now());
+    }
 }
 
 void ReaderScreen::closeSelectionPopup() {
@@ -2958,8 +3038,10 @@ bool ReaderScreen::applyPageOp(const std::string& op) {
 }
 
 bool ReaderScreen::loadPath(const std::string& path, double now,
-                            std::shared_ptr<IPageSource> prepared) {
+                            std::shared_ptr<IPageSource> prepared,
+                            bool restoringTab) {
     closeSelectionPopup();
+    closeAnnotationPopup();
     searchNeedle_.clear();
     searchHits_.clear();
     searchIndex_ = -1;
@@ -2992,10 +3074,15 @@ bool ReaderScreen::loadPath(const std::string& path, double now,
     if (auto pdf = std::dynamic_pointer_cast<folio::engine::PdfiumPageSource>(src))
         pdf->setWakeCallback(onWorkerWake);
 #endif
-    stage_->setSource(src, now);
+    stage_->setSource(src, now, restoringTab);
     stage_->setPageTheme(state_.theme.pageTheme());
-    stage_->setZoomMode(ZoomMode::FitWidth, now);
-    stage_->snapZoomToTarget(now); // visible page requests at final scale on frame one
+    // A parked tab already has an exact view state. Fitting/relaying out its
+    // first page here only to restore its real page a moment later can walk
+    // thousands of pages twice on the UI thread.
+    if (!restoringTab) {
+        stage_->setZoomMode(ZoomMode::FitWidth, now);
+        stage_->snapZoomToTarget(now); // first open requests final scale
+    }
     notesScanCursor_ = 0;
     pdfNotesEntries_.clear();
     pdfNotesRefs_.clear();
@@ -3006,11 +3093,14 @@ bool ReaderScreen::loadPath(const std::string& path, double now,
     annots_.clear();
     annots_.resetVisibility();
     for (std::size_t i = 0; i < 12; ++i) layerItems_[i]->toggled = true;
-    annots_.loadSidecar(sidecarPath(path), path);
-#if FOLIO_HAVE_PDFIUM_SOURCE
-    syncImportedSuppression();
-    src->annotationsForPage(0); // first visible page; later pages on demand
-#endif
+    if (!restoringTab) {
+        annots_.loadSidecar(sidecarPath(path), path);
+        lastPersistedAnnotationRevision_ = annots_.revision();
+        syncImportedSuppression();
+        src->annotationsForPage(0); // first visible page; later pages on demand
+    }
+    // Restoring tabs use their authoritative in-memory annotation snapshot;
+    // no sidecar stat/read/parse or first-page metadata job on this hot path.
     selectedAnnot_ = 0;
     commentTarget_ = 0;
     if (commentField_) { commentField_->text.clear(); commentOriginal_.clear(); }
@@ -3063,7 +3153,9 @@ void ReaderScreen::stashActiveDoc() {
     stage_->commitText();
     commitComment();
     persistAnnotations();
-    d.annots = annots_.all();
+    d.annotationsPersisted =
+        lastPersistedAnnotationRevision_ == annots_.revision();
+    d.annots = annots_.takeAll();
     d.source = pageSource_;
     d.view = stage_->captureViewState(now());
     d.preview.reset();
@@ -3106,7 +3198,8 @@ void ReaderScreen::stashActiveDoc() {
 #endif
     d.page = stage_->currentPage();
     d.pages = pageCount_;
-    state_.rememberDocument(d.path, d.pages, d.page);
+    state_.rememberDocument(d.path, d.pages, d.page, true);
+    d.layout = stage_->takeLayoutSnapshot(now());
 }
 
 void ReaderScreen::setWorkerWakeCallback(std::function<void()> wake) {
@@ -3158,20 +3251,34 @@ void ReaderScreen::switchToDoc(int index, double now) {
     if (index == activeDoc_) return;
     stashActiveDoc();
     OpenDoc& d = docs_[static_cast<std::size_t>(index)];
-    if (!loadPath(d.path, now, d.source)) return;
+    if (!loadPath(d.path, now, d.source, d.hasView)) {
+        // A failed activation must never strand the previous tab's marks in
+        // its parked snapshot while the old canvas remains visible.
+        if (activeDoc_ >= 0) {
+            auto& prior = docs_[static_cast<std::size_t>(activeDoc_)];
+            annots_.restoreAll(std::move(prior.annots));
+            lastPersistedAnnotationRevision_ = prior.annotationsPersisted
+                ? annots_.revision() : ~std::uint64_t{0};
+            stage_->restoreViewState(prior.view, now, &prior.layout);
+        }
+        return;
+    }
     activeDoc_ = index;
     warmVisuals_.erase(std::remove_if(warmVisuals_.begin(), warmVisuals_.end(),
         [&](const auto& w) { auto p = w.lock(); return !p || p == d.source; }),
         warmVisuals_.end());
     // addExisting, not add: the ids have to survive a switch or any undo
     // entry still referring to them would resolve to nothing.
-    annots_.clear();
-    for (const Annotation& a : d.annots) annots_.addExisting(a);
+    if (d.hasView) {
+        annots_.restoreAll(std::move(d.annots));
+        lastPersistedAnnotationRevision_ = d.annotationsPersisted
+            ? annots_.revision() : ~std::uint64_t{0};
+    }
 #if FOLIO_HAVE_PDFIUM_SOURCE
-    // The in-memory tab snapshot is authoritative if the sidecar changed
-    // while this document was away. This is a no-op for the normal switch;
-    // only an actual imported-mark change invalidates the viewport raster.
-    syncImportedSuppression();
+    // This source already carries the imported-mark suppression last applied
+    // while the tab was active. The annotation snapshot cannot mutate while
+    // parked, so rebuilding a potentially huge suppression set is wasted.
+    if (!d.hasView) syncImportedSuppression();
 #endif
     if (d.hasView) {
         applyPageTheme(d.pageTheme);
@@ -3194,7 +3301,7 @@ void ReaderScreen::switchToDoc(int index, double now) {
     stage_->setFocusScrollbarsVisible(!d.focusMode || focusControlsVisible_);
         syncPhoneFabs();
         layoutTree(); // establish the destination viewport BEFORE restoring scroll
-        stage_->restoreViewState(d.view, now);
+        stage_->restoreViewState(d.view, now, &d.layout);
         stage_->setSwitchPreview(std::move(d.preview));
         thumbs_->restoreScrollY(d.thumbnailScroll);
         outline_->restoreScrollY(d.outlineScroll);
@@ -3207,7 +3314,7 @@ void ReaderScreen::switchToDoc(int index, double now) {
     } else {
         stage_->goToPage(d.page, now);
     }
-    state_.rememberDocument(d.path, pageCount_, stage_->currentPage());
+    state_.rememberDocument(d.path, pageCount_, stage_->currentPage(), true);
     // Undo history is per document and page-op undo writes bytes back to a
     // stored path, so carrying it across a switch could rewrite the wrong
     // file. Clearing is the conservative choice.
@@ -3259,7 +3366,16 @@ bool ReaderScreen::openPreparedFile(const std::string& path,
         }
     }
     stashActiveDoc();
-    if (!loadPath(path, now, std::move(prepared))) return false;
+    if (!loadPath(path, now, std::move(prepared))) {
+        if (activeDoc_ >= 0) {
+            auto& prior = docs_[static_cast<std::size_t>(activeDoc_)];
+            annots_.restoreAll(std::move(prior.annots));
+            lastPersistedAnnotationRevision_ = prior.annotationsPersisted
+                ? annots_.revision() : ~std::uint64_t{0};
+            stage_->restoreViewState(prior.view, now, &prior.layout);
+        }
+        return false;
+    }
     OpenDoc d;
     d.path = path;
     d.title = docTitle_;
@@ -3440,6 +3556,17 @@ void ReaderScreen::handleOutsideClick(Point windowPoint, double now) {
         return windowPoint.x >= o.x && windowPoint.x < o.x + w->frame.w &&
                windowPoint.y >= o.y && windowPoint.y < o.y + w->frame.h;
     };
+    if (annotPop_ && annotPop_->isOpen()) {
+        const bool onBar = within(annotPop_);
+        const bool onOptions = (toolColorPop_->isOpen() && within(toolColorPop_)) ||
+            (toolSizePop_->isOpen() && within(toolSizePop_)) ||
+            (toolOpacityPop_->isOpen() && within(toolOpacityPop_));
+        if (!onBar && !onOptions) closeAnnotationPopup();
+        else if (onBar && !onOptions) {
+            for (Popover* p : {toolColorPop_, toolSizePop_, toolOpacityPop_})
+                if (p->isOpen()) p->close(now);
+        }
+    }
     if (selPop_ && selPop_->isOpen()) {
         const bool onSelection = within(selPop_);
         const bool onColour = toolColorPop_->isOpen() && within(toolColorPop_);
@@ -4362,6 +4489,27 @@ void ReaderScreen::syncNotes() {
 void ReaderScreen::onPaint(IPaintTarget& t, const PaintCtx& ctx) {
     auto* self = const_cast<ReaderScreen*>(this);
     if (notes_ && notes_->visible) self->syncNotes();
+    if (annotPop_ && annotPop_->isOpen()) {
+        const Annotation* a = selectedAnnot_ ? annots_.get(selectedAnnot_) : nullptr;
+        Point anchor{};
+        if (!a || a->sourceIndex >= 0 || !stage_ ||
+            stage_->selectedAnnot() != selectedAnnot_ ||
+            !stage_->selectedAnnotWindowAnchor(anchor)) {
+            self->closeAnnotationPopup();
+        } else if (std::fabs(anchor.x - annotPopAnchor_.x) > .5f ||
+                   std::fabs(anchor.y - annotPopAnchor_.y) > .5f) {
+            const float dx = anchor.x - annotPopAnchor_.x;
+            const float dy = anchor.y - annotPopAnchor_.y;
+            annotPop_->frame.x = std::clamp(annotPop_->frame.x + dx, 8.f,
+                std::max(8.f, frame.w - annotPop_->frame.w - 8.f));
+            annotPop_->frame.y = std::clamp(annotPop_->frame.y + dy, 8.f,
+                std::max(8.f, frame.h - annotPop_->frame.h - 8.f));
+            self->annotPopAnchor_ = anchor;
+            // A detached option card should not remain where the mark was.
+            for (Popover* p : {toolColorPop_, toolSizePop_, toolOpacityPop_})
+                if (p && p->isOpen()) p->close(ctx.now);
+        }
+    }
 
     if (state_.focusMode && state_.autoHideFocusControls &&
         focusControlsVisible_ && focusTouches_.empty() &&

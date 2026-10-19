@@ -723,6 +723,10 @@ int runNativeShell(const NativeShellOptions& opts) {
             }
             dirty = false;
             lastPresented = seconds();
+            // A tab click only updates the in-memory recent list. Commit the
+            // small durable index after its new viewport is on screen, not
+            // in the tab's pointer callback (which also avoids two writes).
+            app.state().flushPendingRecents();
         }
 
 #if defined(__ANDROID__)

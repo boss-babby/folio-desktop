@@ -507,6 +507,66 @@ FOLIO_TEST_MAIN("mobile input and layouts") {
     check(modes.currentPage() == 18,
           "round-trip through all layouts keeps selected page and skips entrance replay");
 
+    section("zoom completion schedules its own sharp-scale frame without a click");
+    struct ZoomRasterProbe final : IPageSource {
+        std::vector<float> scales;
+        int pageCount() const override { return 1; }
+        PageSizePt pageSize(int) const override { return {612.f, 792.f}; }
+        bool cachesOwnRasters() const override { return true; }
+        void drawPage(IPaintTarget&, int, const Rect&, float, PageTheme) override {}
+        void drawVisiblePage(IPaintTarget&, int, const Rect&, const Rect&,
+                             float scale, PageTheme) override { scales.push_back(scale); }
+    };
+    auto zoomProbe = std::make_shared<ZoomRasterProbe>();
+    PageStage sharpZoom;
+    sharpZoom.setFrame(0, 0, 390, 640);
+    sharpZoom.setSource(zoomProbe, 0);
+    sharpZoom.setZoom(0.5f, 0);
+    GesturePaint zoomPaint;
+    sharpZoom.onPaint(zoomPaint, {tokens::kLight, 1.0, 1.f});
+    sharpZoom.setZoom(1.0f, 2.0);
+    sharpZoom.onPaint(zoomPaint, {tokens::kLight, 2.08, 1.f});
+    const float animatedRasterScale = zoomProbe->scales.back();
+    // No input event at 2.16: the frame loop must call needsFrame here and
+    // issue a final-scale tile request, then return to zero idle frames.
+    check(sharpZoom.animating(2.16),
+          "settled zoom asks for the final raster frame without pointer input");
+    sharpZoom.onPaint(zoomPaint, {tokens::kLight, 2.16, 1.f});
+    check(zoomProbe->scales.back() > animatedRasterScale * 1.8f &&
+              !sharpZoom.animating(2.17),
+          "the automatic final frame requests sharp tiles and then sleeps");
+
+    section("parked long-document geometry restores without per-page PDF metadata locks");
+    struct LayoutProbe final : IPageSource {
+        mutable int sizeReads = 0;
+        int pageCount() const override { return 6000; }
+        PageSizePt pageSize(int) const override { ++sizeReads; return {612.f, 792.f}; }
+        void drawPage(IPaintTarget&, int, const Rect&, float, PageTheme) override {}
+    };
+    auto layoutProbe = std::make_shared<LayoutProbe>();
+    PageStage cachedLayout;
+    cachedLayout.setFrame(0, 0, 390, 640);
+    cachedLayout.setSource(layoutProbe, 0);
+    cachedLayout.setZoom(0.5f, 0);
+    cachedLayout.onPaint(zoomPaint, {tokens::kLight, 1., 1.f});
+    const auto cachedView = cachedLayout.captureViewState(1.);
+    auto geometry = cachedLayout.takeLayoutSnapshot(1.);
+    check(geometry.placed.size() == 6000 && layoutProbe->sizeReads >= 6000,
+          "first layout resolves long document geometry exactly once");
+    cachedLayout.setSource(std::make_shared<PlaceholderPageSource>(2), 1.1);
+    cachedLayout.setSource(layoutProbe, 2., true);
+    const int beforeRestore = layoutProbe->sizeReads;
+    cachedLayout.restoreViewState(cachedView, 2., &geometry);
+    check(layoutProbe->sizeReads == beforeRestore && geometry.placed.empty(),
+          "ready tab reuses its lightweight layout without blocking on PDF metadata");
+    auto changedGeometry = cachedLayout.takeLayoutSnapshot(2.);
+    cachedLayout.setFrame(0, 0, 420, 640);
+    cachedLayout.setSource(layoutProbe, 3., true);
+    const int beforeResize = layoutProbe->sizeReads;
+    cachedLayout.restoreViewState(cachedView, 3., &changedGeometry);
+    check(layoutProbe->sizeReads >= beforeResize + 6000,
+          "different viewport rejects stale layout and rebuilds correct hit targets");
+
     section("returning tab shows a bounded actual-viewport snapshot until pixels are ready");
     auto proxySource = std::make_shared<PreviewProbe>();
     PageStage proxyStage;
@@ -633,6 +693,15 @@ FOLIO_TEST_MAIN("mobile input and layouts") {
     many.replace(id, moved);
     check(many.countOn(35) == 59 && many.countOn(36) == 61,
           "moving an annotation to another page invalidates the bucket index");
+    const Annotation* residentMarks = many.all().data();
+    auto parkedMarks = many.takeAll();
+    check(many.count() == 0 && parkedMarks.data() == residentMarks &&
+              parkedMarks.size() == 12000,
+          "parking a marked tab transfers annotations without O(n squared) re-insertion");
+    many.restoreAll(std::move(parkedMarks));
+    check(many.all().data() == residentMarks && many.countOn(36) == 61 &&
+              many.count() == 12000,
+          "restoring a parked tab preserves mark identities and lazy page index");
 
     section("rotate view keeps PDF aspect ratio and inverse touch coordinates");
     struct RotationSource final : IPageSource {

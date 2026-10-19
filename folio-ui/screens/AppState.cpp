@@ -157,6 +157,7 @@ RecentDoc recentFromPath(const std::string& path, int pages, int page) {
 }
 
 void AppState::loadRecents(std::string file) {
+    flushPendingRecents();
     recentStateFile = std::move(file);
     recents.clear();
     autoHideFocusControls = true; // old V1 files have no preference row
@@ -197,13 +198,42 @@ void AppState::loadRecents(std::string file) {
     }
 }
 
-void AppState::rememberDocument(const std::string& path, int pages, int page) {
+void AppState::rememberDocument(const std::string& path, int pages, int page,
+                                bool deferSave) {
     if (path.empty()) return;
+    const auto it = std::find_if(recents.begin(), recents.end(),
+                                 [&](const RecentDoc& r) { return r.path == path; });
+    RecentDoc recent;
+    if (deferSave && it != recents.end()) {
+        // A parked tab is already known to be open: no provider/sidecar stat
+        // and no storage write on the input path. Save after presentation.
+        recent = *it;
+        recent.pages = std::max(1, pages);
+        const int current = std::clamp(page, 1, recent.pages);
+        recent.progress = static_cast<float>(current - 1) /
+                          static_cast<float>(recent.pages);
+        recent.meta = std::to_string(recent.pages) + " pages  ·  page " +
+                      std::to_string(current);
+#if defined(__ANDROID__)
+        recent.meta += recent.linked ? " · Source only" : " · Offline copy";
+#else
+        recent.meta += " · Original file";
+#endif
+    } else {
+        recent = recentFromPath(path, pages, page);
+    }
     recents.erase(std::remove_if(recents.begin(), recents.end(),
                                 [&](const RecentDoc& r) { return r.path == path; }),
                   recents.end());
-    recents.insert(recents.begin(), recentFromPath(path, pages, page));
+    recents.insert(recents.begin(), std::move(recent));
     if (recents.size() > kMaxRecentDocs) recents.resize(kMaxRecentDocs);
+    if (deferSave) recentsPending_ = true;
+    else { saveRecents(); recentsPending_ = false; }
+}
+
+void AppState::flushPendingRecents() {
+    if (!recentsPending_) return;
+    recentsPending_ = false;
     saveRecents();
 }
 

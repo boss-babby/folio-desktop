@@ -469,6 +469,10 @@ private:
     std::vector<Button*> zoomPresetItems_;
     WindowControls* winCtl_ = nullptr;
     Popover* selPop_ = nullptr;
+    /// Desktop-only floating actions for a selected Folio annotation.
+    Popover* annotPop_ = nullptr;
+    std::array<Button*, 4> annotPopBtns_{}; // colour, width, opacity, delete
+    Point annotPopAnchor_{};
     std::vector<Button*> selBtns_;
     Button* selColorBtn_ = nullptr;
     // Icon-only: four 36px cells plus padding. The labelled version was
@@ -477,6 +481,8 @@ private:
     static constexpr float kSelPopW = 224.f;
     static constexpr float kSelPopH = 44.f;
     void buildSelectionPopup();
+    void buildAnnotationPopup();
+    void closeAnnotationPopup();
     void closeSelectionPopup();
     void applyTextMarkup(AnnotKind kind);
 
@@ -527,6 +533,7 @@ private:
         std::shared_ptr<IPageSource> source;
         std::shared_ptr<const ViewportPreview> preview;
         PageStage::ViewState view{};
+        PageStage::LayoutSnapshot layout{};
         PageTheme pageTheme = PageTheme::Light;
         std::uint64_t selectedAnnot = 0;
         float thumbnailScroll = 0.f;
@@ -536,11 +543,15 @@ private:
         bool rightCollapsed = true;
         bool focusMode = false;
         bool hasView = false;
+        bool annotationsPersisted = false;
         int page = 1;
         int pages = 1;
     };
     std::vector<OpenDoc> docs_;
     int activeDoc_ = -1;
+    // Annotation revisions are per active tab. A switch never rewrites an
+    // unchanged sidecar; failed writes remain dirty and are retried.
+    std::uint64_t lastPersistedAnnotationRevision_ = ~std::uint64_t{0};
     // Closing a busy document must not join its PDFium worker on the UI
     // thread. Futures own retired sources until cleanup finishes; their
     // destruction at application shutdown still waits for safe teardown.
@@ -549,7 +560,8 @@ private:
     void reapRetiredSources();
     /// Load a file into the view. Does not touch the tab strip or `docs_`.
     bool loadPath(const std::string& path, double now,
-                  std::shared_ptr<IPageSource> prepared = {});
+                  std::shared_ptr<IPageSource> prepared = {},
+                  bool restoringTab = false);
     /// Copy the live annotations and page number into `docs_[activeDoc_]`.
     void stashActiveDoc();
     void switchToDoc(int index, double now);

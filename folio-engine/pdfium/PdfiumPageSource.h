@@ -97,6 +97,7 @@ public:
         return worker_->geometryRevision();
     }
     void setFocusPage(int page) override;
+    void setVisibleReadingPages(int first, int last) override;
     [[nodiscard]] bool cachesOwnRasters() const override { return true; }
 
     // --- text layer ---------------------------------------------------------
@@ -248,6 +249,10 @@ private:
     std::unordered_set<int>                             adjacentPreviewQueued_;
     int                                                 scrollDirection_ = 1;
     int                                                 focusPage_ = -1;
+    int                                                 readingFirst_ = -1, readingLast_ = -1;
+    [[nodiscard]] bool visibleReadingPage(int p) const noexcept {
+        return readingFirst_ >= 0 && p >= readingFirst_ && p <= readingLast_;
+    }
     int                                                 thumbnailFirst_ = -1;
     int                                                 thumbnailLast_ = -1;
     [[nodiscard]] bool visibleThumbnail(int page, int width) const noexcept {

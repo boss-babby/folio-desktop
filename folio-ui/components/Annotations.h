@@ -208,6 +208,21 @@ public:
     }
 
     [[nodiscard]] const std::vector<Annotation>& all() const noexcept { return items_; }
+    /// Move an already indexed tab's annotations out and back without
+    /// copying every stroke or calling addExisting (which scans by id).
+    /// Both calls are on the UI thread; nextId_ stays monotonic across tabs.
+    [[nodiscard]] std::vector<Annotation> takeAll() noexcept {
+        auto snapshot = std::move(items_);
+        items_.clear();
+        ++revision_;
+        ++indexEpoch_;
+        return snapshot;
+    }
+    void restoreAll(std::vector<Annotation>&& snapshot) noexcept {
+        items_ = std::move(snapshot);
+        ++revision_;
+        ++indexEpoch_;
+    }
     bool saveSidecar(const std::string& file, const std::string& document) const;
     bool loadSidecar(const std::string& file, const std::string& document);
     [[nodiscard]] std::vector<const Annotation*> forPage(int page) const;

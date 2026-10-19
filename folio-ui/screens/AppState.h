@@ -129,10 +129,15 @@ struct AppState {
     /// A small, bounded list of real files. The shell supplies a per-user
     /// state file (Android's internal files directory on mobile).
     void loadRecents(std::string file);
-    void rememberDocument(const std::string& path, int pages, int page = 1);
+    void rememberDocument(const std::string& path, int pages, int page = 1,
+                          bool deferSave = false);
     void forgetDocument(const std::string& path);
     void saveRecents() const;
+    void flushPendingRecents();
+    ~AppState() { flushPendingRecents(); }
     std::string recentStateFile;
+private:
+    bool recentsPending_ = false;
 };
 
 }  // namespace folio::ui

@@ -483,6 +483,7 @@ void StreamShell::renderOnce(double now) {
         ++stats_.frames;
     }
     publish(std::move(jpeg));
+    app_.state().flushPendingRecents();
 }
 
 void StreamShell::publish(std::vector<std::uint8_t> jpeg) {

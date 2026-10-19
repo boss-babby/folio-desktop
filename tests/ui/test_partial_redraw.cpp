@@ -199,8 +199,11 @@ FOLIO_TEST_MAIN("retained chrome redraw") {
     zoomStage.paintTree(target, PaintCtx{ctx.pal, 12.22, 1.f});
     check(!zoomProbe->draws.empty() &&
           std::fabs(zoomProbe->draws.front().dest.w - 374.f) < 2.f &&
-          !zoomStage.animating(12.22),
-          "Fit width follows an animated desktop panel without lagging zoom tail");
+          zoomStage.animating(12.22),
+          "Fit width follows the panel immediately and schedules final sharp raster");
+    zoomStage.paintTree(target, PaintCtx{ctx.pal, 12.24, 1.f});
+    check(!zoomStage.animating(12.24),
+          "panel fit adopts the new raster scale once, then sleeps");
 
     section("panel content stays inside the moving edge on a real Skia surface");
     struct OutsideChild : Widget {

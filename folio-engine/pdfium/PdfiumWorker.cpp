@@ -261,6 +261,7 @@ void PdfiumWorker::retainQueuedTiles(
 void PdfiumWorker::suspendVisualWork() {
     std::lock_guard<std::mutex> lk(m_);
     ++visualEpoch_;
+    canvasFirst_ = canvasLast_ = -1;
     tileQueue_.clear();
     renderQueue_.clear();
     textQueue_.clear();
@@ -350,6 +351,12 @@ bool PdfiumWorker::busy() const {
            (outlinePending_ && firstRenderDone_) || !done_.empty();
 }
 
+void PdfiumWorker::setVisibleCanvasRange(int first, int last) {
+    std::lock_guard<std::mutex> lk(m_);
+    canvasFirst_ = first;
+    canvasLast_ = last;
+}
+
 void PdfiumWorker::setThumbnailRange(int first, int last) {
     std::lock_guard<std::mutex> lk(m_);
     if (first == thumbnailFirst_ && last == thumbnailLast_) return;
@@ -362,7 +369,9 @@ void PdfiumWorker::setThumbnailRange(int first, int last) {
             (job.page < first || job.page > last) &&
             std::abs(job.page - focus) > 2 &&
             !(gridBufferFirst_ >= 0 && job.page >= gridBufferFirst_ &&
-              job.page <= gridBufferLast_))
+              job.page <= gridBufferLast_) &&
+            !(canvasFirst_ >= 0 && job.page >= canvasFirst_ &&
+              job.page <= canvasLast_))
             it = renderQueue_.erase(it);
         else ++it;
     }
@@ -392,12 +401,17 @@ void PdfiumWorker::dropQueuedOutside(int page, int radius) {
                                   job.page >= thumbnailFirst_ && job.page <= thumbnailLast_;
         const bool grid = gridBufferFirst_ >= 0 &&
                           job.page >= gridBufferFirst_ && job.page <= gridBufferLast_;
-        it = std::abs(job.page - page) > radius && !visibleThumb && !grid
+        const bool canvas = canvasFirst_ >= 0 && job.page >= canvasFirst_ &&
+                            job.page <= canvasLast_;
+        it = std::abs(job.page - page) > radius && !visibleThumb && !grid && !canvas
             ? renderQueue_.erase(it) : std::next(it);
     }
-    for (auto it = tileQueue_.begin(); it != tileQueue_.end();)
-        it = std::abs(it->second.page - page) > radius ? tileQueue_.erase(it)
-                                                       : std::next(it);
+    for (auto it = tileQueue_.begin(); it != tileQueue_.end();) {
+        const int p = it->second.page;
+        const bool canvas = canvasFirst_ >= 0 && p >= canvasFirst_ && p <= canvasLast_;
+        it = std::abs(p - page) > radius && !canvas ? tileQueue_.erase(it)
+                                                   : std::next(it);
+    }
 }
 
 /// Pick the outstanding job closest to the page the user is looking at.
@@ -439,9 +453,21 @@ bool PdfiumWorker::takeNextJob(Job& out) {
             return true;
         }
     }
-    // Later pages initially advertise page-one dimensions. Resolve the
-    // focused page's actual geometry before allocating its preview/tiles;
-    // it is a single cheap metadata job, not a scan of all PDF pages.
+    // Continuous/TwoUp can show several PDF pages at once. Their real page
+    // sizes and bounded previews must precede even the focused page's sharp
+    // tiles. Page labels still follow focus; render priority follows *sight*.
+    if (canvasFirst_ >= 0) {
+        auto best = metaQueue_.end();
+        for (auto it = metaQueue_.lower_bound(canvasFirst_);
+             it != metaQueue_.end() && it->first <= canvasLast_; ++it)
+            if (best == metaQueue_.end() ||
+                std::abs(it->first - focus) < std::abs(best->first - focus)) best = it;
+        if (best != metaQueue_.end()) {
+            out = std::move(best->second);
+            metaQueue_.erase(best);
+            return true;
+        }
+    }
     if (auto it = metaQueue_.find(focus); it != metaQueue_.end()) {
         out = std::move(it->second);
         metaQueue_.erase(it);
@@ -454,6 +480,20 @@ bool PdfiumWorker::takeNextJob(Job& out) {
         if (it->second.visiblePreview && it->second.page == focus) {
             out = std::move(it->second);
             renderQueue_.erase(it);
+            return true;
+        }
+    }
+    if (canvasFirst_ >= 0) {
+        auto best = renderQueue_.end();
+        for (auto it = renderQueue_.begin(); it != renderQueue_.end(); ++it) {
+            const Job& j = it->second;
+            if (!j.visiblePreview || j.page < canvasFirst_ || j.page > canvasLast_) continue;
+            if (best == renderQueue_.end() ||
+                std::abs(j.page - focus) < std::abs(best->second.page - focus)) best = it;
+        }
+        if (best != renderQueue_.end()) {
+            out = std::move(best->second);
+            renderQueue_.erase(best);
             return true;
         }
     }

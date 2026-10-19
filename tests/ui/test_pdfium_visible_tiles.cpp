@@ -253,6 +253,44 @@ FOLIO_TEST_MAIN("visible-only tiles and tab lifetime") {
         if (im.fit == IPaintTarget::ImageFit::Final)
             check(im.w <= 512 && im.h <= 512,
                   "main canvas stores only 512-device-pixel final tiles");
+    section("reading viewport prioritises every intersecting page, not just focus");
+    {
+        folio::engine::PdfiumPageSource reading;
+        Spy readingSpy;
+        check(reading.open("folio-grid.pdf") && reading.pageCount() == 36,
+              "multi-page reading fixture opens");
+        reading.setVisibleReadingPages(1, 5);
+        reading.setFocusPage(1); // page 5 is beyond the old focus +/-2 window
+        const Rect hugePage{0.f, 0.f, 9792.f, 12672.f};
+        const Rect strip{4096.f, 4096.f, 700.f, 60.f};
+        bool allPreviews = false;
+        const auto until = std::chrono::steady_clock::now() +
+                           std::chrono::seconds(12);
+        do {
+            reading.beginVisibleFrame();
+            reading.tick();
+            readingSpy.images.clear();
+            for (int p = 1; p <= 5; ++p)
+                reading.drawVisiblePage(readingSpy, p, hugePage, strip, 16.f,
+                                        folio::ui::PageTheme::Light);
+            reading.endVisibleFrame();
+            allPreviews = true;
+            for (int p = 1; p <= 5; ++p)
+                allPreviews &= reading.hasCachedPageProxy(p);
+            if (!allPreviews)
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        } while (!allPreviews && std::chrono::steady_clock::now() < until);
+        check(allPreviews, "each partly visible page gets a bounded preview before tile backlog");
+        check(reading.pageSize(5).w == 612.f,
+              "distant visible page receives its real geometry");
+        check(reading.cacheStats().bytes <= 48u * 1024u * 1024u,
+              "reading previews and sharp visible tiles stay within source budget");
+        reading.setVisibleReadingPages(-1, -1);
+        reading.suspendVisualCaches();
+        check(!reading.hasCachedPageProxy(5),
+              "inactive reading tab releases far-page preview");
+    }
+
     section("grid viewport keeps all visible pages, even >2 from focus, in small rasters");
     {
         folio::engine::PdfiumPageSource gridPdf;
@@ -1128,6 +1166,11 @@ FOLIO_TEST_MAIN("visible-only tiles and tab lifetime") {
         circle.box = {.18f, .25f, .3f, .22f};
         const auto circleId = shapeStore.add(circle);
         hollow.selectAnnot(circleId);
+        Point toolbarAnchor{};
+        check(hollow.selectedAnnotWindowAnchor(toolbarAnchor) &&
+                  std::isfinite(toolbarAnchor.x) && std::isfinite(toolbarAnchor.y) &&
+                  toolbarAnchor.y < screen(.48f, .47f).y,
+              "selected mark supplies a visible anchor above its rotated/placed geometry");
         const Point blank = screen(.78f, .73f);
         hollow.onPointer(finger(folio::ui::PointerPhase::Down, 84, blank, 5.));
         hollow.onPointer(finger(folio::ui::PointerPhase::Move, 84,

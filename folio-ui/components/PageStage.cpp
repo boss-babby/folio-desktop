@@ -216,7 +216,8 @@ PageStage::PageStage() {
     source_ = std::make_shared<PlaceholderPageSource>();
 }
 
-void PageStage::setSource(std::shared_ptr<IPageSource> src, double now) {
+void PageStage::setSource(std::shared_ptr<IPageSource> src, double now,
+                          bool restoringTab) {
     // Selection indices are document-specific. Carrying them to a new PDF
     // painted hundreds of unrelated glyph-line rectangles over ordinary
     // text (and could even index beyond the new text layer).
@@ -256,7 +257,10 @@ void PageStage::setSource(std::shared_ptr<IPageSource> src, double now) {
     barTouchHeld_ = barTrackPress_ = false;
     touchPanning_ = touchDrawing_ = pinchWasActive_ = false;
     lastLayoutW_ = 0.f;  // force relayout
-    replayEntrance(now);
+    // The parked tab has its own viewport and view state. Building an
+    // entrance timeline for every page only to discard it on restore is
+    // linear in document size and delays even a ready snapshot.
+    if (!restoringTab) replayEntrance(now);
 }
 
 void PageStage::replayEntrance(double now) {
@@ -404,7 +408,32 @@ PageStage::ViewState PageStage::captureViewState(double now) const {
     return v;
 }
 
-void PageStage::restoreViewState(const ViewState& v, double now) {
+PageStage::LayoutSnapshot PageStage::takeLayoutSnapshot(double now) {
+    LayoutSnapshot result;
+    // A settled, fully laid-out frame can be restored without touching the
+    // PDFium worker mutex once per page. Never reuse geometry from a moving
+    // zoom or from metadata that changed after the last paint.
+    if (!source_ || placed_.empty() || geometryChanged() ||
+        zoomAnim_.active(now) || rotationAnim_.active(now) ||
+        std::fabs(lastLayoutW_ - frame.w) > .5f ||
+        std::fabs(lastLayoutScale_ - effectiveScale(now)) > 1e-4f)
+        return result;
+    result.placed = std::move(placed_);
+    result.contentW = contentW_;
+    result.contentH = contentH_;
+    result.viewportW = frame.w;
+    result.viewportH = frame.h;
+    result.scale = lastLayoutScale_;
+    result.gridSize = gridSize_;
+    result.mode = layout_;
+    result.rotation = rotation_;
+    result.pageCount = source_->pageCount();
+    result.geometryRevision = source_->geometryRevision();
+    return result;
+}
+
+void PageStage::restoreViewState(const ViewState& v, double now,
+                                 LayoutSnapshot* cachedLayout) {
     layout_ = v.layout;
     zoomMode_ = v.zoomMode;
     gridSize_ = v.gridSize;
@@ -426,7 +455,23 @@ void PageStage::restoreViewState(const ViewState& v, double now) {
     scrollX_ = scrollY_ = 0.f;
     lastLayoutW_ = 0.f;
     rasterScale_ = 0.f;
-    relayout(now);
+    const bool reuse = cachedLayout && !cachedLayout->placed.empty() && source_ &&
+        cachedLayout->geometryRevision == source_->geometryRevision() &&
+        cachedLayout->pageCount == source_->pageCount() &&
+        cachedLayout->mode == layout_ && cachedLayout->rotation == rotation_ &&
+        std::fabs(cachedLayout->gridSize - gridSize_) < .01f &&
+        std::fabs(cachedLayout->viewportW - frame.w) < .5f &&
+        std::fabs(cachedLayout->viewportH - frame.h) < .5f &&
+        std::fabs(cachedLayout->scale - zoomTarget_) < 1e-4f;
+    if (reuse) {
+        placed_ = std::move(cachedLayout->placed);
+        contentW_ = cachedLayout->contentW;
+        contentH_ = cachedLayout->contentH;
+        lastLayoutW_ = frame.w;
+        lastLayoutScale_ = zoomTarget_;
+    } else {
+        relayout(now); // changed viewport/metadata/zoom: never reuse stale hit targets
+    }
     entrance_.clear(); // a tab switch is not a new-document fly-in
     scrollX_ = v.scrollX;
     scrollY_ = v.scrollY;
@@ -885,6 +930,33 @@ Rect annotBounds(const Annotation& a) {
     }
     return Rect{l, t, r - l, b - t};
 }
+}
+
+bool PageStage::selectedAnnotWindowAnchor(Point& out) const {
+    if (!selAnnot_ || !store_ || frame.w <= 16.f || frame.h <= 16.f) return false;
+    const Annotation* selected = store_->get(selAnnot_);
+    if (!selected) return false;
+    bool found = false;
+    float l = frame.w, r = 0.f, top = frame.h;
+    for (const Annotation& a : store_->all()) {
+        if (a.deleted || (selected->group
+                ? a.group != selected->group : a.id != selAnnot_)) continue;
+        const auto it = std::find_if(placed_.begin(), placed_.end(),
+            [&a](const Placed& p) { return p.index == a.page; });
+        if (it == placed_.end()) continue;
+        Rect rect = toViewRect(annotBounds(a), it->rect);
+        rect.x -= scrollX_;
+        rect.y -= scrollY_ - overscrollY_;
+        if (rect.right() < 0.f || rect.x > frame.w ||
+            rect.bottom() < 0.f || rect.y > frame.h) continue;
+        l = std::min(l, std::max(0.f, rect.x));
+        r = std::max(r, std::min(frame.w, rect.right()));
+        top = std::min(top, std::max(0.f, rect.y));
+        found = true;
+    }
+    if (!found) return false;
+    out = toWindow({std::clamp((l + r) * .5f, 8.f, frame.w - 8.f), top});
+    return std::isfinite(out.x) && std::isfinite(out.y);
 }
 
 int PageStage::hitAnnotGrip(Point local, bool touch) const {
@@ -2770,8 +2842,11 @@ bool PageStage::handleTouch(const PointerEvent& e) {
                 const PinchState p = touch_.pinch();
                 const Point before{p.centroid.x - p.centroidDelta.x,
                                    p.centroid.y - p.centroidDelta.y};
-                const float next = std::clamp(pinchZoom_ * p.scale,
-                                              kMinZoom, kMaxZoom);
+                // A modest 30% gain reduces finger travel without the
+                // jumpiness of doubling the pinch. Keep the midpoint anchor.
+                const float next = std::clamp(
+                    pinchZoom_ * std::pow(std::max(p.scale, 0.001f), 1.3f),
+                    kMinZoom, kMaxZoom);
                 if (std::fabs(next - pinchZoom_) > 1e-5f) {
                     // Capture the document point UNDER the *old* midpoint,
                     // relayout at the new scale, then put that same point
@@ -3131,7 +3206,9 @@ bool PageStage::onPointer(const PointerEvent& e) {
                 // centre of the viewport, which on a zoomed-in page sends
                 // whatever you were pointing at off the edge.
                 setZoomFocus(e.pos.x, e.pos.y);
-                const float factor = std::exp(e.wheelY * 0.12f);
+                // ~33% more zoom per detent/trackpad delta, continuously
+                // exponential so small gestures remain precise and reversible.
+                const float factor = std::exp(e.wheelY * 0.16f);
                 setZoom(zoomTarget_ * factor, e.timestamp);
             } else if ((e.modifiers & ModShift) || std::fabs(e.wheelX) > 0.01f) {
                 // Shift+wheel is the universal horizontal scroll, and a
@@ -3314,7 +3391,9 @@ bool PageStage::thumbOverlayOnly(double now) const noexcept {
         return false;
     if (!source_ || source_->pending() || selecting_ || dragging_ ||
         movingAnnot_ || highlightMagnifierActive_ || magnifierActive_ ||
-        zoomAnim_.active(now) || rotationAnim_.active(now) || smoothing_ ||
+        zoomAnim_.active(now) || rotationAnim_.active(now) ||
+        (rasterScale_ > 0.f &&
+         std::fabs(rasterScale_ - effectiveScale(now)) > 1e-4f) || smoothing_ ||
         std::fabs(velocity_) > kFlingCutoff ||
         std::fabs(overscrollY_) > .1f ||
         std::fabs(overscrollVelocity_) > 1.f)
@@ -3337,6 +3416,12 @@ bool PageStage::animating(double now) const {
     // need to redraw the same pixels while PDFium is busy.
     if (source_ && source_->pending()) return true;
     if (zoomAnim_.active(now) || rotationAnim_.active(now) || smoothing_) return true;
+    // The final easing frame may fall *before* the 150ms endpoint. Once the
+    // animation reports inactive, schedule exactly one more canvas frame to
+    // adopt the destination raster scale and queue its final PDF tiles. A
+    // later click must never be required to sharpen a completed zoom.
+    if (source_ && rasterScale_ > 0.f &&
+        std::fabs(rasterScale_ - effectiveScale(now)) > 1e-4f) return true;
     // Wait for a possible long press while a finger is still; once it has
     // fired (or the finger moved / an annotation tool owns it), stop the
     // 45 Hz idle repaint. Move events request their own frames.
@@ -3551,6 +3636,18 @@ void PageStage::onPaint(IPaintTarget& t, const PaintCtx& ctx) {
     // otherwise the worker keeps prioritising the previous page for a frame
     // (or several frames in a fast fling).
     self->updateCurrentFromScroll();
+    // The upper-third page drives the page label, but a reading viewport can
+    // already show part of the next/previous page. Publish every intersecting
+    // page BEFORE changing focus, so cancellation cannot discard its jobs.
+    int readingFirst = -1, readingLast = -1;
+    if (layout_ != LayoutMode::Grid) {
+        for (const Placed& p : placed_) {
+            if (p.rect.bottom() <= scrollY_ || p.rect.y >= scrollY_ + b.h) continue;
+            if (readingFirst < 0) readingFirst = p.index;
+            readingLast = p.index;
+        }
+    }
+    source_->setVisibleReadingPages(readingFirst, readingLast);
     source_->setFocusPage(current_);
 
     if (layout_ == LayoutMode::Grid && !placed_.empty()) {

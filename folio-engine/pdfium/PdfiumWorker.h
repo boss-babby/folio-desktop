@@ -171,6 +171,9 @@ public:
 
     /// Pages near `page` are rendered first when several are outstanding.
     void setFocusPage(int page) noexcept { focus_.store(page, std::memory_order_relaxed); }
+    /// Metadata and bounded previews for every on-screen reading page must
+    /// outrank sharp tiles of the focused page. Grid has its own range.
+    void setVisibleCanvasRange(int first, int last);
     /// The Pages panel can show pages far from the canvas focus. Only its
     /// visible thumbnails are eligible to remain queued/rendered.
     void setThumbnailRange(int first, int last);
@@ -234,6 +237,7 @@ private:
     std::uint64_t               activeTileEpoch_ = 0;
     int                         thumbnailFirst_ = -1; // protected by m_
     int                         thumbnailLast_ = -1;
+    int                         canvasFirst_ = -1, canvasLast_ = -1; // visible reading pages
     int                         gridFirst_ = -1, gridLast_ = -1;
     int                         gridBufferFirst_ = -1, gridBufferLast_ = -1;
     std::map<int, Job>          textQueue_;
